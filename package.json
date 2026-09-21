@@ -1,7 +1,7 @@
 {
   "name": "axiomscript",
-  "version": "0.8.17",
-  "description": "AxiomScript — a declarative scripting language for game worlds. Static checker + interpreter + 3D renderer reference implementation. Written by LLMs, for LLMs — token-count is the sole design metric.",
+  "version": "0.9.0",
+  "description": "AxiomScript \u2014 a general-purpose scripting language designed for LLMs to write: token-count is the design metric. Scripts, apps, math and simulation, plus a game/3D runtime. Static checker + interpreter + standard library.",
   "main": "main.js",
   "bin": {
     "axiomscript": "./main.js",
@@ -14,23 +14,27 @@
     "lint": "node lint.js",
     "test": "node run_all_tests.js",
     "test:file": "node",
-    "prepare": "node -e \"if(require('fs').existsSync('.githooks')){require('child_process').execSync('git config core.hooksPath .githooks',{stdio:'inherit'})}\""
+    "prepare": "node -e \"if(require('fs').existsSync('.githooks')){require('child_process').execSync('git config core.hooksPath .githooks',{stdio:'inherit'})}\"",
+    "test:lang": "node test_v090_general.js && node test_v0817_features.js"
   },
   "license": "MIT",
   "keywords": [
-    "game",
-    "scripting",
     "language",
     "interpreter",
     "llm",
     "ai",
+    "scripting",
+    "general-purpose",
+    "dsl",
+    "game",
     "3d",
-    "rasterizer"
+    "stdlib"
   ],
   "files": [
     "*.js",
     "*.md",
     "*.nav",
-    "*.ax"
+    "*.ax",
+    "examples/"
   ]
 }

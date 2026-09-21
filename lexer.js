@@ -32,6 +32,16 @@ const TT = {
   GT: 'GT', LT: 'LT', GE: 'GE', LE: 'LE', EQEQ: 'EQEQ', NE: 'NE', ASSIGN: 'ASSIGN', PIPE: 'PIPE',
   MIDDOT: 'MIDDOT', CROSS: 'CROSS', COMPOSE: 'COMPOSE',
   SEMICOLON: 'SEMICOLON',
+  // v0.9.0: BACKSLASH introduces a lambda — `\x: x * 2`. One token for the whole binder, so
+  // an inline function costs 2 tokens of overhead (`\` + `:`) instead of a named ^fn decl.
+  BACKSLASH: 'BACKSLASH',
+  // v0.9.0: `|>` pipeline. `xs |> sum` is left-to-right data flow without nesting parens —
+  // it saves 1 token per stage versus `sum(xs)` only when stages chain, but it removes the
+  // deep-nesting failure mode LLMs hit when composing 4+ calls.
+  PIPEGT: 'PIPEGT',
+  // v0.9.0: `=>` is an accepted ALIAS for `:` in lambda bodies (`\x => x * 2`). Same cost,
+  // but it matches the shape LLMs have the strongest prior for.
+  FATARROW: 'FATARROW',
   NUMBER: 'NUMBER', HEXNUM: 'HEXNUM', IDENT: 'IDENT', STRING: 'STRING',
   FSTRING: 'FSTRING', // v0.8.7: f"..." and $"..." interpolation (single token, raw payload kept)
   NEWLINE: 'NEWLINE', INDENT: 'INDENT', DEDENT: 'DEDENT', EOF: 'EOF'
@@ -84,6 +94,29 @@ function findTripleClose(line, ch, startIdx = 0) {
     i++;
   }
   return -1;
+}
+
+// v0.9.0: net bracket depth of a line, ignoring brackets inside string literals.
+//
+// A line that leaves a bracket open continues onto the next physical line. Without this, a
+// multi-line array, dict, or argument list — how anyone, human or model, writes a table of
+// data — was a syntax error in an indentation-sensitive language, which pushed programs
+// toward one enormous line or toward building structures statement by statement.
+function netBracketDelta(line) {
+  let depth = 0;
+  let inStr = false, strCh = null;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (inStr) {
+      if (c === '\\') { i++; continue; }
+      if (c === strCh) { inStr = false; strCh = null; }
+      continue;
+    }
+    if (c === '"' || c === "'") { inStr = true; strCh = c; continue; }
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if (c === ')' || c === ']' || c === '}') depth--;
+  }
+  return depth;
 }
 
 class LexError extends Error {
@@ -149,9 +182,21 @@ function tokenize(source) {
   let tripleStartLine = 0;       // for error messages
   let tripleAccum = '';          // accumulated text of the multi-line string's logical line
   let tripleIndent = 0;          // indent of the line where the triple string started
+  // v0.9.0: open-bracket continuation depth. While positive, physical lines are appended to
+  // the logical line that opened the bracket.
+  let bracketDepth = 0;
   for (let i = 0; i < rawLines.length; i++) {
     const raw = stripComment(rawLines[i]);
     const trimmed = raw.trim();
+    if (!inTripleStr && bracketDepth > 0 && logicalLines.length > 0) {
+      // Inside an unclosed ( [ { — this physical line continues the previous logical one.
+      // Blank lines inside a bracketed literal are ignored, as they are everywhere else.
+      if (trimmed.length === 0) continue;
+      logicalLines[logicalLines.length - 1].text += ' ' + trimmed;
+      bracketDepth += netBracketDelta(trimmed);
+      if (bracketDepth < 0) bracketDepth = 0;
+      continue;
+    }
     if (inTripleStr) {
       // We're inside a multi-line triple-quoted string. Append this line to the accumulator.
       // Look for the closing triple-quote in this line.
@@ -202,6 +247,8 @@ function tokenize(source) {
     }
     const indent = raw.match(/^[ ]*/)[0].length;
     logicalLines.push({ indent, text: trimmed, lineNo: i + 1 });
+    const delta = netBracketDelta(trimmed);
+    if (delta > 0) bracketDepth = delta;
   }
   // v0.8.8: if we're still in a triple string at EOF, it's an unterminated string error.
   // The tokenizer will report it when it tries to lex the accumulated text.
@@ -349,6 +396,14 @@ function tokenizeLine(text, lineNo, out) {
         push(TT.QUESTION); i++;
         continue;
       }
+      // v0.9.0: `?!` is the else sigil ONLY when it is followed by `:` (i.e. `?!:`). Anywhere
+      // else it is `?` followed by the negation `!`, so `?!done:` reads as "if not done" —
+      // the spelling every model reaches for first, and previously a confusing parse error
+      // ("?! (else) without preceding ?cond:") on code that looked entirely reasonable.
+      if (text[i + 2] !== ':') {
+        push(TT.QUESTION); i++;
+        continue;
+      }
       push(TT.QMARKEQ); i += 2; continue;
     }
     // v0.8.8: null-coalescing `??` — must check before `?` (single char) and before `?!`.
@@ -360,6 +415,11 @@ function tokenizeLine(text, lineNo, out) {
     // v0.8.9: logical AND/OR operators. `&&` and `||` — check before single-char `&` and `|`.
     if (c === '&' && text[i + 1] === '&') { push(TT.ANDAND); i += 2; continue; }
     if (c === '|' && text[i + 1] === '|') { push(TT.OROR); i += 2; continue; }
+    // v0.9.0: `|>` pipeline operator — checked before single-char `|` (PIPE).
+    if (c === '|' && text[i + 1] === '>') { push(TT.PIPEGT); i += 2; continue; }
+    // v0.9.0: `=>` lambda-body alias — checked before `=` (ASSIGN) and `==` (EQEQ can't
+    // collide: `==` is `=` followed by `=`, not `>`).
+    if (c === '=' && text[i + 1] === '>') { push(TT.FATARROW); i += 2; continue; }
     if (c === '.' && text[i + 1] === '.') { push(TT.DOTDOT); i += 2; continue; }
     if (c === '>' && text[i + 1] === '=') { push(TT.GE); i += 2; continue; }
     if (c === '<' && text[i + 1] === '=') { push(TT.LE); i += 2; continue; }
@@ -410,6 +470,7 @@ function tokenizeLine(text, lineNo, out) {
       case '=': push(TT.ASSIGN); i++; continue;
       case '|': push(TT.PIPE); i++; continue;
       case ';': push(TT.SEMICOLON); i++; continue; // v0.8.7: inline separator (entity header / single-line block)
+      case '\\': push(TT.BACKSLASH); i++; continue; // v0.9.0: lambda binder — `\x: x + 1`
       case '\u00B7': push(TT.MIDDOT); i++; continue; // ·
       case '\u00D7': push(TT.CROSS); i++; continue;  // ×
       case '\u2218': push(TT.COMPOSE); i++; continue; // ∘

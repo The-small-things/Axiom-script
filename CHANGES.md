@@ -1,5 +1,199 @@
 # AxiomScript — Change Log
 
+## v0.9.0 — General Purpose
+
+AxiomScript was a language for describing game worlds. As of v0.9.0 it is a general-purpose
+language that still describes game worlds. The design metric is unchanged — the fewest tokens
+a model can spend to write a correct program — and every addition below was chosen by that
+measure, not by analogy to other languages.
+
+The game runtime is untouched: entities, `&physics`/`&render`/`&tick`/`&on`, events, mixins,
+pools, the rasterizer, and the terminal backend all behave exactly as they did in v0.8.17
+(the v0.8.17 suite passes unchanged), and programs that use bare assignment for frame-to-frame
+scratch state still work.
+
+### The problem this release fixes
+
+Three limits made everything except a game impossible to write:
+
+1. **There was no way to run anything.** Every program needed at least one entity and a frame
+   loop. "Print a number" had no spelling.
+2. **There were no local variables.** Every assignment — in a block, a `^fn`, a loop — wrote to
+   the entity executing it. So recursion overwrote its own caller's variables, a parameter
+   could be read but never assigned, and a function called with no entity had nowhere to put
+   anything.
+3. **Functions were not values.** `.map(f)` worked only when `f` was a bare, declared `^fn`
+   name; given anything else it silently returned a copy of the array — a wrong answer with no
+   error, the most expensive failure mode there is for a generated program.
+
+### Entry point — `^main`
+
+- `^main:` runs once, top to bottom, before any frame loop. A program that declares no entities
+  is a **script**: it runs and exits, and the renderer is never loaded.
+- `^main(argv):` receives the command line (everything after `--`); `^return n` sets the exit
+  code; `^main: stmt` and `^main = expr` are one-line forms.
+- A program with both a `^main` and entities runs `^main` as setup and then enters the loop —
+  the natural shape for a game that builds a level first.
+- `--run` forces script mode; `--sim N` steps a simulation N frames headless with no renderer;
+  `--json` reports `main_result`, the log, and diagnostics as JSON.
+- New advisory **AX-MAIN-001**: a program with neither a `^main` nor entities does nothing when
+  run (expected for a library file that another program imports).
+
+### Lexical scope, recursion, closures
+
+- Real scope frames for every `^fn`/`^proc`/`^main` call and every loop, match arm and `^try`
+  body. Name resolution: scope chain → entity fields → globals → atom.
+- Assignment resolves to (1) an enclosing frame that already binds the name, (2) an existing
+  field of the running entity, (3) the current function frame — or, in an entity block, the
+  entity. Clauses 2 and 3 preserve v0.8 behaviour exactly; clause 1 is what makes recursion
+  correct.
+- `~x: v` inside a function body forces a local, for deliberate shadowing.
+- Recursion depth is now bounded by the host stack and reported as the catchable
+  **AX-DEPTH-001** instead of a host-level crash. The CLI re-executes itself once at start-up
+  with a larger stack (opt out with `--no-restack`), raising usable depth roughly eightfold.
+- Loop budgets are now scoped to where they matter: frame blocks keep a cap (**AX-LOOP-002**,
+  200 000 iterations) so a runaway loop cannot hang a frame; loops in functions and scripts are
+  uncapped. The old blanket 10 000-iteration limit made a million-step sum impossible.
+
+### Functions as values
+
+- **Lambdas**: `\x: x * 2`, `\a, b: a + b`, `\: 42`, or with the `=>` alias `\x => x * 2`.
+  The body is one expression and ends with the enclosing expression, so no closing delimiter is
+  needed inside a call.
+- Closures capture their defining scope, entity, and world — a function returned from a
+  function keeps working.
+- A declared `^fn`/`^proc` used without parentheses is a function value.
+- **Any** callable value can be called: `fns[i](x)`, `(\x: x)(3)`, `ops.dbl(3)` where `ops` is
+  a dict of lambdas (a field holding a function is a method), a callback invoked by parameter
+  name, or an intrinsic passed by name.
+- Every higher-order library entry point accepts any of those — or a **field-name string**
+  (`xs.sort_by("hp")`), the shortest spelling of the most common callback.
+- **Default parameters**: `^fn box(v, lo = 0, hi = 10)`, removing the `?x == null: x = d`
+  prologue optional arguments used to need.
+- `!name(...)` in statement position now falls back to a user `^proc`/`^fn`, a local holding a
+  callable, or an intrinsic, instead of failing with "undefined action".
+
+### Errors
+
+- `^try:` / `^catch e:` / `^fin:` and `^throw expr`. Any value can be thrown; the catch
+  variable binds `{msg, code, value}`.
+- Engine faults — bad index, unknown method, unknown function, sandbox denial, recursion depth
+  — are catchable through the same handler, so a program can retry or fall back instead of
+  losing the rest of the block.
+
+### Control flow and data
+
+- **`?*` match**: multiway dispatch on value equality, several patterns per arm, `_` default,
+  and record-type patterns (`Node:` matches any `^type Node` value). A six-way dispatch costs
+  about half the tokens of the equivalent if/elif ladder.
+- **Destructuring assignment**: `q, r = divmod(n, d)` — unpacks arrays, `[key, value]` pairs,
+  and records by field name.
+- **Multi-variable loops**: `*k, v in items(d):`, `*i, x in enumerate(xs):`, `*a, b in zip(p, q):`.
+- **`in` / `!in`** membership across arrays, strings, dict keys, ranges and buffers.
+- **Structural equality**: arrays and plain dicts/records compare element by element, so
+  `[1,2] == [1,2]` is true, a tuple can be a match pattern, and `uniq`/`count`/`in` stop
+  under-reporting on structured values. Entities and other engine objects keep identity
+  comparison.
+- **Records**: a `^type` name is now a constructor — `P(1, 2)` or `P(x: 1, y: 2)`, with
+  omitted fields null and `type(v)` reporting the type name.
+- **`?:` is right-associative**, so a ternary chain (`a ? 1 : b ? 2 : 3`) parses. It was a
+  syntax error before.
+- **`?!expr:`** now reads as "if not expr". `?!` is the else sigil only when followed by `:`.
+
+### Modules and globals
+
+- `^use "lib.ax"` imports every declaration of another file — include-once by resolved path, so
+  diamond imports and cycles are safe, resolved relative to the importing file, `.ax` inferred.
+  One flat namespace: the importing file wins a clash, reported as **AX-USE-002**. Missing or
+  unparseable imports are **AX-USE-001** / **AX-USE-003**; an imported `^main` is ignored
+  (**AX-USE-004**).
+- `~NAME: value` at top level declares a program global, evaluated once in declaration order and
+  visible to every function — no config dict threaded through every call.
+
+### Syntax ergonomics
+
+- **Multi-line literals**: a line that leaves `(`, `[`, or `{` open continues onto the next.
+  Multi-line arrays, dicts, and argument lists were syntax errors before.
+- Trailing commas in arrays, dicts, and argument lists.
+- Dict keys may be strings (`{"a-b": 1}`) or computed (`{[k]: v}`); `{x}` is shorthand for
+  `{x: x}`.
+- `^type` / `^event` fields may be written on one line, comma separated, with the type
+  annotation optional.
+- **`|>` pipeline**: `xs |> filter(\n: n > 0) |> sum`. The piped value becomes the first
+  argument, so a chain reads in execution order with no nesting to balance.
+- `range(lo, hi, step)`, including a negative step.
+
+### Standard library (new `stdlib.js`, 200+ functions)
+
+Statistics (`sum` `mean` `median` `mode` `stdev` `variance`), integer maths (`mod` `divmod`
+`gcd` `lcm` `fact` `comb` `is_prime` `primes` `isqrt`), arbitrary-precision integers (`big`),
+seeded randomness (`seed` `random_int` `shuffle` `pick` `gauss` `uuid`), collections (`sorted`
+`sort_by` `group_by` `count_by` `partition` `uniq` `zip` `enumerate` `chunk` `windows`
+`flatten` `take` `drop` `min_by` `max_by` `union` `intersect` `difference` `grid` `transpose`),
+dicts (`keys` `values` `items` `dict` `merge` `pick_keys` `omit_keys` `invert` `clone`
+`deep_eq`), strings and encoding (`lines` `words` `chars` `ord` `chr` `capitalize` `title`
+`hash` `b64_encode` `b64_decode` `to_json` `from_json`), regular expressions (`re_test`
+`re_match` `re_all` `re_sub` `re_split`), time (`now` `time` `date_iso` `sleep`), files and
+process (`read` `read_lines` `read_json` `write` `write_json` `append` `file_exists` `ls`
+`mkdir` `rm` `path_join` `input` `read_stdin` `args` `env` `eprint` `exit` `sh`), and function
+utilities (`apply` `partial` `compose` `memo` `check` `check_eq`).
+
+Array, dict and string methods were extended to match (`every` `some` `flat_map` `sum` `min`
+`max` `sort_by` `group_by` `uniq` `find_index` `count` `map_values` `merge` `clone` `lines`
+`words` `chars` `to_int` `replace_all` …).
+
+Sandboxing was extended to cover the new capabilities: `--allow-write PATH` and `--allow-exec`
+join `--allow-read`, and a denial raises the catchable **AX-SANDBOX-001**.
+
+### Runtime and tooling
+
+- **The renderer is optional.** `render3d.js` is loaded only when a program declares visual
+  resources, and its absence is an advisory on those resources rather than a crash. Scripts,
+  `--check`, and `--sim` need nothing but the language.
+- `compile(source, opts)` takes `{filename, imports}` — `filename` resolves `^use` paths.
+- The checker's intrinsic list is **derived from the runtime** instead of hand-maintained; the
+  two can no longer drift and produce false "undefined function" advisories.
+- Undefined-function detection now also covers `^fn`/`^proc`/`^main` bodies, skipping
+  parameters and locals that hold callables.
+- New CLI flags: `--run`, `--sim N`, `--allow-write`, `--allow-exec`, `--no-restack`, and `--`
+  to pass arguments through to the program.
+- Runtime faults no longer assume an entity — `^main`, global initialisers, and host-called
+  functions report cleanly.
+
+### Documentation and tests
+
+- `README.md` rewritten as the language's primary reference; `STDLIB.md` added (every library
+  function); `GRAMMAR.md` updated with all v0.9.0 productions, the scope rules, and the sigil
+  disambiguation table.
+- `examples/`: `fizzbuzz.ax`, `stats.ax`, `wordcount.ax`, `life.ax`, `sim.ax`, and `calc.ax` —
+  a complete expression interpreter (tokenizer, recursive-descent parser, evaluator) written in
+  AxiomScript.
+- `test_v090_general.js`: 171 assertions across the entry point, scope, closures, pipelines,
+  errors, match, records, collections, the standard library, files and the sandbox, modules,
+  backward compatibility, diagnostics, the CLI, the examples, and documentation coverage (a
+  library function missing from `STDLIB.md` fails the build).
+
+### Performance
+
+Scope frames cost something: on a synthetic hot loop (a `&physics` block iterating an array,
+20 000 frames), v0.9.0 runs about 40% slower than v0.8.17 — roughly 4.2 µs per frame against
+3.0 µs, or 0.03% of a 60 Hz frame budget. The frame path was optimised to keep that number
+small: a loop body that creates no closure reuses one scope frame instead of allocating per
+iteration, identifier resolution walks the scope chain once rather than twice, and equality
+short-circuits on primitives before any structural comparison. The remaining difference is the
+cost of having real local variables, which is what recursion, closures, and entity-free
+execution are built on.
+
+### CLI
+
+`--help` and `--version` were added (the CLI previously had neither, so the flags could only be
+learned from the source).
+
+### Version bumps
+
+- `package.json` → `0.9.0`
+- `checker.js` `KNOWN_VERSIONS` → added `'0.9'` and `'0.9.0'`
+
 ## v0.8.17 (Terminal UX + language feature)
 
 ### Stream 1: --term-fps flag

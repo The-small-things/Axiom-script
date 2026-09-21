@@ -1,0 +1,89 @@
+// A complete interpreter for arithmetic expressions: tokenizer, recursive-descent parser,
+// and evaluator — the load-bearing proof that AxiomScript can express arbitrary programs.
+// Run: node main.js examples/calc.ax -- "2 * (3 + 4) - 10 / 5"
+^type Tok: kind, text
+
+^fn tokenize(src):
+  toks = []
+  i = 0
+  *i < len(src):
+    c = src[i]
+    ?c == " ":
+      i += 1
+      ~continue
+    ?c in "0123456789":
+      num = ""
+      *i < len(src) && (src[i] in "0123456789."):
+        num += src[i]
+        i += 1
+      toks.push(Tok("num", num))
+      ~continue
+    ?c in "+-*/()":
+      toks.push(Tok("op", c))
+      i += 1
+      ~continue
+    ^throw f"unexpected character '{c}' at {i}"
+  ^return toks
+
+// The parser is a struct threaded through the grammar functions: {toks, pos}.
+^fn peek(p) = p.pos < len(p.toks) ? p.toks[p.pos] : null
+
+^fn eat(p, text):
+  t = peek(p)
+  ?is_null(t) || t.text != text:
+    ^throw f"expected '{text}'"
+  p.pos += 1
+  ^return t
+
+^fn parse_expr(p):
+  left = parse_term(p)
+  *!is_null(peek(p)) && (peek(p).text in ["+", "-"]):
+    op = peek(p).text
+    p.pos += 1
+    right = parse_term(p)
+    left = op == "+" ? left + right : left - right
+  ^return left
+
+^fn parse_term(p):
+  left = parse_atom(p)
+  *!is_null(peek(p)) && (peek(p).text in ["*", "/"]):
+    op = peek(p).text
+    p.pos += 1
+    right = parse_atom(p)
+    ?op == "/" && right == 0:
+      ^throw "division by zero"
+    left = op == "*" ? left * right : left / right
+  ^return left
+
+^fn parse_atom(p):
+  t = peek(p)
+  ?is_null(t):
+    ^throw "unexpected end of input"
+  ?t.text == "(":
+    eat(p, "(")
+    v = parse_expr(p)
+    eat(p, ")")
+    ^return v
+  ?t.text == "-":
+    p.pos += 1
+    ^return -parse_atom(p)
+  p.pos += 1
+  ^return float(t.text)
+
+^fn calc(src) = parse_expr({toks: tokenize(src), pos: 0})
+
+^main(argv):
+  ?len(argv) == 0:
+    // No argument: run the built-in checks, which double as the test suite.
+    cases = [["1 + 2 * 3", 7], ["(1 + 2) * 3", 9], ["10 / 4", 2.5], ["-3 + 5", 2]]
+    *src, want in cases:
+      got = calc(src)
+      check_eq(got, want, src)
+      print(f"{src} = {got}")
+    ^return 0
+  ^try:
+    print(calc(argv[0]))
+  ^catch e:
+    eprint(f"error: {e.msg}")
+    ^return 1
+  ^return 0

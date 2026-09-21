@@ -1,0 +1,24 @@
+// Statistics over a data set: reductions, sorting, grouping, formatting.
+// Run: node main.js examples/stats.ax
+~SAMPLES: [12, 7, 3, 19, 7, 22, 15, 7, 9, 14]
+
+^fn summary(xs) = {
+  n: len(xs),
+  min: min(xs),
+  max: max(xs),
+  mean: mean(xs),
+  median: median(xs),
+  stdev: stdev(xs),
+  mode: mode(xs),
+}
+
+^main:
+  s = summary(SAMPLES)
+  *k, v in items(s):
+    print(f"{k.padEnd(7)} {is_int(v) ? str(v) : to_fixed(v, 2)}")
+
+  // Histogram — group by decade, then draw a bar per bucket.
+  buckets = group_by(SAMPLES, \v: str(floor(v / 10) * 10))
+  print("")
+  *decade, members in sorted(items(buckets), \e: parse_int(e[0])):
+    print(f"{decade}s | {"#".repeat(len(members))}")

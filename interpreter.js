@@ -20,6 +20,10 @@
 // SECTION 1: Math Types — Vec2, Vec3, Quat, Mat4, Transform
 // ==========================================================================================
 
+// v0.9.0: the general-purpose standard library (see stdlib.js). Kept in its own module so
+// the language core stays readable and so the library can be audited/extended on its own.
+const { stdlibIntrinsics } = require('./stdlib');
+
 class Vec2 {
   constructor(x, y) { this.x = x; this.y = y; }
   add(o) { return new Vec2(this.x + o.x, this.y + o.y); }
@@ -316,6 +320,186 @@ class Atom {
 }
 function atom(name) { return new Atom(name); }
 
+// ==========================================================================================
+// v0.9.0: SCOPES, CLOSURES, AND ERRORS
+//
+// Before v0.9.0 every assignment in a block, a ^fn, or a loop wrote to the *entity* that was
+// executing it. That made three things impossible, all of which a general-purpose language
+// needs: recursion (a recursive call clobbered its caller's variables, since both wrote the
+// same entity field), functions without an entity (a ^fn called from a script had nowhere to
+// put a local), and shadowing (a parameter could be read but never assigned).
+//
+// The fix is an ordinary lexical scope chain. Each ^fn / ^proc / ^main call and each loop body
+// gets a frame; a name resolves to the innermost frame that declares it, then to the entity's
+// fields, then to the world. Entity field writes still work exactly as before — a bare `x = 1`
+// inside an entity block still lands on the entity when `x` is one of its declared fields — so
+// existing game code is unaffected.
+// ==========================================================================================
+
+// Returned by Scope.lookup when a name is bound nowhere in the chain. A sentinel (rather than
+// undefined) lets a single walk distinguish "absent" from "bound to null", which matters on the
+// hot path: identifier resolution runs several times per statement in a 60 Hz block.
+const NOT_BOUND = Symbol('not-bound');
+
+class Scope {
+  constructor(parent = null, isFnRoot = false) {
+    this.vars = new Map();
+    this.parent = parent;
+    this.isFnRoot = isFnRoot;   // true for a ^fn/^proc/^main frame; false for a loop/block frame
+  }
+  lookup(name) { for (let s = this; s; s = s.parent) { const v = s.vars.get(name); if (v !== undefined || s.vars.has(name)) return v; } return NOT_BOUND; }
+  has(name) { for (let s = this; s; s = s.parent) if (s.vars.has(name)) return true; return false; }
+  get(name) { for (let s = this; s; s = s.parent) if (s.vars.has(name)) return s.vars.get(name); return undefined; }
+  // Write to the frame that already declares `name`. Returns false if nobody does.
+  setExisting(name, value) {
+    for (let s = this; s; s = s.parent) if (s.vars.has(name)) { s.vars.set(name, value); return true; }
+    return false;
+  }
+  declare(name, value) { this.vars.set(name, value); return value; }
+  // The nearest enclosing function frame — where an undeclared assignment lands, so a name
+  // first assigned inside a loop body stays visible after the loop (the shape LLMs expect
+  // from Python/JS `var`, and the one that makes accumulator loops work).
+  fnFrame() { let s = this; while (s && !s.isFnRoot && s.parent) s = s.parent; return s; }
+}
+
+// A callable value: a lambda (`\x: x + 1`), a reference to a declared ^fn/^proc, or a bound
+// native intrinsic. Closures capture the scope, entity, and world they were created in, so a
+// lambda returned from a function keeps working after that function returns.
+class Closure {
+  constructor({ params, body, isExpr, scope, entity, name, defaults }) {
+    this.params = params || [];
+    this.defaults = defaults || null;   // parameter defaults, when wrapping a declared ^fn
+    this.body = body;
+    this.isExpr = !!isExpr;     // expression lambda vs statement body
+    this.scope = scope || null;
+    this.entity = entity || null;
+    this.name = name || '<lambda>';
+    this.__callable = true;
+  }
+  toString() { return `<fn ${this.name}/${this.params.length}>`; }
+}
+
+// The value `^throw` raises and `^catch` binds. Runtime faults (a bad index, an unknown
+// method) are wrapped in the same shape, so one handler catches both program-raised and
+// engine-raised errors.
+class AxiomError extends Error {
+  constructor(value, code) {
+    const msg = (value && typeof value === 'object' && typeof value.msg === 'string')
+      ? value.msg
+      : (typeof value === 'string' ? value : stringifyFStringVal(value));
+    super(msg);
+    this.name = 'AxiomError';
+    this.axiomValue = value;
+    this.axiomCode = code || 'AX-THROW';
+  }
+}
+
+// Normalize anything thrown (AxiomError, a JS TypeError from a native intrinsic, ...) into the
+// dict a ^catch clause binds: {msg, code, value}. `msg` is always a string so f-strings can
+// print it directly; `value` is the original payload for programs that throw structured errors.
+function errorToValue(err) {
+  if (err instanceof AxiomError) {
+    const v = err.axiomValue;
+    if (v && typeof v === 'object' && !Array.isArray(v) && !(v instanceof Atom)) {
+      return Object.assign({ msg: err.message, code: err.axiomCode }, v);
+    }
+    return { msg: err.message, code: err.axiomCode, value: v };
+  }
+  return { msg: err && err.message ? err.message : String(err), code: classifyRuntimeError(err), value: null };
+}
+
+// v0.9.0: guards against the two ways a general-purpose program hangs the host instead of
+// reporting an error. Both are generous enough that real computation never hits them.
+const MAX_CALL_DEPTH = 6000;      // recursion — reported as an error, not a JS stack overflow
+const HOT_LOOP_LIMIT = 200000;    // per-loop cap inside &physics/&render/&tick/&on (frame budget)
+
+// Call any callable value with already-evaluated arguments. This is the single entry point used
+// by `f(x)` where f is a variable, by `|>`, and by every higher-order library method — which is
+// why `.map` now works with a lambda, a ^fn name, an intrinsic, or a closure stored in a dict.
+function callValue(fnVal, argVals, ctx, nameHint) {
+  if (fnVal == null) throw new AxiomError(`tried to call ${nameHint ? `'${nameHint}'` : 'a value'} that is null`, 'AX-CALL-001');
+  // A native intrinsic (plain JS function).
+  if (typeof fnVal === 'function') return invokeIntrinsic(fnVal, argVals, ctx);
+  // A name: resolve it against the program's functions, then the intrinsics.
+  if (typeof fnVal === 'string' || fnVal instanceof Atom) {
+    const nm = typeof fnVal === 'string' ? fnVal : fnVal.name;
+    const decl = ctx.world.fns.get(nm) || ctx.world.procs.get(nm);
+    if (decl) return callUserFn(decl, argVals, ctx);
+    const intr = ctx.world.intrinsics[nm];
+    if (intr) return invokeIntrinsic(intr, argVals, ctx);
+    throw new AxiomError(`'${nm}' is not a function`, 'AX-CALL-001');
+  }
+  if (fnVal instanceof Closure) {
+    const world = ctx.world;
+    if ((world._callDepth = (world._callDepth || 0) + 1) > MAX_CALL_DEPTH) {
+      world._callDepth = 0;
+      throw new AxiomError(`call depth exceeded ${MAX_CALL_DEPTH} — infinite recursion?`, 'AX-DEPTH-001');
+    }
+    try {
+      const scope = new Scope(fnVal.scope, true);
+      const cdefaults = fnVal.defaults || {};
+      for (let i = 0; i < fnVal.params.length; i++) {
+        const pname = fnVal.params[i];
+        let v = i < argVals.length ? argVals[i] : undefined;
+        if ((v === undefined || v === null) && cdefaults[pname]) {
+          v = evalExpr(cdefaults[pname], { ...ctx, scope, fnParams: null, inFn: true, hot: false });
+        }
+        scope.declare(pname, v === undefined ? null : v);
+      }
+      // `args` is always bound to the full argument list, so variadic helpers are writable
+      // without a parameter-list ceremony.
+      scope.declare('args', argVals.slice());
+      const callCtx = {
+        ...ctx,
+        entity: fnVal.entity !== null && fnVal.entity !== undefined ? fnVal.entity : ctx.entity,
+        scope,
+        fnParams: null,
+        inFn: true,
+        hot: false,   // a function body is never subject to the hot-block loop cap
+      };
+      if (fnVal.isExpr) return evalExpr(fnVal.body, callCtx);
+      let last = null;
+      for (const stmt of fnVal.body) {
+        const r = execStmtInner(stmt, callCtx);
+        if (r instanceof ReturnSignal) return r.value;
+        if (r !== undefined && !(r instanceof BreakSignal) && !(r instanceof ContinueSignal)) last = r;
+      }
+      return last;
+    } catch (err) {
+      throw asDepthError(err);
+    } finally {
+      world._callDepth--;
+    }
+  }
+  // A raw FnDecl/ProcDecl node (e.g. handed over by older code paths).
+  if (fnVal && Array.isArray(fnVal.body) && Array.isArray(fnVal.params)) return callUserFn(fnVal, argVals, ctx);
+  throw new AxiomError(`value of type ${typeof fnVal} is not callable`, 'AX-CALL-001');
+}
+
+// v0.9.0: some stdlib intrinsics need to call back into the language (anything taking a
+// lambda). Those are tagged `__ctx` and receive the evaluation context as their final
+// argument; missing optional arguments are padded so the context always lands in the right
+// slot regardless of how many arguments the call site supplied.
+function invokeIntrinsic(fn, args, ctx) {
+  if (!fn.__ctx) return fn(...args);
+  const want = Math.max(0, fn.length - 1);
+  const a = args.slice();
+  while (a.length < want) a.push(undefined);
+  return fn(...a, ctx);
+}
+
+// True for anything callValue accepts — used by the library methods to tell "a function was
+// passed" from "a value was passed" (e.g. `.sort()` vs `.sort(\a, b: b - a)`).
+function isCallable(v, world) {
+  if (typeof v === 'function' || v instanceof Closure) return true;
+  if (v && Array.isArray(v.body) && Array.isArray(v.params)) return true;
+  if (world && (typeof v === 'string' || v instanceof Atom)) {
+    const nm = typeof v === 'string' ? v : v.name;
+    return world.fns.has(nm) || world.procs.has(nm) || typeof world.intrinsics[nm] === 'function';
+  }
+  return false;
+}
+
 function isCell(v) { return v && typeof v === 'object' && v.__cell; }
 
 // v0.5.1: timer objects auto-destructure to their `remaining` in numeric comparisons
@@ -346,12 +530,45 @@ function truthy(v) {
   if (Array.isArray(v)) return v.length > 0;
   return !!v;
 }
-function equalsVal(a, b) {
+// v0.9.0: equality is STRUCTURAL for arrays and plain dicts/records, and identity-based for
+// everything else (entities, pools, collider shapes — where identity is the meaning).
+//
+// Without this, `[1, 2] == [1, 2]` was false, `[0, 0]` could never be a match arm, and
+// `uniq`/`in`/`count` silently under-reported on tuples. Comparing two small structures is the
+// common case in the programs this language is for; the depth cap keeps a cyclic structure
+// from turning a comparison into a hang.
+function equalsVal(a, b, depth) {
+  if (a === b) return true;
+  // Fast path: two different primitives are simply unequal. This is the overwhelmingly common
+  // comparison in a frame block, so it must not pay for the structural walk below.
+  const ta = typeof a;
+  if (ta === 'number' || ta === 'string' || ta === 'boolean' || a === null || a === undefined) {
+    const tb = typeof b;
+    if (tb === 'number' || tb === 'string' || tb === 'boolean' || b === null || b === undefined) return false;
+  }
   if (a instanceof Atom && b instanceof Atom) return a.name === b.name;
   if (isCell(a) && isCell(b)) return a.x === b.x && a.y === b.y;
   if (a instanceof Vec3 && b instanceof Vec3) return a.x === b.x && a.y === b.y && a.z === b.z;
   if (a instanceof Vec2 && b instanceof Vec2) return a.x === b.x && a.y === b.y;
-  return a === b;
+  if (a instanceof Quat && b instanceof Quat) return a.x === b.x && a.y === b.y && a.z === b.z && a.w === b.w;
+  const d = depth === undefined ? 0 : depth;
+  if (d > 32) return false;
+  if (Array.isArray(a) && Array.isArray(b)) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (!equalsVal(a[i], b[i], d + 1)) return false;
+    return true;
+  }
+  if (a && b && typeof a === 'object' && typeof b === 'object'
+      && a.constructor === Object && b.constructor === Object) {
+    const ka = Object.keys(a), kb = Object.keys(b);
+    if (ka.length !== kb.length) return false;
+    for (const k of ka) {
+      if (!Object.prototype.hasOwnProperty.call(b, k)) return false;
+      if (!equalsVal(a[k], b[k], d + 1)) return false;
+    }
+    return true;
+  }
+  return false;
 }
 function compareOp(op, a, b) {
   switch (op) {
@@ -584,11 +801,21 @@ class BMap {
 
 // v0.4: Range — produced by '..' operator, consumed by ForLoop.
 class Range {
-  constructor(lo, hi) { this.lo = lo; this.hi = hi; }
+  // v0.9.0: an optional step (may be negative). `0..n` still builds a step-1 range, so the
+  // existing `*i in 0..10:` form is unchanged.
+  constructor(lo, hi, step) { this.lo = lo; this.hi = hi; this.step = (step === undefined || step === null || step === 0) ? 1 : step; }
+  get length() { const n = Math.ceil((this.hi - this.lo) / this.step); return n > 0 ? n : 0; }
   [Symbol.iterator]() {
-    let i = Math.round(this.lo);
-    const end = Math.round(this.hi);
-    return { next() { if (i < end) return { value: i++, done: false }; return { done: true }; } };
+    const step = this.step;
+    let i = step > 0 ? Math.round(this.lo) : this.lo;
+    const end = this.hi;
+    if (Number.isInteger(step)) i = Math.round(this.lo);
+    return {
+      next() {
+        if (step > 0 ? i < end : i > end) { const v = i; i += step; return { value: v, done: false }; }
+        return { done: true };
+      },
+    };
   }
 }
 
@@ -2326,7 +2553,7 @@ class EntityInstance {
       }
     }
   }
-  rootCtx() { return { entity: this, world: this.world, dt: 0 }; }
+  rootCtx() { return { entity: this, world: this.world, dt: 0, scope: this.world ? new Scope(this.world.globalScope) : null, inFn: false, hot: false }; }
   get(name) {
     if (name === 'pose') return this.locals.get('pose');
     if (name === 'wpose') {
@@ -2404,7 +2631,12 @@ class World {
     this.typeDecls = new Map();
     this.channels = new ChannelBus();
     this.input = { move: new Vec2(0, 0), jump: false, fire: false, aim: new Vec2(0, 0) };
-    this.intrinsics = defaultIntrinsics();
+    // v0.9.0: the general-purpose standard library is merged over the engine intrinsics. It
+    // is bound to this World so its I/O respects the sandbox settings, and it receives a small
+    // runtime bridge so its higher-order functions can invoke AxiomScript lambdas.
+    this.intrinsics = Object.assign(defaultIntrinsics(), stdlibIntrinsics(this, {
+      callValue, truthy, equalsVal, stringify: stringifyFStringVal, AxiomError, Atom, Vec3, Vec2,
+    }));
     this._tickAcc = new Map();
     this._physicsAcc = 0;
     this.physicsHz = 60;
@@ -2435,16 +2667,90 @@ class World {
     this.sandbox = false;
     this.allowNet = false;
     this.allowReadPaths = new Set();
+    // v0.9.0: sandbox gates for the general-purpose stdlib. Reads were already gated; writes
+    // and subprocess execution are new capabilities and default to OFF in sandbox mode.
+    this.allowWritePaths = new Set();
+    this.allowExec = false;
+    // v0.9.0: the root lexical scope. Globals assigned at the top of ^main, and anything a
+    // ^fn declares with `~name: value` at its outermost level, live here.
+    this.globalScope = new Scope(null, true);
+    this._callDepth = 0;
+    this._closureCache = new WeakMap();
+    // v0.9.0: `^main:` entry point (set by loadProgram) and the value it returned.
+    this.mainDecl = null;
+    this.mainResult = null;
+    this.exitCode = 0;
+    // v0.9.0: argv visible to the program through `args()`.
+    this.argv = [];
   }
+
+  // v0.9.0: wrap a declared ^fn/^proc as a first-class value so it can be passed to .map,
+  // stored in a dict, or piped into. Cached per declaration so `f == f` holds.
+  closureFor(decl) {
+    let c = this._closureCache.get(decl);
+    if (!c) {
+      c = new Closure({ params: decl.params, defaults: decl.defaults, body: decl.body, isExpr: false, scope: this.globalScope, entity: null, name: decl.name });
+      this._closureCache.set(decl, c);
+    }
+    return c;
+  }
+
+  // v0.9.0: the root context for entity-free execution — scripts, ^main, and any ^fn called
+  // from the host. `entity: null` is now a supported state everywhere.
+  scriptCtx() {
+    return { entity: null, world: this, dt: 0, scope: new Scope(this.globalScope), blockName: null, eventPayload: null, inFn: true, hot: false };
+  }
+
+  // v0.9.0: run `^main`. Returns the value ^main returned (used as the process exit code when
+  // it is a number). Faults are reported the same way block faults are, and also rethrown to
+  // the caller so a CLI can exit non-zero.
+  runMain(argv) {
+    if (!this.mainDecl) return null;
+    this.argv = argv || [];
+    const decl = this.mainDecl;
+    const ctx = this.scriptCtx();
+    const scope = new Scope(this.globalScope, true);
+    if (decl.params.length) scope.declare(decl.params[0], this.argv.slice());
+    scope.declare('args', this.argv.slice());
+    const mainCtx = { ...ctx, scope };
+    try {
+      for (const stmt of decl.body) {
+        const r = execStmtInner(stmt, mainCtx);
+        if (r instanceof ReturnSignal) { this.mainResult = r.value; break; }
+      }
+    } catch (err) {
+      if (err instanceof ReturnSignal) { this.mainResult = err.value; }
+      else {
+        const v = errorToValue(err);
+        this.runtimeDiagnostics.push(makeRuntimeFault(null, { name: 'main' }, { line: decl.line, col: decl.col }, err, this));
+        this.exitCode = 1;
+        throw err;
+      }
+    }
+    if (typeof this.mainResult === 'number') this.exitCode = this.mainResult | 0;
+    return this.mainResult;
+  }
+
+  // v0.9.0: true when the program is a script (has ^main) rather than a simulation. A program
+  // can be both — ^main runs first, then the frame loop, which is how a game does setup.
+  get isScript() { return !!this.mainDecl; }
 
   // v0.8.7: enable sandbox mode. Call from main.js when --sandbox is passed.
   // Options: { allowNet: bool, allowReadPaths: string[] }
   setSandbox(opts = {}) {
+    const nodePath = require('path');
     this.sandbox = true;
     this.allowNet = !!opts.allowNet;
+    // Paths are stored both as written and resolved, so `--allow-read ./data` matches a read
+    // of the same file spelled as an absolute path (and vice versa).
     if (Array.isArray(opts.allowReadPaths)) {
-      for (const p of opts.allowReadPaths) this.allowReadPaths.add(p);
+      for (const p of opts.allowReadPaths) { this.allowReadPaths.add(p); this.allowReadPaths.add(nodePath.resolve(p)); }
     }
+    // v0.9.0: the standard library can write files and run commands, so both need gates.
+    if (Array.isArray(opts.allowWritePaths)) {
+      for (const p of opts.allowWritePaths) { this.allowWritePaths.add(p); this.allowWritePaths.add(nodePath.resolve(p)); }
+    }
+    this.allowExec = !!opts.allowExec;
   }
 
   // v0.8.7: check whether a given file path is readable in the current sandbox configuration.
@@ -2472,7 +2778,14 @@ class World {
     // via the render3d PNG decoder; if the path is one of the procedural names ("checker", "stripe",
     // "noise", "grid"), use the procedural generator instead. If loading fails, the entity just
     // renders flat-shaded — the runtime never throws on texture load failure.
-    const { proceduralMeshForPath, loadTexture, proceduralTexture } = require('./render3d');
+    // v0.9.0: the renderer is loaded lazily and optionally. A program that declares no visual
+    // resources — a CLI tool, a solver, a test — must not need a rasterizer to be present at
+    // all, and a missing render3d.js is now a warning on the resources that needed it rather
+    // than a crash on every program.
+    const renderer = (program.resources && program.resources.length) ? loadRendererModule(this) : null;
+    const proceduralMeshForPath = renderer ? renderer.proceduralMeshForPath : () => null;
+    const loadTexture = renderer ? renderer.loadTexture : () => null;
+    const proceduralTexture = renderer ? renderer.proceduralTexture : () => null;
     for (const r of program.resources || []) {
       const res = { kind: r.kind, path: r.path, name: r.name };
       if (r.kind === 'Texture') {
@@ -2574,6 +2887,19 @@ class World {
     for (const p of program.procs || []) this.procs.set(p.name, p);
     for (const m of program.mixins || []) this.mixins.set(m.name, m);
     for (const mat of program.materials || []) this.materials.set(mat.name, mat);
+    // v0.9.0: program globals (`~NAME: expr` at top level) are evaluated once, in declaration
+    // order, into the root scope — so a global may be defined in terms of an earlier one.
+    for (const g of program.globals || []) {
+      const ctx = this.scriptCtx();
+      let v = null;
+      try { v = evalExpr(g.value, ctx); }
+      catch (err) {
+        this.runtimeDiagnostics.push(makeRuntimeFault(null, { name: 'global' }, g, err, this));
+      }
+      for (const n of g.names) this.globalScope.declare(n, v);
+    }
+    // v0.9.0: the ^main entry point, if the program declares one.
+    if (program.main) this.mainDecl = program.main;
     for (const e of program.entities) {
       // v0.4: compose mixin members into entity before instantiation
       const composedMembers = this._composeMixins(e);
@@ -2810,6 +3136,28 @@ class World {
 // SECTION 8: Intrinsics
 // ==========================================================================================
 
+// v0.9.0: optional renderer. AxiomScript's 3D backend is a peer dependency of the *language*,
+// not a prerequisite for running a program. Programs that declare visual resources load it on
+// demand; everything else never touches it.
+let _rendererModule; // undefined = not tried, null = unavailable
+function loadRendererModule(world) {
+  if (_rendererModule !== undefined) return _rendererModule;
+  try {
+    _rendererModule = require('./render3d');
+  } catch (e) {
+    _rendererModule = null;
+    if (world) {
+      world.runtimeDiagnostics.push({
+        error_code: 'AX-RENDER-000', severity: 'advisory',
+        message_for_human: `renderer module (render3d.js) is unavailable — visual resources will not load: ${e.message}`,
+        message_for_agent: `This program declares #Mesh3D/#Texture resources, but render3d.js could not be loaded. Non-visual execution (^main, ^fn, physics) is unaffected.`,
+        location: { line: null, col: null },
+      });
+    }
+  }
+  return _rendererModule;
+}
+
 function defaultIntrinsics() {
   return {
     // v0.8.9: v2 with 1 arg = uniform Vec2(v, v).
@@ -2863,8 +3211,9 @@ function defaultIntrinsics() {
     sign: (x) => Math.sign(x),
     // Two-arg:
     // v0.8.10: variadic min/max — min(a,b,c) instead of min(a,min(b,c))
-    min: (...args) => Math.min(...args),
-    max: (...args) => Math.max(...args),
+    // v0.9.0: min/max also accept a single array — `min(xs)` instead of `min(...)` spreads.
+    min: (...args) => (args.length === 1 && Array.isArray(args[0])) ? (args[0].length ? Math.min(...args[0]) : null) : Math.min(...args),
+    max: (...args) => (args.length === 1 && Array.isArray(args[0])) ? (args[0].length ? Math.max(...args[0]) : null) : Math.max(...args),
     pow: (base, exp) => Math.pow(base, exp),
     atan2: (y, x) => Math.atan2(y, x),
     // v0.8.8: random intrinsics. `random()` returns [0, 1). `randomRange(lo, hi)` returns [lo, hi).
@@ -2923,7 +3272,8 @@ function defaultIntrinsics() {
     int: (s) => parseInt(s, 10),
     float: (s) => parseFloat(s),
     str: (v) => v == null ? 'null' : typeof v === 'object' ? JSON.stringify(v) : String(v),
-    type: (v) => v == null ? 'null' : Array.isArray(v) ? 'array' : typeof v === 'object' ? (v instanceof Atom ? 'atom' : v instanceof Vec3 ? 'vec3' : v instanceof Vec2 ? 'vec2' : v instanceof Quat ? 'quat' : v instanceof EntityInstance ? 'entity' : v instanceof Transform ? 'transform' : v instanceof Mat4 ? 'mat4' : 'object') : typeof v,
+    // v0.9.0: `type()` reports a record's declared ^type name and recognizes functions.
+    type: (v) => v == null ? 'null' : typeof v === 'function' ? 'fn' : Array.isArray(v) ? 'array' : typeof v === 'object' ? (v.__callable ? 'fn' : v.__type ? v.__type : v instanceof Atom ? 'atom' : v instanceof Vec3 ? 'vec3' : v instanceof Vec2 ? 'vec2' : v instanceof Quat ? 'quat' : v instanceof EntityInstance ? 'entity' : v instanceof Transform ? 'transform' : v instanceof Mat4 ? 'mat4' : 'object') : typeof v,
     is_null: (v) => v == null,
     is_number: (v) => typeof v === 'number',
     is_string: (v) => typeof v === 'string',
@@ -2972,6 +3322,11 @@ function flattenPath(node) {
 function resolveIdent(name, ctx) {
   if (name === 'dt') return ctx.dt;
   if (name === 'self') return ctx.entity;
+  // v0.9.0: lexical scope first — parameters, loop variables, and locals shadow entity fields.
+  if (ctx.scope) {
+    const hit = ctx.scope.lookup(name);
+    if (hit !== NOT_BOUND) return hit === undefined ? null : hit;
+  }
   // v0.8.2: recognize `null` as a literal (not an Atom). Queries like ?nearest return JS null
   // when nothing is found; without this, `t == null` in axiom source would compare against
   // Atom('null') (the fallback) and always be false — a silent dead-end for null checks.
@@ -2986,6 +3341,14 @@ function resolveIdent(name, ctx) {
     if (v !== undefined) return v;
   }
   if (name === 'input') return ctx.world.input;
+  // v0.9.0: a declared ^fn/^proc used WITHOUT parentheses is a function value, so `xs.map(sq)`,
+  // `sort_by(people, age)` and `handlers.push(retry)` all work without a lambda wrapper.
+  if (ctx.world) {
+    const decl = ctx.world.fns.get(name) || ctx.world.procs.get(name);
+    if (decl) return ctx.world.closureFor(decl);
+  }
+  // Unknown bare identifiers stay atoms (`state = idle`) — the symbol type the language has
+  // always used for enum-ish values.
   return atom(name);
 }
 
@@ -3010,6 +3373,47 @@ function stringifyFStringVal(v) {
     try { return JSON.stringify(v); } catch (e) { return String(v); }
   }
   return String(v);
+}
+
+// v0.9.0: the name to show a model in an error message. `typeof null` is "object" and
+// `constructor.name` is absent on a null — both produce messages that point at the wrong
+// thing, and a wrong hint is worse than none because it sends the next attempt sideways.
+function typeNameOf(v) {
+  if (v === null || v === undefined) return 'null';
+  if (Array.isArray(v)) return 'array';
+  if (typeof v === 'object') {
+    if (v.__callable) return 'function';
+    if (v.__type) return `record ${v.__type}`;
+    if (v.constructor && v.constructor.name && v.constructor.name !== 'Object') return v.constructor.name;
+    return 'dict';
+  }
+  if (typeof v === 'function') return 'function';
+  return typeof v;
+}
+
+// v0.9.0: dict keys are strings. A computed key is coerced the same way an f-string would
+// render it, so `{[1]: "a"}` and `d["1"]` agree.
+function stringifyKey(v) {
+  if (typeof v === 'string') return v;
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+  if (v instanceof Atom) return v.name;
+  return stringifyFStringVal(v);
+}
+
+// v0.9.0: destructuring for multi-variable loops and comprehensions. Arrays destructure by
+// position; a dict entry pair from items() is already [key, value]; a record destructures by
+// field NAME, so `*name, hp in people:` works on a list of records too.
+function destructureElement(item, index, varName) {
+  if (item == null) return null;
+  if (Array.isArray(item)) return item[index];
+  if (item instanceof Vec2) return index === 0 ? item.x : item.y;
+  if (item instanceof Vec3) return index === 0 ? item.x : index === 1 ? item.y : item.z;
+  if (typeof item === 'object') {
+    if (varName !== undefined && Object.prototype.hasOwnProperty.call(item, varName)) return item[varName];
+    const keys = Object.keys(item).filter(k => k !== '__type');
+    return item[keys[index]];
+  }
+  return index === 0 ? item : null;
 }
 
 function evalExpr(node, ctx) {
@@ -3088,7 +3492,7 @@ function evalExpr(node, ctx) {
       if (obj && typeof obj === 'object' && !Array.isArray(obj) && !(obj instanceof Vec2) && !(obj instanceof Vec3) && !(obj instanceof Quat) && !(obj instanceof EntityInstance)) return obj[idx];
       if (obj && typeof obj === 'object' && obj[idx] !== undefined) return obj[idx];
       if (obj && typeof obj[idx] !== 'undefined') return obj[idx];
-      throw new Error(`cannot index a ${obj && obj.constructor ? obj.constructor.name : typeof obj}`);
+      throw new AxiomError(`cannot index ${typeNameOf(obj)} with [${stringifyKey(idx)}] — check the value is an array, string, or dict first (is_null / type)`, 'AX-RUNTIME-INDEX');
     }
     case 'Unary': {
       const v = evalExpr(node.expr, ctx);
@@ -3155,6 +3559,43 @@ function evalExpr(node, ctx) {
     case 'Call': {
       return callFunction(node.callee, node.args, ctx);
     }
+    // v0.9.0: a lambda evaluates to a Closure capturing the current scope/entity.
+    case 'Lambda': {
+      return new Closure({
+        params: node.params, body: node.body, isExpr: true,
+        scope: ctx.scope || ctx.world.globalScope, entity: ctx.entity, name: '<lambda>',
+      });
+    }
+    // v0.9.0: `x |> f` — pipe the left value into the right-hand callable as its FIRST argument.
+    //   xs |> sum                 → sum(xs)
+    //   xs |> map(\v: v * 2)      → map(xs, \v: v * 2)
+    //   n  |> \v: v + 1           → (\v: v + 1)(n)
+    // Piping into a call inserts the value ahead of the written arguments, which is what makes
+    // a chain read in execution order instead of inside-out.
+    case 'Pipe': {
+      const val = evalExpr(node.left, ctx);
+      const r = node.right;
+      if (r.type === 'Call') {
+        const args = [{ value: { type: '__Value', value: val } }, ...r.args];
+        return callFunction(r.callee, args, ctx);
+      }
+      if (r.type === 'MethodCall') {
+        // `x |> obj.m(a)` → obj.m(x, a)
+        const obj = evalExpr(r.obj, ctx);
+        return callMethod(obj, r.method, [{ value: { type: '__Value', value: val } }, ...r.args], ctx);
+      }
+      const fn = evalExpr(r, ctx);
+      return callValue(fn, [val], ctx, r.name);
+    }
+    // v0.9.0: calling the result of an expression — `fns[i](x)`, `(\x: x * 2)(4)`.
+    case 'CallValue': {
+      const fn = evalExpr(node.callee, ctx);
+      const argVals = node.args.map(a => evalExpr(a.value, ctx));
+      return callValue(fn, argVals, ctx);
+    }
+    // An already-evaluated value spliced into an argument list (used by `|>`). Never written
+    // in source; it exists so piping reuses the ordinary call paths without re-evaluating.
+    case '__Value': return node.value;
     case 'ArrayLit': {
       return node.elements.map(e => evalExpr(e, ctx));
     }
@@ -3175,15 +3616,16 @@ function evalExpr(node, ctx) {
       else if (iterable && typeof iterable[Symbol.iterator] === 'function') seq = Array.from(iterable);
       else seq = [];
       const items = [];
+      // v0.9.0: comprehension variables live in a real scope frame, so they shadow entity
+      // fields and outer locals the same way a loop variable does, and never leak outward.
+      const compScope = new Scope(ctx.scope || (ctx.world && ctx.world.globalScope) || null);
+      const childCtx = { ...ctx, scope: compScope };
       for (const item of seq) {
-        // Bind var(s) into a child evaluation context.
-        const childCtx = { ...ctx, fnParams: { ...(ctx.fnParams || {}) } };
         if (node.vars.length === 1) {
-          childCtx.fnParams[node.vars[0]] = item;
+          compScope.declare(node.vars[0], item);
         } else {
-          // Multi-var destructuring: assume item is array-like.
           for (let vi = 0; vi < node.vars.length; vi++) {
-            childCtx.fnParams[node.vars[vi]] = item ? item[vi] : undefined;
+            compScope.declare(node.vars[vi], destructureElement(item, vi, node.vars[vi]));
           }
         }
         if (node.cond && !truthy(evalExpr(node.cond, childCtx))) continue;
@@ -3193,7 +3635,11 @@ function evalExpr(node, ctx) {
     }
     case 'DictLit': {
       const d = {};
-      for (const p of node.pairs) d[p.key] = evalExpr(p.value, ctx);
+      // v0.9.0: `keyExpr` is the computed-key form `{[expr]: v}`; `key` is the literal form.
+      for (const p of node.pairs) {
+        const k = p.keyExpr !== undefined ? stringifyKey(evalExpr(p.keyExpr, ctx)) : p.key;
+        d[k] = evalExpr(p.value, ctx);
+      }
       return d;
     }
     default:
@@ -3327,6 +3773,19 @@ function binaryOp(op, l, r) {
       default: throw new Error(`operator '${op}' not defined for matrices`);
     }
   }
+  // v0.9.0: membership. One operator across every container the language has, because an LLM
+  // should not have to remember whether the value in hand is an array, a dict or a string.
+  if (op === 'in') {
+    if (r == null) return false;
+    if (typeof r === 'string') return r.indexOf(String(l)) !== -1;
+    if (Array.isArray(r)) return r.some(v => equalsVal(v, l));
+    if (r instanceof Range) { const n = Number(l); return r.step > 0 ? (n >= r.lo && n < r.hi) : (n <= r.lo && n > r.hi); }
+    if (r instanceof BVec) return r.data.slice(0, r.len).some(v => equalsVal(v, l));
+    if (r instanceof BMap) return r.has(l);
+    if (r instanceof Map || r instanceof Set) return r.has(l);
+    if (typeof r === 'object') return Object.prototype.hasOwnProperty.call(r, stringifyKey(l));
+    return false;
+  }
   switch (op) {
     case '+': return l + r; case '-': return l - r; case '*': return l * r; case '/': return l / r;
     case '%': return l % r;  // v0.8.8: modulo (numbers only — Vec3 has no modulo)
@@ -3334,6 +3793,38 @@ function binaryOp(op, l, r) {
     case '>': case '<': case '>=': case '<=': case '==': case '!=': return compareOp(op, l, r);
     default: throw new Error(`unknown operator '${op}'`);
   }
+}
+
+// v0.9.0: shared helpers for the higher-order library.
+//
+// `keySelector` turns whatever was passed — a lambda, a ^fn name, a closure, a field name, or
+// nothing — into a JS function. Accepting a field name (`xs.sort_by("hp")`) matters: it is the
+// shortest possible spelling of the most common callback, and it cannot be mistyped into
+// silence the way a missing lambda could.
+function keySelector(sel, ctx) {
+  if (sel === undefined || sel === null) return (v) => v;
+  if (typeof sel === 'string') return (v) => (v == null ? null : v[sel]);
+  if (isCallable(sel, ctx.world)) return (v, i) => callValue(sel, [v, i], ctx);
+  if (sel instanceof Atom) return (v) => (v == null ? null : v[sel.name]);
+  return () => sel;
+}
+
+// Natural ordering: numeric for numbers, lexicographic otherwise. JS's default array sort
+// compares stringified values, which puts 10 before 9 — a silent wrong answer.
+function defaultCompare(a, b) {
+  if (typeof a === 'number' && typeof b === 'number') return a - b;
+  if (typeof a === 'boolean' || typeof b === 'boolean') return (a ? 1 : 0) - (b ? 1 : 0);
+  const sa = stringifyKey(a), sb = stringifyKey(b);
+  return sa < sb ? -1 : sa > sb ? 1 : 0;
+}
+
+// Declared parameter count of any callable — used to tell a comparator (2 params) from a key
+// function (1 param) in `.sort(...)`.
+function arityOf(fn) {
+  if (fn instanceof Closure) return fn.params.length;
+  if (fn && Array.isArray(fn.params)) return fn.params.length;
+  if (typeof fn === 'function') return fn.length;
+  return 0;
 }
 
 function callMethod(obj, method, argNodes, ctx) {
@@ -3358,6 +3849,21 @@ function callMethod(obj, method, argNodes, ctx) {
       case 'charAt': return obj.charAt(args[0]);
       case 'charCodeAt': return obj.charCodeAt(args[0]);
       case 'match': { const m = obj.match(args[0]); if (!m) return null; if (args[0] instanceof RegExp && args[0].global) return { matches: Array.from(m), count: m.length }; return { match: m[0], index: m.index, groups: Array.from(m.slice(1)) }; }
+      // v0.9.0: the string methods a text-processing program actually reaches for. `lines`,
+      // `words` and `chars` are the three shapes almost every parsing task starts from.
+      case 'lines': return obj.split(/\r?\n/);
+      case 'words': return obj.trim().split(/\s+/).filter(Boolean);
+      case 'chars': return obj.split('');
+      case 'len': return obj.length;
+      case 'reverse': return obj.split('').reverse().join('');
+      case 'replace_all': return obj.split(String(args[0])).join(String(args[1] ?? ''));
+      case 'capitalize': return obj ? obj[0].toUpperCase() + obj.slice(1) : obj;
+      case 'count': { const needle = String(args[0]); if (!needle) return 0; return obj.split(needle).length - 1; }
+      case 'to_int': { const n = parseInt(obj.trim(), args[0] || 10); return Number.isNaN(n) ? null : n; }
+      case 'to_num': { const n = Number(obj.trim()); return Number.isNaN(n) ? null : n; }
+      case 'trim_start': return obj.replace(/^\s+/, '');
+      case 'trim_end': return obj.replace(/\s+$/, '');
+      case 'is_empty': return obj.length === 0;
     }
   }
   // v0.8.11: dict/object methods — keys, values, entries, has, delete, get, set
@@ -3369,8 +3875,18 @@ function callMethod(obj, method, argNodes, ctx) {
       case 'entries': return Object.entries(obj);
       case 'has': return Object.prototype.hasOwnProperty.call(obj, args[0]);
       case 'delete': delete obj[args[0]]; return undefined;
-      case 'get': return (args[0] in obj) ? obj[args[0]] : args[1];
+      case 'get': return (args[0] in obj) ? obj[args[0]] : (args[1] === undefined ? null : args[1]);
       case 'set': obj[args[0]] = args[1]; return args[1];
+      // v0.9.0: dicts get the same higher-order surface as arrays, so a record or a lookup
+      // table can be transformed without converting it to pairs and back.
+      case 'items': return Object.keys(obj).filter(k => k !== '__type').map(k => [k, obj[k]]);
+      case 'len': return Object.keys(obj).filter(k => k !== '__type').length;
+      case 'map_values': { const f = keySelector(args[0], ctx); const out = {}; for (const k of Object.keys(obj)) { if (k === '__type') continue; out[k] = f(obj[k], k); } return out; }
+      case 'filter': { const f = keySelector(args[0], ctx); const out = {}; for (const k of Object.keys(obj)) { if (k === '__type') continue; if (truthy(f(obj[k], k))) out[k] = obj[k]; } return out; }
+      case 'each': case 'forEach': { const f = keySelector(args[0], ctx); for (const k of Object.keys(obj)) { if (k === '__type') continue; f(obj[k], k); } return null; }
+      case 'merge': return Object.assign({}, obj, ...args.filter(a => a && typeof a === 'object'));
+      case 'clone': { try { return JSON.parse(JSON.stringify(obj)); } catch (e) { return Object.assign({}, obj); } }
+      case 'is_empty': return Object.keys(obj).filter(k => k !== '__type').length === 0;
     }
   }
   // v0.8.8: plain Array methods. LLMs naturally write `items.push(x)`, `.filter(fn)`, etc.
@@ -3424,89 +3940,63 @@ function callMethod(obj, method, argNodes, ctx) {
         return obj.map(v => (v === null || v === undefined) ? '' : String(v)).join(sep);
       }
       case 'sort': {
-        // If a comparator fn is passed as an Ident, look it up in world.fns.
-        const fnNode = argNodes[0] && argNodes[0].value;
-        if (fnNode && fnNode.type === 'Ident') {
-          const fnDecl = ctx.world.fns.get(fnNode.name) || ctx.world.procs.get(fnNode.name);
-          if (fnDecl) {
-            obj.sort((a, b) => {
-              const r = callUserFn(fnDecl, [a, b], ctx);
-              return typeof r === 'number' ? r : 0;
-            });
+        // v0.9.0: the comparator can be a lambda, a ^fn name, a closure in a variable, or a
+        // field name (`items.sort("hp")` sorts by that field). Passing nothing sorts naturally
+        // (numeric for numbers, lexicographic otherwise) instead of JS's string-only order.
+        const sel = args[0];
+        if (sel != null) {
+          if (isCallable(sel, ctx.world) && arityOf(sel) >= 2) {
+            obj.sort((a, b) => { const r = callValue(sel, [a, b], ctx); return typeof r === 'number' ? r : 0; });
             return obj;
           }
+          const key = keySelector(sel, ctx);
+          obj.sort((a, b) => defaultCompare(key(a), key(b)));
+          return obj;
         }
-        // No comparator or not found — default sort (lexicographic for strings, numeric for numbers).
-        // JS default sort is lexicographic, which is wrong for numbers. Detect all-number arrays
-        // and sort numerically in that case.
-        if (obj.every(v => typeof v === 'number')) {
-          obj.sort((a, b) => a - b);
-        } else {
-          obj.sort();
-        }
+        if (obj.every(v => typeof v === 'number')) obj.sort((a, b) => a - b);
+        else obj.sort(defaultCompare);
         return obj;
       }
       case 'reverse': {
         obj.reverse();
         return obj;
       }
-      case 'map': {
-        const fnNode = argNodes[0] && argNodes[0].value;
-        if (fnNode && fnNode.type === 'Ident') {
-          const fnDecl = ctx.world.fns.get(fnNode.name) || ctx.world.procs.get(fnNode.name);
-          if (fnDecl) {
-            return obj.map(item => callUserFn(fnDecl, [item], ctx));
-          }
-        }
-        // No fn — return a shallow copy.
-        return obj.slice();
-      }
-      case 'filter': {
-        const fnNode = argNodes[0] && argNodes[0].value;
-        if (fnNode && fnNode.type === 'Ident') {
-          const fnDecl = ctx.world.fns.get(fnNode.name) || ctx.world.procs.get(fnNode.name);
-          if (fnDecl) {
-            return obj.filter(item => truthy(callUserFn(fnDecl, [item], ctx)));
-          }
-        }
-        return obj.slice();
-      }
+      // v0.9.0: the higher-order methods take ANY callable — a lambda, a ^fn by name, a
+      // closure held in a variable or a dict, or a field-name string. Before v0.9.0 only a
+      // bare ^fn identifier worked and everything else silently returned a copy of the array,
+      // which is the worst possible failure mode: no error, wrong answer.
+      case 'map': { const f = keySelector(args[0], ctx); return obj.map((v, i) => f(v, i)); }
+      case 'filter': { const f = keySelector(args[0], ctx); return obj.filter((v, i) => truthy(f(v, i))); }
+      case 'reject': { const f = keySelector(args[0], ctx); return obj.filter((v, i) => !truthy(f(v, i))); }
       case 'reduce': {
-        const fnNode = argNodes[0] && argNodes[0].value;
-        const initial = args[1];
-        if (fnNode && fnNode.type === 'Ident') {
-          const fnDecl = ctx.world.fns.get(fnNode.name) || ctx.world.procs.get(fnNode.name);
-          if (fnDecl) {
-            let acc = initial !== undefined ? initial : (obj.length > 0 ? obj[0] : undefined);
-            const start = initial !== undefined ? 0 : 1;
-            for (let i = start; i < obj.length; i++) {
-              acc = callUserFn(fnDecl, [acc, obj[i]], ctx);
-            }
-            return acc;
-          }
-        }
-        return initial !== undefined ? initial : (obj.length > 0 ? obj[0] : undefined);
+        const fn = args[0];
+        let acc = args[1];
+        let start = 0;
+        if (acc === undefined) { acc = obj.length ? obj[0] : null; start = 1; }
+        for (let i = start; i < obj.length; i++) acc = callValue(fn, [acc, obj[i], i], ctx);
+        return acc;
       }
-      case 'find': {
-        const fnNode = argNodes[0] && argNodes[0].value;
-        if (fnNode && fnNode.type === 'Ident') {
-          const fnDecl = ctx.world.fns.get(fnNode.name) || ctx.world.procs.get(fnNode.name);
-          if (fnDecl) {
-            return obj.find(item => truthy(callUserFn(fnDecl, [item], ctx)));
-          }
-        }
-        return undefined;
+      case 'find': { const f = keySelector(args[0], ctx); for (let i = 0; i < obj.length; i++) if (truthy(f(obj[i], i))) return obj[i]; return null; }
+      case 'find_index': { const f = keySelector(args[0], ctx); for (let i = 0; i < obj.length; i++) if (truthy(f(obj[i], i))) return i; return -1; }
+      case 'forEach': case 'each': { const f = keySelector(args[0], ctx); for (let i = 0; i < obj.length; i++) f(obj[i], i); return null; }
+      case 'every': case 'all': { const f = keySelector(args[0], ctx); for (let i = 0; i < obj.length; i++) if (!truthy(f(obj[i], i))) return false; return true; }
+      case 'some': case 'any': { const f = keySelector(args[0], ctx); for (let i = 0; i < obj.length; i++) if (truthy(f(obj[i], i))) return true; return false; }
+      case 'flat_map': case 'flatMap': { const f = keySelector(args[0], ctx); const out = []; for (let i = 0; i < obj.length; i++) { const r = f(obj[i], i); if (Array.isArray(r)) out.push(...r); else out.push(r); } return out; }
+      case 'count': {
+        if (args[0] === undefined) return obj.length;
+        if (isCallable(args[0], ctx.world)) { const f = keySelector(args[0], ctx); let n = 0; for (let i = 0; i < obj.length; i++) if (truthy(f(obj[i], i))) n++; return n; }
+        let n = 0; for (const v of obj) if (equalsVal(v, args[0])) n++; return n;
       }
-      case 'forEach': {
-        const fnNode = argNodes[0] && argNodes[0].value;
-        if (fnNode && fnNode.type === 'Ident') {
-          const fnDecl = ctx.world.fns.get(fnNode.name) || ctx.world.procs.get(fnNode.name);
-          if (fnDecl) {
-            for (const item of obj) callUserFn(fnDecl, [item], ctx);
-          }
-        }
-        return null;
-      }
+      case 'sum': { const f = keySelector(args[0], ctx); let t = 0; for (let i = 0; i < obj.length; i++) { const v = args[0] === undefined ? obj[i] : f(obj[i], i); t += typeof v === 'number' ? v : Number(v) || 0; } return t; }
+      case 'min': { if (!obj.length) return null; const f = keySelector(args[0], ctx); let best = obj[0], bk = args[0] === undefined ? obj[0] : f(obj[0], 0); for (let i = 1; i < obj.length; i++) { const k = args[0] === undefined ? obj[i] : f(obj[i], i); if (defaultCompare(k, bk) < 0) { bk = k; best = obj[i]; } } return best; }
+      case 'max': { if (!obj.length) return null; const f = keySelector(args[0], ctx); let best = obj[0], bk = args[0] === undefined ? obj[0] : f(obj[0], 0); for (let i = 1; i < obj.length; i++) { const k = args[0] === undefined ? obj[i] : f(obj[i], i); if (defaultCompare(k, bk) > 0) { bk = k; best = obj[i]; } } return best; }
+      case 'sort_by': { const f = keySelector(args[0], ctx); return obj.slice().sort((a, b) => defaultCompare(f(a), f(b))); }
+      case 'group_by': { const f = keySelector(args[0], ctx); const out = {}; for (let i = 0; i < obj.length; i++) { const g = stringifyKey(f(obj[i], i)); (out[g] = out[g] || []).push(obj[i]); } return out; }
+      case 'uniq': { const f = keySelector(args[0], ctx); const seen = new Set(); const out = []; for (let i = 0; i < obj.length; i++) { const k = stringifyKey(args[0] === undefined ? obj[i] : f(obj[i], i)); if (seen.has(k)) continue; seen.add(k); out.push(obj[i]); } return out; }
+      case 'len': return obj.length;
+      case 'first': return obj.length ? obj[0] : null;
+      case 'last': return obj.length ? obj[obj.length - 1] : null;
+      case 'clear': { obj.length = 0; return obj; }
       case 'flat': {
         const depth = args[0] !== undefined ? args[0] : 1;
         return obj.flat(depth);
@@ -3649,7 +4139,18 @@ function callMethod(obj, method, argNodes, ctx) {
     if (method === 'has') return obj.has(evalExpr(argNodes[0].value, ctx));
     if (method === 'clear') { obj.clear(); return null; }
   }
-  throw new Error(`no method '.${method}(...)' on ${obj && obj.constructor ? obj.constructor.name : typeof obj}`);
+  // v0.9.0: a field holding a function IS a method. This is how objects are written without
+  // adding a class construct: `counter = {n: 0, bump: \d: ...}` then `counter.bump(1)`. It
+  // also covers a record whose ^type field holds a callback, and an entity field holding one.
+  if (obj != null) {
+    let member;
+    if (obj instanceof EntityInstance) member = obj.get(method);
+    else if (typeof obj === 'object') member = obj[method];
+    if (member !== undefined && isCallable(member, ctx.world)) {
+      return callValue(member, argNodes.map(a => evalExpr(a.value, ctx)), ctx, method);
+    }
+  }
+  throw new AxiomError(`no method '.${method}(...)' on ${typeNameOf(obj)}`, 'AX-RUNTIME-METHOD');
 }
 
 function resolveObserveArg(valueNode, ctx) {
@@ -3727,7 +4228,12 @@ function callGlobalQuery(name, argNodes, entity, ctx) {
   if (name === 'exists') {
     const tagArg = argNodes[0] && argNodes[0].value;
     if (!tagArg || tagArg.type !== 'TagRef') {
-      throw new Error(`'?exists(...)' requires a #Tag argument`);
+      // v0.9.0: `exists(path)` on a string is the filesystem check from the standard library.
+      // The two readings never overlap — one takes a #Tag, the other a string — so accepting
+      // both here spares the LLM from having to remember which spelling the language wanted.
+      const v = tagArg ? evalExpr(tagArg, ctx) : null;
+      if (typeof v === 'string') return ctx.world.intrinsics.file_exists(v);
+      throw new AxiomError(`'?exists(...)' takes a #Tag (entity check) or a string (file check)`, 'AX-QUERY-001');
     }
     return ctx.world.resolveTag(tagArg.path[0]) !== undefined;
   }
@@ -3750,20 +4256,55 @@ function callGlobalQuery(name, argNodes, entity, ctx) {
 }
 
 // v0.4: call a user-defined function. Returns the value of the last expression (implicit return).
+// v0.9.0: every call gets a fresh scope frame, which is what makes recursion correct. The
+// frame's parent is the world's root scope (globals), NOT the caller's frame — AxiomScript is
+// lexically scoped, so a function cannot see its caller's locals.
 function callUserFn(fnDecl, argVals, ctx) {
-  const fnCtx = { ...ctx, fnParams: {} };
-  for (let i = 0; i < fnDecl.params.length; i++) {
-    fnCtx.fnParams[fnDecl.params[i]] = i < argVals.length ? argVals[i] : null;
+  const world = ctx.world;
+  if ((world._callDepth = (world._callDepth || 0) + 1) > MAX_CALL_DEPTH) {
+    world._callDepth = 0;
+    throw new AxiomError(`call depth exceeded ${MAX_CALL_DEPTH} in '${fnDecl.name}' — infinite recursion?`, 'AX-DEPTH-001');
   }
-  let lastVal = null;
-  for (const stmt of fnDecl.body) {
-    const result = execStmtInner(stmt, fnCtx);
-    if (result instanceof ReturnSignal) return result.value;
-    if (result !== undefined && !(result instanceof BreakSignal) && !(result instanceof ContinueSignal)) {
-      lastVal = result;
+  try {
+    const scope = new Scope(world.globalScope, true);
+    const defaults = fnDecl.defaults || {};
+    const defCtx = { ...ctx, scope, fnParams: null, inFn: true, hot: false };
+    for (let i = 0; i < fnDecl.params.length; i++) {
+      const pname = fnDecl.params[i];
+      let v = i < argVals.length ? argVals[i] : undefined;
+      // v0.9.0: a missing (or explicitly null) argument takes the parameter's default.
+      if ((v === undefined || v === null) && defaults[pname]) v = evalExpr(defaults[pname], defCtx);
+      scope.declare(pname, v === undefined ? null : v);
     }
+    scope.declare('args', argVals.slice());
+    const fnCtx = { ...ctx, scope, fnParams: null, inFn: true, hot: false, blockName: ctx.blockName };
+    let lastVal = null;
+    for (const stmt of fnDecl.body) {
+      const result = execStmtInner(stmt, fnCtx);
+      if (result instanceof ReturnSignal) return result.value;
+      if (result !== undefined && !(result instanceof BreakSignal) && !(result instanceof ContinueSignal)) {
+        lastVal = result;
+      }
+    }
+    return lastVal;
+  } catch (err) {
+    throw asDepthError(err);
+  } finally {
+    world._callDepth--;
   }
-  return lastVal;
+}
+
+// The interpreter uses several JS frames per AxiomScript call, so a deep recursion can exhaust
+// the host stack before MAX_CALL_DEPTH is reached. Either way the program gets one clear,
+// catchable error naming the real cause instead of a host-level RangeError.
+function asDepthError(err) {
+  // Deliberately no regex here: this runs with the stack already exhausted, where compiling a
+  // pattern can fail outright. A plain indexOf costs nothing and cannot.
+  if (err instanceof RangeError && String(err.message || '').indexOf('call stack') !== -1) {
+    const e = new AxiomError('recursion depth exhausted the host stack — add a base case, rewrite the recursion as a loop, or raise the limit with `node --stack-size=N`', 'AX-DEPTH-001');
+    return e;
+  }
+  return err;
 }
 
 function callFunction(name, argNodes, ctx) {
@@ -3791,14 +4332,28 @@ function callFunction(name, argNodes, ctx) {
     if (Array.isArray(v)) return v.length;
     if (v instanceof BVec || v instanceof BMap) return v.len;
     if (v instanceof Pool) return v.liveCount;
-    if (v && typeof v === 'object') return Object.keys(v).length;
+    // v0.9.0: a Range knows its own length, and a record's `__type` tag is not a field.
+    if (v instanceof Range) return Math.max(0, Math.round(v.hi) - Math.round(v.lo));
+    if (v && typeof v === 'object') return Object.keys(v).filter(k => k !== '__type').length;
     return 0;
   }
   // v0.8.13: range() — Python-style range(n) and range(lo, hi)
   if (name === 'range') {
     const args = argNodes.map(a => evalExpr(a.value, ctx));
     if (args.length === 1) return new Range(0, args[0]);
+    // v0.9.0: `range(lo, hi, step)`, including a negative step for a countdown. Without a
+    // step, counting down needed a manual while loop (≈12 tokens) for no reason.
+    if (args.length >= 3) return new Range(args[0], args[1], args[2]);
     return new Range(args[0], args[1]);
+  }
+  // v0.9.0: innermost binding wins. A local or parameter holding a callable — `f = \x: x + 1`
+  // then `f(2)`, or a callback passed in by name — shadows a same-named function or intrinsic,
+  // which is what lexical scope means and what makes a parameter called `map` or `sum` safe.
+  if (ctx.scope) {
+    const v = ctx.scope.lookup(name);
+    if (v !== NOT_BOUND && isCallable(v, ctx.world)) {
+      return callValue(v, argNodes.map(a => evalExpr(a.value, ctx)), ctx, name);
+    }
   }
   // v0.4: user-defined functions AND procs
   let fnDecl = ctx.world.fns.get(name);
@@ -3810,18 +4365,192 @@ function callFunction(name, argNodes, ctx) {
   const intr = ctx.world.intrinsics[name];
   if (intr) {
     const args = argNodes.map(a => evalExpr(a.value, ctx));
-    return intr(...args);
+    return invokeIntrinsic(intr, args, ctx);
   }
+  // v0.9.0: `^type` names are constructors — `^type P: x, y` then `P(1, 2)` or `P(x: 1, y: 2)`
+  // builds {x: 1, y: 2, __type: "P"}. Records were declarable but not constructible before.
+  const typeDecl = ctx.world.typeDecls.get(name);
+  if (typeDecl) return constructRecord(typeDecl, argNodes, ctx);
   if (name === 'patrol_point') return patrolPoint(ctx.entity);
-  throw new Error(`unknown function '${name}(...)'`);
+  // v0.9.0: distinguish "no such function" from "that name holds something that is not a
+  // function" — the fix for the two is completely different.
+  if (ctx.scope) {
+    const bound = ctx.scope.lookup(name);
+    if (bound !== NOT_BOUND) {
+      throw new AxiomError(`'${name}' holds ${typeNameOf(bound)}, which is not callable`, 'AX-CALL-001');
+    }
+  }
+  if (ctx.entity && ctx.entity.get(name) !== undefined) {
+    throw new AxiomError(`field '${name}' holds ${typeNameOf(ctx.entity.get(name))}, which is not callable`, 'AX-CALL-001');
+  }
+  throw new AxiomError(`unknown function '${name}(...)'`, 'AX-RUNTIME-FUNC');
+}
+
+// v0.9.0: build a record from a ^type declaration. Positional args follow declaration order;
+// named args (`P(y: 2)`) may be mixed in; omitted fields are null. The `__type` tag lets
+// `type(v)` report the record's name and lets a match arm dispatch on shape.
+function constructRecord(typeDecl, argNodes, ctx) {
+  const out = { __type: typeDecl.name };
+  for (const f of typeDecl.fields) out[f.name] = null;
+  let pos = 0;
+  for (const a of argNodes) {
+    if (!a) continue;
+    const v = a.value ? evalExpr(a.value, ctx) : null;
+    if (a.name) { out[a.name] = v; continue; }
+    const f = typeDecl.fields[pos++];
+    if (f) out[f.name] = v;
+  }
+  return out;
 }
 
 // ==========================================================================================
 // SECTION 10: Statement Execution
 // ==========================================================================================
 
+// v0.9.0: read a bare name for a compound assignment (`x += 1`). Same resolution order as
+// resolveIdent, minus the atom fallback (a missing name reads as null, so `n += 1` on an
+// undeclared name starts from null rather than from the atom `n`).
+// v0.9.0: a match arm pattern. A bare lowercase identifier that is not bound anywhere matches
+// by atom equality (`idle`, `running`), which is how state machines are written; everything
+// else is an ordinary expression compared by value. A record pattern `P` (a ^type name) matches
+// any record carrying that `__type`, so `?* node:` can dispatch on shape.
+function matchesPattern(subject, patNode, ctx) {
+  if (patNode.type === 'Ident' && ctx.world && ctx.world.typeDecls.has(patNode.name)) {
+    return !!(subject && typeof subject === 'object' && subject.__type === patNode.name);
+  }
+  return equalsVal(subject, evalExpr(patNode, ctx));
+}
+
+function readVar(name, ctx) {
+  if (ctx.scope) { const hit = ctx.scope.lookup(name); if (hit !== NOT_BOUND) return hit === undefined ? null : hit; }
+  if (ctx.entity) {
+    const v = ctx.entity.get(name);
+    if (v !== undefined) return v;
+  }
+  return null;
+}
+
+// v0.9.0: the assignment rule, in one place.
+//   1. a name already bound in an enclosing scope frame  → write there (params, locals)
+//   2. an existing field of the running entity           → write the field (unchanged v0.8
+//                                                          behavior for game code)
+//   3. otherwise                                         → declare in the current function
+//                                                          frame, or on the entity when the
+//                                                          statement runs in an entity block
+// `declareLocal` (the `~x: v` form) forces case 3's scope branch, which is how a script
+// shadows an outer name on purpose.
+function writeVar(name, value, ctx, declareLocal) {
+  // Inside a function body (`ctx.inFn`), `~x: v` declares/updates a local explicitly.
+  if (declareLocal && ctx.inFn && ctx.scope) {
+    if (!ctx.scope.setExisting(name, value)) ctx.scope.fnFrame().declare(name, value);
+    return;
+  }
+  if (ctx.scope && ctx.scope.setExisting(name, value)) return;
+  // An entity block keeps v0.8 semantics exactly: a bare assignment lands on the entity, so a
+  // name used as frame-to-frame scratch state still persists. Only function bodies get true
+  // locals for undeclared names — which is precisely the change recursion needed.
+  if (ctx.entity && (!ctx.inFn || ctx.entity.get(name) !== undefined)) { ctx.entity.set(name, value); return; }
+  if (ctx.scope) { ctx.scope.fnFrame().declare(name, value); return; }
+  if (ctx.entity) { ctx.entity.set(name, value); return; }
+  throw new AxiomError(`cannot assign '${name}' — no scope and no entity in this context`, 'AX-SCOPE-001');
+}
+
+// Run a statement list in a child scope frame (loop bodies, match arms, try blocks). Returns
+// a control signal (break/continue/return) or undefined.
+function execBody(body, ctx, scope) {
+  const bodyCtx = scope ? { ...ctx, scope } : ctx;
+  for (const st of body) {
+    const r = execStmtInner(st, bodyCtx);
+    if (r instanceof BreakSignal || r instanceof ContinueSignal || r instanceof ReturnSignal) return r;
+  }
+  return undefined;
+}
+
+// v0.9.0: does this statement list create a closure? Only an inline lambda can capture a loop
+// iteration's scope frame (a declared ^fn closes over the globals, never over its caller), so
+// when a body contains none, one scope frame can be reused across iterations instead of one
+// per iteration. That keeps frame blocks close to their pre-0.9 allocation profile — the
+// zero-allocation contract is the reason &physics exists.
+function bodyCreatesClosure(stmt) {
+  if (stmt.__capt !== undefined) return stmt.__capt;
+  let found = false;
+  const seen = new Set();
+  const walk = (node) => {
+    if (found || !node || typeof node !== 'object') return;
+    if (Array.isArray(node)) { for (const n of node) walk(n); return; }
+    if (seen.has(node)) return;
+    seen.add(node);
+    if (node.type === 'Lambda') { found = true; return; }
+    for (const k in node) {
+      if (k === 'type' || k === 'line' || k === 'col' || k === '__capt') continue;
+      const v = node[k];
+      if (v && typeof v === 'object') walk(v);
+    }
+  };
+  walk(stmt.body);
+  stmt.__capt = found;
+  return found;
+}
+
+// v0.9.0: loop budget. Inside a hot entity block a runaway loop must not freeze the frame, so
+// it is capped; inside a ^fn/^proc/^main there is no cap — a long-running computation is the
+// point of a general-purpose language, and the old blanket 10 000-iteration limit made even a
+// million-step sum impossible.
+function loopLimitFor(ctx) {
+  return ctx.hot ? HOT_LOOP_LIMIT : Infinity;
+}
+
 function execStmtInner(stmt, ctx) {
   switch (stmt.type) {
+    // v0.9.0: `?* subject:` — multiway match on value equality, `_` arm is the default.
+    case 'Match': {
+      const subject = evalExpr(stmt.subject, ctx);
+      for (const arm of stmt.arms) {
+        let hit = false;
+        if (arm.patterns === null) hit = true;   // `_` default
+        else {
+          for (const pat of arm.patterns) {
+            if (matchesPattern(subject, pat, ctx)) { hit = true; break; }
+          }
+        }
+        if (hit) return execBody(arm.body, ctx, new Scope(ctx.scope || ctx.world.globalScope));
+      }
+      return;
+    }
+    // v0.9.0: `^throw expr` — raise. Any value can be thrown; a dict is the idiomatic form
+    // for structured errors (`^throw {code: "E_IO", msg: "no file"}`).
+    case 'Throw': {
+      const v = stmt.expr ? evalExpr(stmt.expr, ctx) : null;
+      throw new AxiomError(v, (v && typeof v === 'object' && v.code) ? v.code : 'AX-THROW');
+    }
+    // v0.9.0: `^try: ... ^catch e: ... ^fin: ...`. Catches both program throws and engine
+    // faults (bad index, unknown method, division by a missing value), so a program can
+    // recover instead of losing the rest of the block.
+    case 'Try': {
+      let signal;
+      try {
+        signal = execBody(stmt.body, ctx, new Scope(ctx.scope || ctx.world.globalScope));
+      } catch (err) {
+        if (err instanceof BreakSignal || err instanceof ContinueSignal || err instanceof ReturnSignal) throw err;
+        if (!stmt.catchBody) {
+          if (stmt.finallyBody) execBody(stmt.finallyBody, ctx, new Scope(ctx.scope || ctx.world.globalScope));
+          throw err;
+        }
+        const catchScope = new Scope(ctx.scope || ctx.world.globalScope);
+        if (stmt.catchVar) catchScope.declare(stmt.catchVar, errorToValue(err));
+        try {
+          signal = execBody(stmt.catchBody, ctx, catchScope);
+        } finally {
+          if (stmt.finallyBody) execBody(stmt.finallyBody, ctx, new Scope(ctx.scope || ctx.world.globalScope));
+        }
+        return signal;
+      }
+      if (stmt.finallyBody) {
+        const fsig = execBody(stmt.finallyBody, ctx, new Scope(ctx.scope || ctx.world.globalScope));
+        if (fsig) return fsig;
+      }
+      return signal;
+    }
     // v0.5 fix: deep member assignment (pose.vel.y = 0)
     case 'DeepAssign': {
       // v0.8.2: if stmt.tag is set, this is a cross-entity deep assign (#Tag.field.path = expr).
@@ -3862,6 +4591,14 @@ function execStmtInner(stmt, ctx) {
       else if (obj && typeof obj === 'object') obj[lastProp] = v;
       return;
     }
+    // v0.9.0: `a, b = expr` — unpack an array, a key/value pair, or a record by field name.
+    case 'DestructureAssign': {
+      const v = evalExpr(stmt.value, ctx);
+      for (let i = 0; i < stmt.names.length; i++) {
+        writeVar(stmt.names[i], destructureElement(v, i, stmt.names[i]), ctx, false);
+      }
+      return;
+    }
     case 'Assign': {
       if (stmt.op === '~=') {
         const dist = resolveIdent(stmt.target, ctx);
@@ -3879,14 +4616,14 @@ function execStmtInner(stmt, ctx) {
         // v0.8.17: `??=` (compoundOp '??') writes only when current is null/undefined.
         let v = evalExpr(stmt.value, ctx);
         if (stmt.compoundOp) {
-          const current = ctx.entity.get(stmt.target);
+          const current = readVar(stmt.target, ctx);
           if (stmt.compoundOp === '??') {
             if (current !== null && current !== undefined) return;
           } else {
             v = binaryOp(stmt.compoundOp, current, v);
           }
         }
-        ctx.entity.set(stmt.target, v);
+        writeVar(stmt.target, v, ctx, stmt.sigil === '~');
       }
       return;
     }
@@ -3903,7 +4640,7 @@ function execStmtInner(stmt, ctx) {
         else if (arr instanceof BVec) current = arr.get(idx);
         else if (arr instanceof BMap) current = arr.get(idx);
         else if (arr && typeof arr === 'object') current = arr[idx];
-        else throw new Error(`cannot index-assign to ${arr && arr.constructor ? arr.constructor.name : typeof arr}`);
+        else throw new AxiomError(`cannot assign into ${typeNameOf(arr)} by index — '${stmt.obj}' is not an array or dict`, 'AX-RUNTIME-INDEX');
         // v0.8.17: ??= short-circuits on non-null current.
         if (stmt.compoundOp === '??') {
           if (current !== null && current !== undefined) return;
@@ -3915,7 +4652,7 @@ function execStmtInner(stmt, ctx) {
       else if (arr instanceof BVec) arr.set(idx, v);
       else if (arr instanceof BMap) arr.set(idx, v);
       else if (arr && typeof arr === 'object') arr[idx] = v;
-      else throw new Error(`cannot index-assign to ${arr && arr.constructor ? arr.constructor.name : typeof arr}`);
+      else throw new AxiomError(`cannot assign into ${typeNameOf(arr)} by index — '${stmt.obj}' is not an array or dict`, 'AX-RUNTIME-INDEX');
       return;
     }
     // v0.4 fix: member assignment (e.hp = val)
@@ -4026,53 +4763,86 @@ function execStmtInner(stmt, ctx) {
     }
     case 'WhileLoop': {
       let iters = 0;
+      const limit = loopLimitFor(ctx);
+      const outer = ctx.scope || (ctx.world ? ctx.world.globalScope : null);
+      const fresh = bodyCreatesClosure(stmt);
+      let scope = new Scope(outer);
+      let bodyCtx = { ...ctx, scope };
       while (truthy(evalExpr(stmt.cond, ctx))) {
-        if (++iters > 10000) throw new Error('while loop exceeded 10000 iterations');
-        for (const s of stmt.body) {
-          const r = execStmtInner(s, ctx);
-          if (r instanceof BreakSignal) return;
-          if (r instanceof ReturnSignal) return r;
-          if (r instanceof ContinueSignal) continue; // v0.4 fix: ~continue in for-loop
+        if (++iters > limit) throw new AxiomError(`while loop exceeded ${limit} iterations in a hot block`, 'AX-LOOP-002');
+        if (fresh) { scope = new Scope(outer); bodyCtx = { ...ctx, scope }; }
+        else if (scope.vars.size) scope.vars.clear();
+        let r;
+        for (const st of stmt.body) {
+          r = execStmtInner(st, bodyCtx);
+          if (r instanceof BreakSignal || r instanceof ContinueSignal || r instanceof ReturnSignal) break;
+          r = undefined;
         }
+        if (r instanceof BreakSignal) return;
+        if (r instanceof ReturnSignal) return r;
+        // ContinueSignal: next iteration.
       }
       return;
     }
     case 'ForLoop': {
       const iterable = evalExpr(stmt.iterable, ctx);
-      // v0.8.11: add plain-object (dict) iteration — iterate keys.
+      // v0.9.0: the loop variable lives in a scope frame instead of the entity's locals, so a
+      // loop works with no entity present (scripts), nests without clobbering, and does not
+      // leave a stray field behind. Multi-variable loops (`*k, v in ...`) destructure here.
+      const loopVars = stmt.vars && stmt.vars.length > 1 ? stmt.vars : null;
+      const outerScope = ctx.scope || (ctx.world ? ctx.world.globalScope : null);
+      const bindLoop = (scope, item) => {
+        if (loopVars) {
+          for (let vi = 0; vi < loopVars.length; vi++) scope.declare(loopVars[vi], destructureElement(item, vi, loopVars[vi]));
+        } else {
+          scope.declare(stmt.varName, item);
+        }
+      };
+      const seqLimit = loopLimitFor(ctx);
+      let seqIters = 0;
+      const freshFrame = bodyCreatesClosure(stmt);
+      let loopScope = new Scope(outerScope);
+      let loopCtx = { ...ctx, scope: loopScope };
+      const runIteration = (item) => {
+        if (++seqIters > seqLimit) throw new AxiomError(`for loop exceeded ${seqLimit} iterations in a hot block`, 'AX-LOOP-002');
+        if (freshFrame) { loopScope = new Scope(outerScope); loopCtx = { ...ctx, scope: loopScope }; }
+        else if (loopScope.vars.size) loopScope.vars.clear();
+        bindLoop(loopScope, item);
+        for (const st of stmt.body) {
+          const r = execStmtInner(st, loopCtx);
+          if (r instanceof BreakSignal || r instanceof ContinueSignal || r instanceof ReturnSignal) return r;
+        }
+        return undefined;
+      };
+      // Dict / record iteration yields KEYS (v0.8 behavior); `*k, v in items(d):` yields pairs.
       if (iterable && typeof iterable === 'object' && !Array.isArray(iterable) && !(iterable instanceof Range) && !(iterable instanceof BVec) && !(iterable instanceof BMap) && !(iterable instanceof Pool) && !(iterable instanceof Vec2) && !(iterable instanceof Vec3) && !(iterable instanceof Quat) && !(iterable instanceof EntityInstance) && typeof iterable[Symbol.iterator] !== 'function') {
         for (const k of Object.keys(iterable)) {
-          ctx.entity.locals.set(stmt.varName, k);
-          for (const s of stmt.body) {
-            const r = execStmtInner(s, ctx);
-            if (r instanceof BreakSignal) return;
-            if (r instanceof ReturnSignal) return r;
-            if (r instanceof ContinueSignal) break;
-          }
+          const r = loopVars ? runIteration([k, iterable[k]]) : runIteration(k);
+          if (r instanceof BreakSignal) return;
+          if (r instanceof ReturnSignal) return r;
         }
-      } else if (iterable instanceof Range || Array.isArray(iterable) || iterable instanceof BVec || (iterable && typeof iterable[Symbol.iterator] === 'function')) {
-        for (const item of iterable) {
-          ctx.entity.locals.set(stmt.varName, item);
-          for (const s of stmt.body) {
-            const r = execStmtInner(s, ctx);
-            if (r instanceof BreakSignal) return;
-            if (r instanceof ReturnSignal) return r;
-            if (r instanceof ContinueSignal) break; // v0.5.1 fix: ~continue skips remaining body, outer loop advances
-          }
+        return;
+      }
+      if (iterable instanceof Range || Array.isArray(iterable) || iterable instanceof BVec || typeof iterable === 'string' || (iterable && typeof iterable[Symbol.iterator] === 'function')) {
+        const seq = typeof iterable === 'string' ? iterable.split('') : (iterable instanceof BVec ? iterable.data.slice(0, iterable.len) : iterable);
+        for (const item of seq) {
+          const r = runIteration(item);
+          if (r instanceof BreakSignal) return;
+          if (r instanceof ReturnSignal) return r;
         }
-      } else if (iterable instanceof Pool) {
+        return;
+      }
+      if (iterable instanceof Pool) {
         for (const slot of iterable.slots) {
           if (!slot.used) continue;
-          ctx.entity.locals.set(stmt.varName, slot.data);
-          for (const s of stmt.body) {
-            const r = execStmtInner(s, ctx);
-            if (r instanceof BreakSignal) return;
-            if (r instanceof ReturnSignal) return r;
-            if (r instanceof ContinueSignal) break; // v0.5.1 fix: ~continue in Pool iteration
-          }
+          const r = runIteration(slot.data);
+          if (r instanceof BreakSignal) return;
+          if (r instanceof ReturnSignal) return r;
         }
+        return;
       }
-      return;
+      if (iterable == null) return;
+      throw new AxiomError(`cannot iterate a ${typeof iterable}`, 'AX-ITER-001');
     }
     case 'Return': {
       return new ReturnSignal(evalExpr(stmt.expr, ctx));
@@ -4744,10 +5514,27 @@ function execAction(name, argNodes, ctx) {
     return;
   }
   // Native subsystem actions
-  const subsystem = NATIVE_SUBSYSTEMS[ctx.entity.decl.base];
+  const subsystem = ctx.entity ? NATIVE_SUBSYSTEMS[ctx.entity.decl.base] : null;
   if (subsystem && subsystem.actions.includes(name)) {
     const args = argNodes.map(a => evalExpr(a.value, ctx));
     return subsystem.actionImpl(name, args, ctx.entity, ctx.world);
+  }
+  // v0.9.0: `!name(...)` falls back to a user ^proc/^fn, to a callable held in a local, and
+  // finally to an intrinsic. Statement position is where an LLM naturally writes a call whose
+  // result it does not use, and before this a `!draw_row(y)` calling a declared ^proc failed at
+  // runtime with "undefined action" — a confusing error for correct-looking code.
+  const userDecl = ctx.world.procs.get(name) || ctx.world.fns.get(name);
+  if (userDecl) {
+    const args = argNodes.map(a => evalExpr(a.value, ctx));
+    return callUserFn(userDecl, args, ctx);
+  }
+  if (ctx.scope && ctx.scope.has(name)) {
+    const v = ctx.scope.get(name);
+    if (isCallable(v, ctx.world)) return callValue(v, argNodes.map(a => evalExpr(a.value, ctx)), ctx, name);
+  }
+  const intrinsic = ctx.world.intrinsics[name];
+  if (typeof intrinsic === 'function') {
+    return invokeIntrinsic(intrinsic, argNodes.map(a => evalExpr(a.value, ctx)), ctx);
   }
   throw new Error(`unknown action '!${name}(...)'`);
 }
@@ -4775,6 +5562,20 @@ function spawnInit(node, ctx) {
 }
 
 function classifyRuntimeError(err) {
+  // v0.9.0: errors the new language features raise carry their own code already.
+  if (err instanceof AxiomError && err.axiomCode) {
+    const code = err.axiomCode;
+    if (code === 'AX-DEPTH-001') return { code, human: 'Recursion went too deep.', hint: 'Add a base case, or convert the recursion to a loop. Use memo(fn) if the recursion is re-computing the same arguments.' };
+    if (code === 'AX-LOOP-002') return { code, human: 'A loop in a hot block ran past its iteration budget.', hint: 'Frame blocks (&physics/&render/&tick/&on) are capped so one frame cannot hang the program. Move the long computation into a ^fn called from ^main, or bound the loop.' };
+    if (code === 'AX-CALL-001') return { code, human: 'Tried to call something that is not a function.', hint: 'Check the value: type(v) reports "fn" for callables. A ^fn name used without () is a function value; a field holding a number is not.' };
+    if (code === 'AX-SANDBOX-001') return { code, human: 'The sandbox denied this operation.', hint: 'Pass --allow-read/--allow-write for the path, or --allow-exec for commands. Sandbox mode denies all three by default.' };
+    if (code === 'AX-RUNTIME-INDEX') return { code, human: err.message, hint: 'Guard the value first: `?is_null(v):` or `v ?? []`, and use len(v) to check the range. Reading past the end of an array gives null rather than an error.' };
+    if (code === 'AX-RUNTIME-METHOD') return { code, human: err.message, hint: 'Check the receiver type with type(v). Array, dict, and string methods are listed in STDLIB.md; a dict field holding a function is callable as a method.' };
+    if (code === 'AX-RUNTIME-FUNC') return { code, human: err.message, hint: 'Declare it with ^fn/^proc, import it with ^use, or check the spelling against STDLIB.md.' };
+    if (code === 'AX-CHECK') return { code, human: err.message, hint: 'A check()/check_eq() assertion failed. Catch it with ^try:/^catch e: or fix the condition.' };
+    if (code === 'AX-EXIT') return { code, human: err.message, hint: 'exit() ended the program; this is not a failure unless the code is non-zero.' };
+    return { code, human: err.message, hint: 'Raised by ^throw or by the standard library. Wrap the call in ^try:/^catch e: to handle it.' };
+  }
   const m = (err && err.message) || String(err);
   if (/^no method/.test(m)) return {
     code: 'AX-RUNTIME-METHOD', human: 'Called an undefined method.',
@@ -4831,7 +5632,9 @@ function makeRuntimeFault(entity, block, stmt, err, world) {
   return {
     error_code: cls.code,
     severity: 'fatal',
-    location: { entity: entity.decl.name, block: block.name, line, col },
+    // v0.9.0: entity may be null — ^main, a global initializer, and a ^fn called from the host
+    // all run without one.
+    location: { entity: entity ? entity.decl.name : null, block: block ? block.name : null, line, col },
     violated_rule: { section: 'runtime', title: 'Runtime Fault' },
     context_snippet: snippet,
     message_for_human: cls.human,
@@ -4842,8 +5645,15 @@ function makeRuntimeFault(entity, block, stmt, err, world) {
   };
 }
 
+const HOT_BLOCKS = new Set(['physics', 'render', 'tick', 'on']);
+
 function runBlock(block, entity, world, dt, eventPayload) {
-  const ctx = { entity, world, dt, blockName: block.name, eventPayload: eventPayload || null };
+  // v0.9.0: each block execution gets its own scope frame (parented to the world globals), and
+  // is marked `hot` when it runs on the frame budget so loop caps apply there and only there.
+  const ctx = {
+    entity, world, dt, blockName: block.name, eventPayload: eventPayload || null,
+    scope: new Scope(world.globalScope), inFn: false, hot: HOT_BLOCKS.has(block.name),
+  };
   for (const stmt of block.body) {
     try {
       execStmtInner(stmt, ctx);

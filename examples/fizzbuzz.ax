@@ -1,0 +1,7 @@
+// The smallest complete program shape: ^main, a loop, a match, output.
+// Run: node main.js examples/fizzbuzz.ax
+^main:
+  *n in range(1, 21):
+    ?* [n % 3, n % 5]:
+      [0, 0]: print("FizzBuzz")
+      _: print(n % 3 == 0 ? "Fizz" : n % 5 == 0 ? "Buzz" : str(n))

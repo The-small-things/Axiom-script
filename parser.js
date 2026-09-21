@@ -68,6 +68,12 @@ class Parser {
     const procs = [];
     const mixins = []
     const materials = [];
+    // v0.9.0: `^use "path"` imports and the `^main:` entry point. Both are top-level decls.
+    // `uses` is a list of {path, line, col}; the checker resolves and splices them in before
+    // the semantic passes run (see checker.js resolveUses).
+    const uses = [];
+    const globals = [];
+    let main = null;
     let inputBlock = null;
     // v0.8.8: parse-error recovery. Collect errors instead of throwing on the first one. When
     // a top-level decl parse throws, record the error, skip to the next `@` / `^` / `#` / EOF,
@@ -101,6 +107,24 @@ class Parser {
           mixins.push(this.parseMixinDecl());
         } else if (this.at(TT.CARET) && this.peek(1).type === TT.IDENT && this.peek(1).value === 'mat') {
           materials.push(this.parseMaterialDecl());
+        // v0.9.0: `^main:` — the program entry point. A file with a ^main runs as a script:
+        // the body executes once, top to bottom, with no entities and no frame loop required.
+        // This is what makes AxiomScript usable for apps, CLI tools, and math — the game loop
+        // is now opt-in (it starts only when the program declares entities).
+        } else if (this.at(TT.CARET) && this.peek(1).type === TT.IDENT && this.peek(1).value === 'main') {
+          const m = this.parseMainDecl();
+          if (main) throw new ParseError('duplicate ^main — a program has exactly one entry point', this.peek());
+          main = m;
+        // v0.9.0: `^use "lib.ax"` — textual module import (include-once, resolved relative to
+        // the importing file). Everything the imported file declares becomes available here.
+        } else if (this.at(TT.CARET) && this.peek(1).type === TT.IDENT && this.peek(1).value === 'use') {
+          uses.push(this.parseUseDecl());
+        // v0.9.0: top-level `~NAME: value` declares a program global — a constant or a shared
+        // table every ^fn can read without it being threaded through as a parameter. The
+        // alternative (packing constants into a dict and passing it everywhere) costs tokens
+        // on every call and is exactly the boilerplate this language exists to remove.
+        } else if (this.at(TT.TILDE) && this.peek(1).type === TT.IDENT) {
+          globals.push(this.parseGlobalDecl());
         } else {
           throw new ParseError(`unexpected top-level token ${this.peek().type}`, this.peek());
         }
@@ -126,7 +150,83 @@ class Parser {
       }
       this.skipNewlines();
     }
-    return { type: 'Program', entities, inputBlock, resources, events, types, fns, procs, mixins, materials };
+    return { type: 'Program', entities, inputBlock, resources, events, types, fns, procs, mixins, materials, uses, globals, main };
+  }
+
+  // v0.9.0: `~NAME: expr` at top level — a program global. Several names may share one value
+  // (`~a, b: 0`), matching the entity field shorthand.
+  parseGlobalDecl() {
+    const line = this.peek().line, col = this.peek().col;
+    this.expect(TT.TILDE);
+    const names = [this.expect(TT.IDENT).value];
+    while (this.at(TT.COMMA)) { this.advance(); names.push(this.expect(TT.IDENT).value); }
+    this.expect(TT.COLON);
+    const value = this.parseExpr();
+    this.expect(TT.NEWLINE);
+    return { type: 'GlobalDecl', names, value, line, col };
+  }
+
+  // v0.9.0: `^main:` / `^main(args):` — the entry point. `args` (optional, one param) receives
+  // the CLI argument array. The body is an ordinary statement list; `^return n` sets the process
+  // exit code. Parsed as a ProcDecl-shaped node so callUserFn can run it unchanged.
+  parseMainDecl() {
+    const line = this.peek().line, col = this.peek().col;
+    this.expect(TT.CARET);
+    this.expect(TT.IDENT); // 'main'
+    const params = [];
+    if (this.at(TT.LPAREN)) {
+      this.advance();
+      if (!this.at(TT.RPAREN)) {
+        params.push(this.expect(TT.IDENT).value);
+        while (this.at(TT.COMMA)) { this.advance(); params.push(this.expect(TT.IDENT).value); }
+      }
+      this.expect(TT.RPAREN);
+    }
+    // Expression body: `^main = expr` (one-liner scripts).
+    if (this.at(TT.ASSIGN)) {
+      this.advance();
+      const expr = this.parseExpr();
+      this.expect(TT.NEWLINE);
+      return { type: 'MainDecl', name: 'main', params, body: [{ type: 'ExprStmt', expr, line, col }], line, col };
+    }
+    this.expect(TT.COLON);
+    // Single-line body: `^main: print("hi")` — the whole program in 5 tokens.
+    if (!this.at(TT.NEWLINE)) {
+      const body = [this.parseStmt()];
+      return { type: 'MainDecl', name: 'main', params, body, line, col };
+    }
+    this.expect(TT.NEWLINE);
+    this.expect(TT.INDENT);
+    const body = [];
+    while (!this.at(TT.DEDENT)) { body.push(this.parseStmt()); this.skipNewlines(); }
+    this.expect(TT.DEDENT);
+    return { type: 'MainDecl', name: 'main', params, body, line, col };
+  }
+
+  // v0.9.0: `^use "path.ax"` — import every top-level declaration of another file into this
+  // program. Include-once by resolved absolute path, so diamond imports and cycles are safe.
+  // There is no namespace qualifier by design: a qualifier costs 2 tokens at every call site,
+  // and LLM-authored programs are small enough that a flat namespace with a duplicate-name
+  // diagnostic (AX-USE-002) is the cheaper trade.
+  parseUseDecl() {
+    const line = this.peek().line, col = this.peek().col;
+    this.expect(TT.CARET);
+    this.expect(TT.IDENT); // 'use'
+    const paths = [];
+    const first = this.peek();
+    if (first.type !== TT.STRING) throw new ParseError(`^use expects a quoted path, got ${first.type}`, first);
+    this.advance();
+    paths.push(first.value);
+    // `^use "a.ax", "b.ax"` — several imports in one statement.
+    while (this.at(TT.COMMA)) {
+      this.advance();
+      const t = this.peek();
+      if (t.type !== TT.STRING) throw new ParseError(`^use expects a quoted path, got ${t.type}`, t);
+      this.advance();
+      paths.push(t.value);
+    }
+    this.expect(TT.NEWLINE);
+    return { type: 'UseDecl', paths, line, col };
   }
 
   // v0.2 §1.6: "#Mesh3D Terrain: \"assets/terrain.mesh\"" — declares a shared, content-addressed
@@ -201,18 +301,37 @@ class Parser {
   // meaningful for events today (§2.3.1) -- a Pool element type's fields (v0.3 §2.1.1) are always
   // required, since a partially-initialized pooled struct isn't a sound thing to hand back from
   // "!spawn(...)".
+  // v0.9.0: schema fields accept a single-line comma form in addition to the indented block:
+  //   ^type P: x:: number, y:: number
+  // The block form is unchanged. The one-liner saves 2 tokens per field (no NEWLINE/INDENT
+  // bookkeeping) and keeps small record types to one line, which is how LLMs write them.
+  // v0.9.0: the type annotation is also optional — `^type P: x, y` declares two untyped
+  // fields. Types are documentation here (the runtime is dynamically typed), so paying 2
+  // tokens per field for `:: number` is optional, not mandatory.
   parseSchemaFields() {
     this.expect(TT.COLON);
-    this.expect(TT.NEWLINE);
-    this.expect(TT.INDENT);
     const fields = [];
-    while (!this.at(TT.DEDENT)) {
+    const parseOne = () => {
       const fname = this.expect(TT.IDENT).value;
-      this.expect(TT.COLONCOLON);
-      const ftype = this.parseTypeRef();
+      let ftype = null;
+      if (this.at(TT.COLONCOLON)) { this.advance(); ftype = this.parseTypeRef(); }
       let optional = false;
       if (this.at(TT.QUESTION)) { this.advance(); optional = true; }
       fields.push({ name: fname, ftype, optional });
+    };
+    // Single-line form: `^type P: x:: number, y:: number`
+    if (!this.at(TT.NEWLINE)) {
+      parseOne();
+      while (this.at(TT.COMMA)) { this.advance(); parseOne(); }
+      this.expect(TT.NEWLINE);
+      return fields;
+    }
+    this.expect(TT.NEWLINE);
+    this.expect(TT.INDENT);
+    while (!this.at(TT.DEDENT)) {
+      parseOne();
+      // Allow several fields per line in the block form too.
+      while (this.at(TT.COMMA)) { this.advance(); parseOne(); }
       this.expect(TT.NEWLINE);
     }
     this.expect(TT.DEDENT);
@@ -247,17 +366,28 @@ class Parser {
   //   token is `=`, parse a single expression and use it as an implicit `^return expr` body.
   //   This saves 2-3 tokens per short function (no `:` NEWLINE INDENT `^return` NEWLINE DEDENT).
   //   Same AST as the block form (FnDecl with body = [Return(expr)]).
+  // v0.9.0: parameters may carry a default — `^fn clamp_to(v, lo = 0, hi = 1)`. A caller that
+  // omits one gets the default instead of null, which removes the `?x == null: x = d` prologue
+  // (5-7 tokens per optional parameter) that optional arguments used to require.
+  parseParamDefault() {
+    if (!this.at(TT.ASSIGN)) return null;
+    this.advance();
+    return this.parseTernary();
+  }
+
   parseFnDecl() {
     const line = this.peek().line, col = this.peek().col;
     this.expect(TT.CARET);
     this.expect(TT.IDENT); // 'fn'
     const name = this.expect(TT.IDENT).value;
     const params = [];
+    const defaults = {};
     let retType = null;
     if (this.at(TT.LPAREN)) {
       this.advance();
       if (!this.at(TT.RPAREN)) {
         params.push(this.expect(TT.IDENT).value);
+        { const d = this.parseParamDefault(); if (d) defaults[params[params.length - 1]] = d; }
         while (this.at(TT.COMMA)) {
           this.advance();
           // v0.4 fix: -> type annotation on last param inside parens
@@ -267,6 +397,7 @@ class Parser {
             break;
           }
           params.push(this.expect(TT.IDENT).value);
+          { const d = this.parseParamDefault(); if (d) defaults[params[params.length - 1]] = d; }
         }
         // v0.4 fix: -> can also appear after last param without trailing comma
         if (!retType && this.at(TT.ARROW)) {
@@ -287,7 +418,7 @@ class Parser {
       const expr = this.parseExpr();
       this.expect(TT.NEWLINE);
       const body = [{ type: 'Return', expr, line, col }];
-      return { type: 'FnDecl', name, params, retType, body, line, col };
+      return { type: 'FnDecl', name, params, defaults, retType, body, line, col };
     }
     this.expect(TT.COLON);
     this.expect(TT.NEWLINE);
@@ -295,7 +426,7 @@ class Parser {
     const body = [];
     while (!this.at(TT.DEDENT)) { body.push(this.parseStmt()); this.skipNewlines(); }
     this.expect(TT.DEDENT);
-    return { type: 'FnDecl', name, params, retType, body, line, col };
+    return { type: 'FnDecl', name, params, defaults, retType, body, line, col };
   }
 
   // v0.4: "^proc name(a, b):" — imperative procedure. No return type. Can call !actions.
@@ -305,11 +436,17 @@ class Parser {
     this.expect(TT.IDENT); // 'proc'
     const name = this.expect(TT.IDENT).value;
     const params = [];
+    const defaults = {};
     if (this.at(TT.LPAREN)) {
       this.advance();
       if (!this.at(TT.RPAREN)) {
         params.push(this.expect(TT.IDENT).value);
-        while (this.at(TT.COMMA)) { this.advance(); params.push(this.expect(TT.IDENT).value); }
+        { const d = this.parseParamDefault(); if (d) defaults[params[params.length - 1]] = d; }
+        while (this.at(TT.COMMA)) {
+          this.advance();
+          params.push(this.expect(TT.IDENT).value);
+          { const d = this.parseParamDefault(); if (d) defaults[params[params.length - 1]] = d; }
+        }
       }
       this.expect(TT.RPAREN);
     }
@@ -320,7 +457,7 @@ class Parser {
       this.expect(TT.NEWLINE);
       // Wrap as ExprStmt — proc expression body doesn't auto-return (unlike ^fn).
       const body = [{ type: 'ExprStmt', expr, line, col }];
-      return { type: 'ProcDecl', name, params, body, line, col };
+      return { type: 'ProcDecl', name, params, defaults, body, line, col };
     }
     this.expect(TT.COLON);
     this.expect(TT.NEWLINE);
@@ -328,7 +465,7 @@ class Parser {
     const body = [];
     while (!this.at(TT.DEDENT)) { body.push(this.parseStmt()); this.skipNewlines(); }
     this.expect(TT.DEDENT);
-    return { type: 'ProcDecl', name, params, body, line, col };
+    return { type: 'ProcDecl', name, params, defaults, body, line, col };
   }
 
   // v0.4: "^mix HP: ~hp: 100, ~max: 100" — mixin declaration. Contains field decls and blocks.
@@ -890,6 +1027,22 @@ class Parser {
     }
     if (this.at(TT.CARET)) {
       if (this.peek(1).type === TT.IDENT && this.peek(1).value === 'emit') return this.parseEmit();
+      // v0.9.0: structured error handling. `^try:` / `^catch e:` / `^fin:` and `^throw expr`.
+      // Without this, any failure in a block aborted the whole block and pushed a runtime
+      // diagnostic — fine for a game frame, useless for a program that must recover (parse a
+      // file, retry a request, validate input).
+      if (this.peek(1).type === TT.IDENT && this.peek(1).value === 'try') return this.parseTryStmt();
+      if (this.peek(1).type === TT.IDENT && this.peek(1).value === 'throw') {
+        const line = this.peek().line, col = this.peek().col;
+        this.advance(); this.advance(); // ^ throw
+        let expr = null;
+        if (!this.at(TT.NEWLINE) && !this.at(TT.SEMICOLON)) expr = this.parseExpr();
+        if (this.at(TT.SEMICOLON)) this.advance(); else this.expect(TT.NEWLINE);
+        return { type: 'Throw', expr, line, col };
+      }
+      if (this.peek(1).type === TT.IDENT && (this.peek(1).value === 'catch' || this.peek(1).value === 'fin')) {
+        throw new ParseError(`^${this.peek(1).value} without a preceding ^try:`, this.peek());
+      }
       // v0.4: ^return expr
       if (this.peek(1).type === TT.IDENT && this.peek(1).value === 'return') {
         const line = this.peek().line, col = this.peek().col;
@@ -916,15 +1069,21 @@ class Parser {
     if (this.atKeyword('elif') || this.atKeyword('else')) {
       throw new ParseError(`${this.peek().value} without preceding if/?cond:`, this.peek());
     }
+    // v0.9.0: `?* subject:` — multiway match. Arms are `value: stmt` lines, `_` is the default.
+    // Versus an if/elif chain this drops the repeated `subject ==` on every arm: a 6-way
+    // dispatch costs ~24 tokens instead of ~48, and dispatch tables are the single most common
+    // shape in interpreter/state-machine/command-router code.
+    if (this.at(TT.QUESTION) && this.peek(1).type === TT.STAR) {
+      return this.parseMatchStmt();
+    }
     if (this.at(TT.QUESTION)) {
       // v0.8.9: `?!#Tag:` is the exists-shorthand in conditional position. The lexer emits
       // `?!#` as QUESTION + BANG + HASH (not QMARKEQ) so we can detect it here.
       if (this.peek(1).type === TT.BANG && this.peek(2).type === TT.HASH) {
         return this.parseCondBlock();
       }
-      if (this.peek(1).type === TT.BANG) {
-        throw new ParseError('?! (else) without preceding ?cond:', this.peek());
-      }
+      // v0.9.0: `?!expr:` is a negated condition ("if not expr"). The else sigil is `?!:`,
+      // which the lexer emits as a single QMARKEQ token, so there is no ambiguity left here.
       return this.parseCondBlock();
     }
     if (this.atKeyword('if')) {
@@ -945,6 +1104,27 @@ class Parser {
     }
     // transition_chain starts with an lvalue identifier followed eventually by "->"
     if (this.at(TT.IDENT) && this.peek(1).type === TT.ARROW) return this.parseTransitionChain();
+    // v0.9.0: destructuring assignment — `a, b = expr` unpacks an array, a key/value pair, or
+    // a record by field name. It is what makes multi-value returns free: `q, r = divmod(n, d)`
+    // instead of a temporary plus two index reads, with no name to invent for the temporary.
+    if (this.at(TT.IDENT) && this.peek(1).type === TT.COMMA) {
+      const save = this.pos;
+      const names = [this.advance().value];
+      let ok = true;
+      while (this.at(TT.COMMA)) {
+        this.advance();
+        if (!this.at(TT.IDENT)) { ok = false; break; }
+        names.push(this.advance().value);
+      }
+      if (ok && this.at(TT.ASSIGN)) {
+        const line = this.peek().line, col = this.peek().col;
+        this.advance();
+        const value = this.parseExpr();
+        this.expect(TT.NEWLINE);
+        return { type: 'DestructureAssign', names, value, line, col };
+      }
+      this.pos = save;   // not a destructuring — fall through to the ordinary statement forms
+    }
     if (this.at(TT.DOLLAR) || this.at(TT.IDENT)) return this.parseAssignOrExprStmt();
     // v0.8.2: #Tag.field = expr — cross-entity field write. The statement starts with HASH
     // (a TagRef), followed by .field paths, then = and an expression. This is the write
@@ -958,6 +1138,88 @@ class Parser {
       return this.parseAssignOrExprStmt();
     }
     throw new ParseError(`unexpected statement token ${this.peek().type}`, this.peek());
+  }
+
+  // v0.9.0: `^try:` body `^catch e:` handler [`^fin:` cleanup]. The catch variable is optional
+  // (`^catch:` discards the error). The bound value is a dict {msg, code, value} — `value` is
+  // whatever `^throw` was given (any value, not just strings), `code` is the AX-* class for
+  // runtime faults, `msg` is always a string so f-strings can print it directly.
+  parseTryStmt() {
+    const line = this.peek().line, col = this.peek().col;
+    this.expect(TT.CARET);
+    this.expect(TT.IDENT); // 'try'
+    this.expect(TT.COLON);
+    const body = this.parseIndentedOrInlineBody();
+    let catchVar = null, catchBody = null, finallyBody = null;
+    this.skipNewlines();
+    if (this.at(TT.CARET) && this.peek(1).type === TT.IDENT && this.peek(1).value === 'catch') {
+      this.advance(); this.advance();
+      if (this.at(TT.IDENT)) catchVar = this.advance().value;
+      this.expect(TT.COLON);
+      catchBody = this.parseIndentedOrInlineBody();
+      this.skipNewlines();
+    }
+    if (this.at(TT.CARET) && this.peek(1).type === TT.IDENT && this.peek(1).value === 'fin') {
+      this.advance(); this.advance();
+      this.expect(TT.COLON);
+      finallyBody = this.parseIndentedOrInlineBody();
+    }
+    if (!catchBody && !finallyBody) {
+      throw new ParseError('^try: needs a ^catch: or ^fin: clause', this.peek());
+    }
+    return { type: 'Try', body, catchVar, catchBody, finallyBody, line, col };
+  }
+
+  // Shared body parser for the v0.9.0 block forms: either a single inline statement on the
+  // same line, or a NEWLINE + INDENT block. Mirrors what parseBlock/parseCondBlock already do.
+  parseIndentedOrInlineBody() {
+    if (!this.at(TT.NEWLINE)) return [this.parseStmt()];
+    this.advance();
+    this.expect(TT.INDENT);
+    const body = [];
+    while (!this.at(TT.DEDENT)) { body.push(this.parseStmt()); this.skipNewlines(); }
+    this.expect(TT.DEDENT);
+    return body;
+  }
+
+  // v0.9.0: `?* subject:` multiway match.
+  //
+  //   ?* cmd:
+  //     "add", "plus": r = a + b
+  //     "neg": r = -a
+  //     _: ^throw f"bad op {cmd}"
+  //
+  // Arm patterns are ordinary expressions compared with value equality (the same `==` the
+  // language already uses), several per arm separated by commas. `_` is the default arm and
+  // must come last. Arm bodies are inline statements or indented blocks.
+  // A match is an ordinary statement — it has no value; assign inside the arms.
+  parseMatchStmt() {
+    const line = this.peek().line, col = this.peek().col;
+    this.expect(TT.QUESTION);
+    this.expect(TT.STAR);
+    const subject = this.parseExpr();
+    this.expect(TT.COLON);
+    this.expect(TT.NEWLINE);
+    this.expect(TT.INDENT);
+    const arms = [];
+    let sawDefault = false;
+    while (!this.at(TT.DEDENT)) {
+      if (this.at(TT.IDENT) && this.peek().value === '_' && this.peek(1).type === TT.COLON) {
+        this.advance(); this.advance();
+        arms.push({ patterns: null, body: this.parseIndentedOrInlineBody() });
+        sawDefault = true;
+        this.skipNewlines();
+        continue;
+      }
+      if (sawDefault) throw new ParseError('the `_` default arm must be last in a ?* match', this.peek());
+      const patterns = [this.parseExpr()];
+      while (this.at(TT.COMMA)) { this.advance(); patterns.push(this.parseExpr()); }
+      this.expect(TT.COLON);
+      arms.push({ patterns, body: this.parseIndentedOrInlineBody() });
+      this.skipNewlines();
+    }
+    this.expect(TT.DEDENT);
+    return { type: 'Match', subject, arms, line, col };
   }
 
   // v0.8.2: parse `#Tag.field = expr` (or `#Tag.field.subfield = expr` for deep member assign).
@@ -1053,7 +1315,9 @@ class Parser {
         // Parse else clause — v0.8.11: single-line support (same pattern as normal cond path)
         let elseBody = null;
         if (this.at(TT.QMARKEQ)) { this.advance(); this.expect(TT.COLON); if (this.at(TT.NEWLINE)) { this.advance(); this.expect(TT.INDENT); elseBody = []; while (!this.at(TT.DEDENT)) { elseBody.push(this.parseStmt()); this.skipNewlines(); } this.expect(TT.DEDENT); } else { elseBody = [this.parseStmt()]; } }
-        else if (this.at(TT.QUESTION) && this.peek(1).type === TT.BANG) { this.advance(); this.advance(); this.expect(TT.COLON); if (this.at(TT.NEWLINE)) { this.advance(); this.expect(TT.INDENT); elseBody = []; while (!this.at(TT.DEDENT)) { elseBody.push(this.parseStmt()); this.skipNewlines(); } this.expect(TT.DEDENT); } else { elseBody = [this.parseStmt()]; } }
+        // v0.9.0: `? ! :` is an else clause only when the `!` is immediately followed by `:`.
+        // `?!flag:` (a negated condition) starts a NEW conditional, not an else branch.
+        else if (this.at(TT.QUESTION) && this.peek(1).type === TT.BANG && this.peek(2).type === TT.COLON) { this.advance(); this.advance(); this.expect(TT.COLON); if (this.at(TT.NEWLINE)) { this.advance(); this.expect(TT.INDENT); elseBody = []; while (!this.at(TT.DEDENT)) { elseBody.push(this.parseStmt()); this.skipNewlines(); } this.expect(TT.DEDENT); } else { elseBody = [this.parseStmt()]; } }
         else if (this.atKeyword('else')) { this.advance(); this.expect(TT.COLON); if (this.at(TT.NEWLINE)) { this.advance(); this.expect(TT.INDENT); elseBody = []; while (!this.at(TT.DEDENT)) { elseBody.push(this.parseStmt()); this.skipNewlines(); } this.expect(TT.DEDENT); } else { elseBody = [this.parseStmt()]; } }
         else if (this.atKeyword('elif')) { elseBody = [this.parseCondBlock()]; }
         return { type: 'CondBlock', cond, guard, ifBody, elseBody, line, col };
@@ -1145,7 +1409,8 @@ class Parser {
         // v0.8.9: single-line else — ?!: stmt
         elseBody = [this.parseStmt()];
       }
-    } else if (this.at(TT.QUESTION) && this.peek(1).type === TT.BANG) {
+    } else if (this.at(TT.QUESTION) && this.peek(1).type === TT.BANG && this.peek(2).type === TT.COLON) {
+      // v0.9.0: only `? ! :` is an else clause — `?!flag:` is a negated condition.
       this.advance(); // ?
       this.advance(); // !
       this.expect(TT.COLON);
@@ -1179,6 +1444,27 @@ class Parser {
     const line = this.peek().line, col = this.peek().col;
     this.expect(TT.STAR); // consume *
     // Disambiguate: *IDENT in expr (for) vs *expr (while)
+    // v0.9.0: multi-variable for — `*k, v in items(d):` destructures each element. Iterating a
+    // dict's entries or a zip() without destructuring costs 2 extra index reads per iteration.
+    if (this.at(TT.IDENT) && this.peek(1).type === TT.COMMA) {
+      const vars = [this.advance().value];
+      while (this.at(TT.COMMA)) { this.advance(); vars.push(this.expect(TT.IDENT).value); }
+      if (!(this.at(TT.IDENT) && this.peek().value === 'in')) {
+        throw new ParseError(`expected 'in' after loop variables`, this.peek());
+      }
+      this.advance(); // consume 'in'
+      const iterable = this.parseExpr();
+      this.expect(TT.COLON);
+      let body;
+      if (this.at(TT.NEWLINE)) {
+        this.advance(); this.expect(TT.INDENT); body = [];
+        while (!this.at(TT.DEDENT)) { body.push(this.parseStmt()); this.skipNewlines(); }
+        this.expect(TT.DEDENT);
+      } else {
+        body = [this.parseStmt()];
+      }
+      return { type: 'ForLoop', varName: vars[0], vars, iterable, body, line, col };
+    }
     if (this.at(TT.IDENT) && this.peek(1).type === TT.IDENT && this.peek(1).value === 'in') {
       const varName = this.advance().value; // loop variable
       this.advance(); // consume 'in'
@@ -1440,7 +1726,20 @@ class Parser {
   // v0.8.9: precedence is now: ternary (lowest) -> nullCoalesce -> infer -> ...
   // ?? binds TIGHTER than ternary (matching C#/JS/TS/Swift), so `x ?? 0 ? a : b`
   // parses as `(x ?? 0) ? a : b`, not `x ?? (0 ? a : b)`.
-  parseExpr() { return this.parseTernary(); }
+  // v0.9.0: `|>` (pipeline) sits at the LOWEST precedence, below the ternary, so
+  // `xs |> filter(\x: x > 0) |> len` reads strictly left to right with no parens to balance.
+  parseExpr() { return this.parsePipeline(); }
+
+  parsePipeline() {
+    let left = this.parseTernary();
+    while (this.at(TT.PIPEGT)) {
+      const line = this.peek().line, col = this.peek().col;
+      this.advance();
+      const right = this.parseTernary();
+      left = { type: 'Pipe', left, right, line, col };
+    }
+    return left;
+  }
 
   // v0.8.8: null-coalescing `a ?? b` — returns `a` if not null/undefined, else `b`.
   // v0.8.9: moved BELOW ternary (tighter) — `a ?? b ?? c` chains left-associatively.
@@ -1483,10 +1782,14 @@ class Parser {
     const cond = this.parseNullCoalesce();
     if (this.at(TT.QUESTION)) {
       this.advance();
-      const branch = this.parseNullCoalesce();
+      // v0.9.0: both branches parse as full ternaries, making `?:` right-associative — so a
+      // chain (`a ? 1 : b ? 2 : 3`) works. Before this the else-branch stopped at `??`
+      // precedence, and an if/elif ladder written as a ternary chain — the shortest way to
+      // express multiway selection in an expression — was a parse error.
+      const branch = this.parseTernary();
       if (this.at(TT.COLON)) {
         this.advance();
-        const elze = this.parseNullCoalesce();
+        const elze = this.parseTernary();
         return { type: 'Ternary', cond, then: branch, else: elze };
       }
       // v0.8.3: `obj ?name(args)` query form. The branch can be a Call (traditional) or a
@@ -1519,11 +1822,30 @@ class Parser {
 
   parseComparison() {
     let left = this.parseAdditive();
-    while (this.atAny(TT.GT, TT.LT, TT.GE, TT.LE, TT.EQEQ, TT.NE, TT.QMARKGT)) {
-      const opTok = this.advance();
-      const opMap = { GT: '>', LT: '<', GE: '>=', LE: '<=', EQEQ: '==', NE: '!=', QMARKGT: '?>' };
-      const right = this.parseAdditive();
-      left = { type: 'Binary', op: opMap[opTok.type], left, right };
+    for (;;) {
+      if (this.atAny(TT.GT, TT.LT, TT.GE, TT.LE, TT.EQEQ, TT.NE, TT.QMARKGT)) {
+        const opTok = this.advance();
+        const opMap = { GT: '>', LT: '<', GE: '>=', LE: '<=', EQEQ: '==', NE: '!=', QMARKGT: '?>' };
+        const right = this.parseAdditive();
+        left = { type: 'Binary', op: opMap[opTok.type], left, right };
+        continue;
+      }
+      // v0.9.0: `x in xs` / `x !in xs` — membership over arrays, strings, dict keys, ranges.
+      // `xs.includes(x)` costs four tokens and needs the collection's type to be known;
+      // `in` costs one and works on all of them.
+      if (this.at(TT.IDENT) && this.peek().value === 'in') {
+        this.advance();
+        const right = this.parseAdditive();
+        left = { type: 'Binary', op: 'in', left, right };
+        continue;
+      }
+      if (this.at(TT.BANG) && this.peek(1).type === TT.IDENT && this.peek(1).value === 'in') {
+        this.advance(); this.advance();
+        const right = this.parseAdditive();
+        left = { type: 'Unary', op: '!', expr: { type: 'Binary', op: 'in', left, right } };
+        continue;
+      }
+      break;
     }
     return left;
   }
@@ -1591,6 +1913,12 @@ class Parser {
         const index = this.parseExpr();
         this.expect(TT.RBRACKET);
         expr = { type: 'Index', obj: expr, index };
+      } else if (this.at(TT.LPAREN) && (expr.type === 'Member' || expr.type === 'Index' || expr.type === 'Call' || expr.type === 'CallValue' || expr.type === 'MethodCall' || expr.type === 'Lambda')) {
+        // v0.9.0: call ANY expression that produced a callable — `fns[i](x)`, `(\x: x)(3)`,
+        // `table.get(k)(arg)`. Before this, only a bare IDENT could appear in call position,
+        // so a function stored in a list or a dict could not be invoked at all.
+        const args = this.parseArgs();
+        expr = { type: 'CallValue', callee: expr, args };
       } else if (this.at(TT.LPAREN) && expr.type === 'Ident') {
         const args = this.parseArgs();
         // v0.8.3: if the callee is a known query name, produce a Query node (receiverless)
@@ -1701,6 +2029,25 @@ class Parser {
 
   parsePrimary() {
     const tok = this.peek();
+    // v0.9.0: lambda — `\x: x * 2`, `\a, b: a + b`, `\: 42` (no params), or the `=>` alias
+    // (`\x => x * 2`). The body is ONE expression and ends where the enclosing expression ends,
+    // so `xs.map(\x: x * 2)` needs no closing delimiter of its own.
+    //
+    // This is what makes the higher-order library usable: before v0.9.0 every callback had to
+    // be a separately declared ^fn (≈8 tokens of overhead, plus a name to invent), which is why
+    // .map/.filter silently degraded to a copy when handed anything else.
+    if (tok.type === TT.BACKSLASH) {
+      this.advance();
+      const params = [];
+      if (!this.at(TT.COLON) && !this.at(TT.FATARROW)) {
+        params.push(this.expect(TT.IDENT).value);
+        while (this.at(TT.COMMA)) { this.advance(); params.push(this.expect(TT.IDENT).value); }
+      }
+      if (this.at(TT.FATARROW)) this.advance();
+      else this.expect(TT.COLON, 'lambda body');
+      const body = this.parseTernary();  // not parsePipeline: `f |> g` after a lambda body pipes the RESULT
+      return { type: 'Lambda', params, body, line: tok.line, col: tok.col };
+    }
     if (tok.type === TT.NUMBER) { this.advance(); return { type: 'NumberLit', value: tok.value, unit: tok.unit }; }
     // v0.5: hex number literal (0xffcc44)
     if (tok.type === TT.HEXNUM) { this.advance(); return { type: 'NumberLit', value: tok.value }; }
@@ -1756,22 +2103,57 @@ class Parser {
         this.expect(TT.RBRACKET);
         return { type: 'Comprehension', expr: firstExpr, vars, iterable, cond, line: tok.line, col: tok.col };
       }
-      // Plain array literal.
+      // Plain array literal. v0.9.0: a trailing comma is tolerated, which matters now that a
+      // literal can span lines — every generator of tabular data emits one.
       const elements = [firstExpr];
-      while (this.at(TT.COMMA)) { this.advance(); elements.push(this.parseExpr()); }
+      while (this.at(TT.COMMA)) {
+        this.advance();
+        if (this.at(TT.RBRACKET)) break;
+        elements.push(this.parseExpr());
+      }
       this.expect(TT.RBRACKET);
       return { type: 'ArrayLit', elements };
     }
     // v0.4: dict literal {k: v, k2: v2}
+    // v0.4: dict literal {k: v}. v0.9.0 extends the key forms:
+    //   {"a-b": 1}     — string keys (any characters, not just identifiers)
+    //   {[expr]: 1}    — computed keys
+    //   {x, y}         — shorthand for {x: x, y: y} (halves the cost of packing locals)
+    //   {a: 1,}        — trailing comma tolerated
     if (tok.type === TT.LBRACE) {
       this.advance();
       const pairs = [];
-      if (!this.at(TT.RBRACE)) {
+      const parseEntry = () => {
+        if (this.at(TT.STRING)) {
+          const k = this.advance().value;
+          this.expect(TT.COLON);
+          pairs.push({ key: k, value: this.parseExpr() });
+          return;
+        }
+        if (this.at(TT.LBRACKET)) {
+          this.advance();
+          const keyExpr = this.parseExpr();
+          this.expect(TT.RBRACKET);
+          this.expect(TT.COLON);
+          pairs.push({ keyExpr, value: this.parseExpr() });
+          return;
+        }
         const k = this.expect(TT.IDENT).value;
-        this.expect(TT.COLON);
-        const v = this.parseExpr();
-        pairs.push({ key: k, value: v });
-        while (this.at(TT.COMMA)) { this.advance(); const kk = this.expect(TT.IDENT).value; this.expect(TT.COLON); const vv = this.parseExpr(); pairs.push({ key: kk, value: vv }); }
+        if (this.at(TT.COLON)) {
+          this.advance();
+          pairs.push({ key: k, value: this.parseExpr() });
+        } else {
+          // Shorthand {x} → {x: x}
+          pairs.push({ key: k, value: { type: 'Ident', name: k, line: tok.line, col: tok.col } });
+        }
+      };
+      if (!this.at(TT.RBRACE)) {
+        parseEntry();
+        while (this.at(TT.COMMA)) {
+          this.advance();
+          if (this.at(TT.RBRACE)) break;  // trailing comma
+          parseEntry();
+        }
       }
       this.expect(TT.RBRACE);
       return { type: 'DictLit', pairs };

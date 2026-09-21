@@ -1,6 +1,13 @@
-# AxiomScript v0.8.15 — Formal Grammar (EBNF)
+# AxiomScript v0.9.0 — Formal Grammar (EBNF)
 
-> This grammar covers ALL syntax in AxiomScript v0.8.7, including every addition from Phases 1–2
+> **v0.9.0 additions** (all marked `v0.9.0` below): the `^main` entry point, `^use` imports,
+> top-level `~NAME: value` globals, lambdas (`\x: expr`), the pipeline operator `|>`,
+> `^try`/`^catch`/`^fin`/`^throw`, the `?*` match statement, destructuring assignment,
+> multi-variable loops, default parameters, the `in` membership operator, calling any callable
+> expression, richer dict-literal keys, single-line `^type`/`^event` field lists, and
+> bracket-continued multi-line literals.
+>
+> This grammar covers ALL syntax in AxiomScript, including every addition from Phases 1–2
 > (f-strings, comprehensions, expression-body functions, inline blocks, prefix ternary,
 > multi-field declarations, implicit-self actions, numeric shortcuts, comma-mixins, semicolons
 > in entity headers) and the alias forms from Phase 3 (`if`/`elif`/`else`).
@@ -37,8 +44,18 @@ token = AT | TILDE | DOLLAR | AMP | BANG | BANGBANG
       | NULLCOALEQ                              (* v0.8.17: ??= null-coalescing assign *)
       | GT | LT | GE | LE | EQEQ | NE | ASSIGN | PIPE
       | MIDDOT | CROSS | COMPOSE
+      | BACKSLASH | PIPEGT | FATARROW          (* v0.9.0: lambda, pipeline, lambda-body alias *)
       | NUMBER | HEXNUM | IDENT | STRING | FSTRING
       | NEWLINE | INDENT | DEDENT | EOF ;
+
+(* v0.9.0 LEXER CHANGES
+   - BACKSLASH `\` introduces a lambda; PIPEGT `|>` is the pipeline operator; FATARROW `=>`
+     is an accepted alias for the `:` in a lambda body.
+   - `?!` lexes as QMARKEQ (the else sigil) ONLY when immediately followed by `:`. Elsewhere
+     it is QUESTION + BANG, so `?!ready:` reads as "if not ready".
+   - LINE CONTINUATION: a physical line that leaves a `(`, `[`, or `{` open (counted outside
+     string literals) is joined with the lines that follow until the bracket closes. Multi-line
+     array, dict, and argument lists are therefore legal. *)
 
 (* NUMBER carries an optional `unit` suffix (e.g. `3s`, `10hz`, `3f`, `3v`).
    FSTRING is the f"..." or $"..." interpolated string (single token, raw payload kept).
@@ -66,7 +83,28 @@ top_level_decl = entity_decl
                | fn_decl
                | proc_decl
                | mixin_decl
-               | material_decl ;
+               | material_decl
+               | main_decl        (* v0.9.0 *)
+               | use_decl         (* v0.9.0 *)
+               | global_decl ;    (* v0.9.0 *)
+
+(* v0.9.0: the program entry point. A file with a ^main runs as a script — the body executes
+   once, with no entities and no frame loop. A file with BOTH a ^main and entities runs ^main
+   as setup and then starts the loop. At most one ^main per program. *)
+main_decl = '^' 'main' [ '(' IDENT ')' ]
+            ( '=' expr NEWLINE
+            | ':' stmt NEWLINE                                  (* single-line body *)
+            | ':' NEWLINE INDENT { stmt } DEDENT ) ;
+
+(* v0.9.0: textual import, include-once by resolved absolute path (cycles terminate). Paths
+   resolve relative to the importing file; '.ax' is appended if the literal path is absent.
+   All of the imported file's declarations enter one flat namespace; a name the importing file
+   also declares wins, and the shadowing is reported (AX-USE-002). *)
+use_decl = '^' 'use' STRING { ',' STRING } NEWLINE ;
+
+(* v0.9.0: program global — evaluated once, in declaration order, into the root scope. Visible
+   to every function, so constants and lookup tables need not be threaded through calls. *)
+global_decl = '~' IDENT { ',' IDENT } ':' expr NEWLINE ;
 
 (* v0.8.15: @input: block REMOVED (Phase 9 Option B). It was parsed but had no runtime effect.
    Now it's a fatal parse error. Input is fixed: input.move (Vec2), input.jump (bool),
@@ -88,9 +126,18 @@ resource_source = STRING                                      (* file path *)
 ## Events & Types
 
 ```ebnf
-event_decl = '^' 'event' IDENT ':' NEWLINE INDENT { schema_field NEWLINE } DEDENT ;
-type_decl  = '^' 'type'  IDENT ':' NEWLINE INDENT { schema_field NEWLINE } DEDENT ;
-schema_field = IDENT '::' type_ref [ '?' ] ;  (* '?' marks the field optional *)
+event_decl = '^' 'event' IDENT schema_fields ;
+type_decl  = '^' 'type'  IDENT schema_fields ;
+
+(* v0.9.0: fields may be written on one line, comma separated, and the type annotation is
+   optional (the runtime is dynamically typed — the annotation documents intent). *)
+schema_fields = ':' schema_field { ',' schema_field } NEWLINE
+              | ':' NEWLINE INDENT { schema_field { ',' schema_field } NEWLINE } DEDENT ;
+schema_field = IDENT [ '::' type_ref ] [ '?' ] ;  (* '?' marks the field optional *)
+
+(* v0.9.0: a ^type name is also a CONSTRUCTOR. `P(1, 2)` fills the fields in declaration order;
+   `P(y: 2)` names them; omitted fields are null. The result is a dict carrying `__type`, which
+   `type(v)` reports and a `?*` match arm can dispatch on. *)
 type_ref = '#' IDENT | IDENT ;  (* "#Entity" or "number", "v3", etc. *)
 ```
 
@@ -104,8 +151,13 @@ fn_decl = '^' 'fn' IDENT [ param_list ] [ ret_type ]
 
 proc_decl = '^' 'proc' IDENT [ param_list ] ':' NEWLINE INDENT { stmt NEWLINE } DEDENT ;
 
-param_list = '(' IDENT { ',' IDENT } [ '->' type_ref ] ')' ;
+(* v0.9.0: a parameter may carry a default. A caller that omits the argument (or passes null)
+   gets the default, which removes the `?x == null: x = d` prologue optional arguments needed. *)
+param_list = '(' param { ',' param } [ '->' type_ref ] ')' ;
+param = IDENT [ '=' expr ] ;
 ret_type = '->' type_ref ;
+
+(* Inside every ^fn / ^proc / ^main / lambda body, `args` is bound to the full argument list. *)
 ```
 
 ## Mixins & Materials
@@ -216,7 +268,31 @@ stmt = assert_stmt
      | transition_chain
      | assign_stmt
      | expr_stmt
-     | cross_entity_assign ;
+     | cross_entity_assign
+     | match_stmt            (* v0.9.0 *)
+     | try_stmt              (* v0.9.0 *)
+     | throw_stmt            (* v0.9.0 *)
+     | destructure_assign ;  (* v0.9.0 *)
+
+(* v0.9.0: multiway match. Arm patterns are ordinary expressions compared by value equality
+   (which is STRUCTURAL for arrays and dicts, so a tuple works as a pattern); `_` is the
+   default arm and must come last. A bare identifier naming a ^type matches any record of that
+   type. A match is a statement, not an expression — assign inside the arms. *)
+match_stmt = '?' '*' expr ':' NEWLINE INDENT { match_arm } DEDENT ;
+match_arm  = ( expr { ',' expr } | '_' ) ':' inline_or_block_body ;
+
+(* v0.9.0: structured error handling. `^catch` may bind a variable, which receives
+   {msg, code, value}; engine faults (bad index, unknown method, sandbox denial) are catchable
+   through the same handler. At least one of ^catch / ^fin must be present. *)
+try_stmt   = '^' 'try' ':' inline_or_block_body
+             [ '^' 'catch' [ IDENT ] ':' inline_or_block_body ]
+             [ '^' 'fin' ':' inline_or_block_body ] ;
+throw_stmt = '^' 'throw' [ expr ] ( NEWLINE | ';' ) ;
+
+(* v0.9.0: unpack an array, a [key, value] pair, or a record (by field name). *)
+destructure_assign = IDENT { ',' IDENT } '=' expr ( NEWLINE | ';' ) ;
+
+inline_or_block_body = stmt | NEWLINE INDENT { stmt } DEDENT ;
 
 assert_stmt = ( '!!' | BANG BANG ) expr ( NEWLINE | ';' ) ;
 action_stmt = '!' IDENT [ '(' args ')' ] ( NEWLINE | ';' ) ;  (* v0.8.7: implicit-self *)
@@ -237,9 +313,15 @@ cond_block = ( '?' | 'if' ) infer_expr ':'
 else_clause = ( '?!:' | '?' '!' ':' | 'else' ':' ) NEWLINE INDENT { stmt } DEDENT
             | 'elif' cond_block ;  (* v0.8.7: chained else-if — desugars to else:[CondBlock] *)
 
+(* v0.9.0: a for loop may bind SEVERAL variables, destructuring each element — `*k, v in
+   items(d):`, `*i, x in enumerate(xs):`, `*a, b in zip(p, q):`. Bodies may be inline.
+   Loop variables live in a scope frame, so they shadow rather than overwrite, nest safely,
+   and work with no entity present.
+   Iteration budget: loops inside &physics/&render/&tick/&on are capped (AX-LOOP-002) so one
+   frame cannot hang; loops inside ^fn/^proc/^main are uncapped. *)
 loop = for_loop | while_loop ;
-for_loop = '*' IDENT 'in' expr ':' NEWLINE INDENT { stmt } DEDENT ;
-while_loop = '*' expr ':' NEWLINE INDENT { stmt } DEDENT ;
+for_loop = '*' IDENT { ',' IDENT } 'in' expr ':' ( stmt | NEWLINE INDENT { stmt } DEDENT ) ;
+while_loop = '*' expr ':' ( stmt | NEWLINE INDENT { stmt } DEDENT ) ;
 
 break_stmt = '~' 'break' ( NEWLINE | ';' ) ;
 continue_stmt = '~' 'continue' ( NEWLINE | ';' ) ;
@@ -276,7 +358,15 @@ expr_stmt = expr ( NEWLINE | ';' ) ;
    unary → postfix → primary. *)
 
 (* v0.8.15: null-coalescing `??` at lowest precedence (below ternary). `a ?? b ?? c` chains. *)
-expr = null_coalesce ;
+(* v0.9.0: `|>` (pipeline) is the LOWEST precedence, below the ternary.
+     x |> f              → f(x)
+     x |> f(a)           → f(x, a)        (the piped value becomes the FIRST argument)
+     x |> obj.m(a)       → obj.m(x, a)
+     x |> \v: v + 1      → (\v: v + 1)(x)
+   Chaining reads left to right with no nesting to balance. *)
+expr = pipeline ;
+
+pipeline = null_coalesce { '|>' null_coalesce } ;
 
 null_coalesce = ternary { '??' ternary } ;
 
@@ -292,7 +382,13 @@ ternary_else = expr ;
 
 infer = comparison [ '~>' IDENT ] ;  (* e.g. `$belief ~> argmax` *)
 
-comparison = additive { ( '>' | '<' | '>=' | '<=' | '==' | '!=' | '?>' ) additive } ;
+(* v0.9.0: `in` / `!in` — membership over arrays, strings, dict keys, ranges, and buffers,
+   at comparison precedence. No ambiguity with the loop/comprehension `in`: those parse their
+   variable list and consume `in` before any expression parsing begins. *)
+comparison = additive { ( '>' | '<' | '>=' | '<=' | '==' | '!=' | '?>' | 'in' | '!' 'in' ) additive } ;
+
+(* v0.9.0: `==` / `!=` are STRUCTURAL for arrays and plain dicts/records (compared element by
+   element, to a depth of 32) and identity-based for everything else (entities, pools, shapes). *)
 
 additive = multiplicative { ( '+' | '-' | '..' ) multiplicative } ;
 
@@ -301,10 +397,13 @@ multiplicative = unary { ( '*' | '/' | '%' | '·' | '×' | '∘' ) unary } ;
 
 unary = ( '!' | '-' ) unary | postfix ;
 
+(* v0.9.0: ANY expression that evaluates to a callable may be called — `fns[i](x)`,
+   `(\x: x * 2)(4)`, `table.get(k)(arg)`. A dict field holding a function is a method:
+   `ops.dbl(3)` calls the closure stored at `ops.dbl`. *)
 postfix = primary { postfix_op } ;
-postfix_op = '.' IDENT [ '(' args ')' ]     (* member access or method call *)
+postfix_op = '.' IDENT [ '(' args ')' ]     (* member access, method call, or stored-function call *)
            | '[' expr ']'                   (* index *)
-           | '(' args ')' ;                 (* call (only if primary is IDENT) *)
+           | '(' args ')' ;                 (* call — of an IDENT, or of any callable result *)
 
 primary = NUMBER [ unit_suffix ]            (* v0.8.7: 3f, 3v *)
         | HEXNUM
@@ -317,7 +416,15 @@ primary = NUMBER [ unit_suffix ]            (* v0.8.7: 3f, 3v *)
         | '(' expr ')'                       (* grouping *)
         | '?' IDENT '(' args ')'             (* receiverless query *)
         | '?!#' IDENT { '.' IDENT }          (* v0.8.15: ?!#Tag shorthand for ?exists(#Tag) *)
-        | IDENT ;                            (* bare identifier *)
+        | lambda                             (* v0.9.0 *)
+        | IDENT ;                            (* bare identifier — a declared ^fn name used
+                                                without parens is a FUNCTION VALUE; any other
+                                                unbound name is an atom *)
+
+(* v0.9.0: lambda. The body is ONE expression and ends where the enclosing expression ends, so
+   `xs.map(\x: x * 2)` needs no closing delimiter of its own. Closures capture the scope, the
+   entity, and the world they were created in. `=>` is an accepted alias for the `:`. *)
+lambda = '\' [ IDENT { ',' IDENT } ] ( ':' | '=>' ) expr ;
 
 (* v0.8.7: numeric literal suffixes — attached by the lexer as `unit`. *)
 unit_suffix = 'f' | 'v' | 's' | 'ms' | 'hz' | IDENT ;  (* 'f'=float, 'v'=uniform Vec3, others passthrough *)
@@ -328,8 +435,16 @@ unit_suffix = 'f' | 'v' | 's' | 'ms' | 'hz' | IDENT ;  (* 'f'=float, 'v'=uniform
 (* v0.8.7: array comprehension — `[expr for var in iter (if cond)?]` *)
 comprehension = expr 'for' IDENT { ',' IDENT } 'in' expr [ 'if' expr ] ;
 
-array_elems = expr { ',' expr } ;
-dict_elems = { IDENT ':' expr } ;
+(* v0.9.0: trailing commas are tolerated in arrays, dicts, and argument lists. *)
+array_elems = expr { ',' expr } [ ',' ] ;
+
+(* v0.9.0: dict keys may be identifiers, string literals, or computed; `{x}` is shorthand for
+   `{x: x}`. Keys are strings — a computed key is coerced the way an f-string would render it. *)
+dict_elems = dict_entry { ',' dict_entry } [ ',' ] ;
+dict_entry = IDENT ':' expr
+           | STRING ':' expr
+           | '[' expr ']' ':' expr
+           | IDENT ;                         (* shorthand: {x} → {x: x} *)
 args = '(' [ arg { ',' arg } ] ')' ;
 arg = IDENT ':' expr                (* named arg *)
     | ( '>' | '<' | '>=' | '<=' | '==' | '!=' ) expr   (* predicate arg *)
@@ -382,6 +497,14 @@ The 9 sigils (`@ ~ & ! ^ ? * # +`) have context-dependent meanings. The rules:
 | `#` | anywhere | Resource/entity reference | `#Mesh3D Sphere: "..."`, `#Player.pos` |
 | `+` | entity header | Mixin include | `+Stats`, `+M1, M2, M3` |
 | `+` | in expression | Addition operator | `a + b` |
+| `^` | top-level (v0.9.0) | `^main` entry point, `^use` import | `^main:`, `^use "lib.ax"` |
+| `^` | block body (v0.9.0) | `^try` / `^catch` / `^fin` / `^throw` | `^try:`, `^throw "x"` |
+| `~` | top level (v0.9.0) | Program global | `~MAX: 100` |
+| `?*` | statement start (v0.9.0) | Match | `?* cmd:` |
+| `?!` | statement start, NOT followed by `:` (v0.9.0) | Negated condition | `?!ready:` |
+| `\` | expression position (v0.9.0) | Lambda | `\x: x * 2` |
+| `\|>` | between expressions (v0.9.0) | Pipeline | `xs \|> sum` |
+| `in` | between expressions (v0.9.0) | Membership | `x in xs` |
 
 ### Concrete disambiguation examples
 
@@ -409,7 +532,45 @@ $belief ~> argmax            // infer operator (~> after $-field)
 !play("hit.wav")             // action (block body, before IDENT)
 !!hp > 0                     // assert (double-bang)
 ~hp!: 60                     // override marker (! after field name in ~ decl)
+
+// v0.9.0 — ?! disambiguation:
+?!:                          // else clause      (`?!` followed by `:`)
+?!ready:                     // if NOT ready     (`?!` followed by anything else)
+?!#Boss:                     // if #Boss exists  (the ?exists shorthand)
+
+// v0.9.0 — \ and |> :
+xs.map(\x: x * 2)            // lambda; body ends with the enclosing expression
+xs |> filter(\x: x > 0) |> len   // pipeline: filter(xs, ...) then len(...)
+
+// v0.9.0 — `in`:
+*i in 0..10:                 // loop keyword (parsed before any expression)
+?x in [1, 2, 3]:             // membership operator
+[v for v in xs if v in ok]   // both, in one comprehension
 ```
+
+## Scope and assignment (v0.9.0)
+
+AxiomScript is lexically scoped. Each `^fn` / `^proc` / `^main` call and each loop, match arm,
+and `^try` body gets a scope frame; a name resolves to the innermost frame that binds it, then
+to the running entity's fields, then to the program globals.
+
+Assignment (`x = v`) resolves in this order:
+
+1. a name already bound in an enclosing scope frame → written there (parameters, locals);
+2. an existing field of the entity running the statement → written to the field (this is the
+   pre-0.9 behaviour, so every existing entity program is unaffected);
+3. otherwise → declared in the current function frame, or, inside an entity block, on the
+   entity (again matching pre-0.9 behaviour for frame-to-frame scratch state).
+
+Inside a function body, `~x: v` forces the scope branch, which is how a local deliberately
+shadows an outer name. A function never sees its caller's locals.
+
+Consequences: recursion is correct (each call has its own frame), a parameter can be assigned,
+a lambda returned from a function keeps working (closures capture their defining scope), and a
+`^fn` can run with no entity at all — which is what makes script mode possible.
+
+Recursion depth is bounded by the host stack. The CLI raises it at start-up (see
+`--no-restack`); exceeding it raises the catchable `AX-DEPTH-001` rather than crashing.
 
 ## Comments
 

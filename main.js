@@ -30,20 +30,74 @@
 //   node main.js world.ax --png-every 30   # in either mode, save a PNG every 30 frames
 //   node main.js world.ax --input script.txt  # headless mode: per-step input from a file
 //   node main.js world.ax --json --terminal # terminal renders to stdout during run; JSON dump emitted after final frame
+//   node main.js prog.ax --run             # v0.9.0: run ^main as a script and exit
+//   node main.js world.ax --sim 120        # v0.9.0: step 120 frames headless, no renderer
+//   node main.js prog.ax -- a b            # v0.9.0: everything after -- is the program's args()
+//   node main.js prog.ax --no-restack      # v0.9.0: skip the larger-stack re-exec
 //
 // Output: writes PNGs to ./screenshots/frame_NNNNN.png (headless mode only)
 
 const fs = require('fs');
 const path = require('path');
+
+// v0.9.0: RECURSION HEADROOM.
+//
+// Node's default stack allows only a few hundred nested AxiomScript calls — the interpreter
+// uses several host frames per language call — which is far too shallow for a general-purpose
+// language: a recursive descent parser, a tree walk, or a quicksort on a few thousand items
+// all exceed it. Since a program cannot raise its own stack after start-up, the CLI re-executes
+// itself once with a larger one. The child is marked with an environment variable so this
+// happens exactly once; `--no-restack` (or AXIOM_NO_RESTACK=1) opts out.
+//
+// If the larger stack is refused by the OS (a thread-stack ulimit below the request, which
+// shows up as a SIGSEGV on start-up), the run is retried with the default stack rather than
+// failing — a shallower limit is better than no run at all.
+const RESTACK_KB = 6000;
+if (!process.env.AXIOM_NO_RESTACK
+    && !process.argv.includes('--no-restack')
+    && !process.execArgv.some(a => a.startsWith('--stack-size'))) {
+  const { spawnSync } = require('child_process');
+  const childArgs = [`--stack-size=${RESTACK_KB}`, __filename, ...process.argv.slice(2)];
+  const childEnv = Object.assign({}, process.env, { AXIOM_NO_RESTACK: '1' });
+  const res = spawnSync(process.execPath, childArgs, { stdio: 'inherit', env: childEnv });
+  if (!(res.signal === 'SIGSEGV' || res.signal === 'SIGBUS' || res.error)) {
+    process.exit(res.status === null ? 1 : res.status);
+  }
+  // Fall through and run in-process with the default stack.
+  process.env.AXIOM_NO_RESTACK = '1';
+}
 const { compile } = require('./checker');
 const { World, Vec2 } = require('./interpreter');
-const { rasterizeFrame, savePNG } = require('./render3d');
+// v0.9.0: the renderer and the gamepad adapter are loaded ON DEMAND. A script (`^main`) must
+// run with nothing but the language present — requiring a rasterizer to print a number was the
+// clearest sign the runtime assumed every program was a game.
+let _render3d = null;
+function renderer() {
+  if (_render3d) return _render3d;
+  try { _render3d = require('./render3d'); }
+  catch (e) {
+    console.error(`this mode needs the renderer (render3d.js), which could not be loaded: ${e.message}`);
+    console.error(`use --sim N to step the simulation headless, --run for script mode, or --check to validate without executing.`);
+    process.exit(1);
+  }
+  return _render3d;
+}
+const rasterizeFrame = (...a) => renderer().rasterizeFrame(...a);
+const savePNG = (...a) => renderer().savePNG(...a);
 // v0.8.16: terminal rendering backend — converts the RGBA pixel buffer to Unicode
 // block characters with 24-bit ANSI color. Pure post-process on rasterizeFrame output.
 const { renderToTerminal, detectColorSupport } = require('./terminal');
 // v0.8.1: gamepad input adapter — polls @kmamal/sdl controllers (if any connected) and merges
 // LeftStick → input.move, ButtonSouth → input.jump, alongside the existing keyboard polling.
-const { pollGamepadToInput, mergeKeyboardGamepad } = require('./input_gamepad');
+let _gamepad = null;
+function gamepad() {
+  if (_gamepad) return _gamepad;
+  try { _gamepad = require('./input_gamepad'); }
+  catch (e) { _gamepad = { pollGamepadToInput: () => null, mergeKeyboardGamepad: (kb) => kb }; }
+  return _gamepad;
+}
+const pollGamepadToInput = (...a) => gamepad().pollGamepadToInput(...a);
+const mergeKeyboardGamepad = (...a) => gamepad().mergeKeyboardGamepad(...a);
 
 // v0.8.15: serialize AxiomScript runtime values for --json output. Plain numbers/strings/bools
 // pass through. Vec3/Vec2/Quat become arrays. Atom becomes {atom: name}. EntityInstance becomes
@@ -119,6 +173,22 @@ for (let i = 0; i < args.length; i++) {
     else if (a === '--sandbox') { flags.sandbox = true; }
     else if (a === '--allow-net') { flags.allowNet = true; }
     else if (a === '--allow-read') { flags.allowReadPaths = flags.allowReadPaths || []; flags.allowReadPaths.push(args[++i]); }
+    // v0.9.0: the stdlib can write files and run commands, so the sandbox needs gates for both.
+    else if (a === '--allow-write') { flags.allowWritePaths = flags.allowWritePaths || []; flags.allowWritePaths.push(args[++i]); }
+    else if (a === '--allow-exec') { flags.allowExec = true; }
+    // v0.9.0: --run forces script mode (execute ^main, then exit) even when the program also
+    // declares entities. Without it, a program with a ^main runs ^main and then starts the
+    // frame loop only if it has entities to simulate.
+    else if (a === '--run' || a === '-r') { flags.run = true; }
+    else if (a === '--no-restack') { /* handled before start-up; accepted here so it is not "unknown" */ }
+    else if (a === '--help' || a === '-h') { flags.help = true; }
+    else if (a === '--version' || a === '-v') { flags.version = true; }
+    // v0.9.0: --sim N steps the simulation N frames with NO rendering at all. Game logic can
+    // then be exercised (and asserted on, with --json) on a machine with no display and no
+    // rasterizer — the same way a script runs.
+    else if (a === '--sim') { flags.sim = true; flags.frames = parseInt(args[++i], 10) || 60; }
+    // v0.9.0: everything after `--` is the program's own argv, readable with args().
+    else if (a === '--') { flags.scriptArgs = args.slice(i + 1); i = args.length; }
     // v0.8.15: --check (parse-only, no World creation). For linting/CI/IDE. Exits 0 if no
     // fatal/contract_violation diagnostics, 1 otherwise. Diagnostics go to stderr.
     else if (a === '--check') { flags.check = true; }
@@ -137,6 +207,43 @@ for (let i = 0; i < args.length; i++) {
     if (!positionalFile) positionalFile = a;
   }
 }
+// v0.9.0: `--help` / `--version`. A CLI with no usage output forces a model to guess flags
+// from documentation it may not have been given; printing them costs one line each.
+if (flags.help) {
+  console.log(`AxiomScript ${require('./package.json').version} — a language designed to be written by LLMs.
+
+usage: axiom <file.ax> [options] [-- program args]
+
+  <file.ax>              program to run (default: world.ax); '-' is not special, use --stdin
+  --eval '<source>'      run inline source instead of a file
+  --stdin                read the program from standard input
+  -- a b c               everything after -- is passed to the program, readable with args()
+
+running
+  --run, -r              script mode: run ^main and exit (even if the program has entities)
+  --sim N                step a simulation N frames headless, no renderer
+  --check                parse and check only; exit 1 if anything blocks
+  --json                 machine-readable output (result, log, diagnostics, entity state)
+  --no-restack           skip the larger-stack re-exec (lowers the recursion limit)
+
+rendering (only for programs with entities)
+  --terminal, -t [N]     render to the terminal with Unicode blocks
+  --ascii, -A            ASCII density mode          --no-color, -C   disable colour
+  --subpixel, -S         half-block horizontal detail  --term-fps N   terminal frame rate
+  --sdl                  force an SDL window         --headless N     N frames, PNG output
+  --width N --height N   resolution                  --png-every N    PNG dump interval
+  --input FILE           scripted input for headless runs
+
+sandbox
+  --sandbox              deny file writes, subprocesses, and unlisted reads
+  --allow-read PATH      permit reads under PATH     --allow-write PATH  permit writes
+  --allow-exec           permit sh()                 --allow-net         permit network use
+
+docs: README.md (language tour) · STDLIB.md (library) · GRAMMAR.md (full grammar)`);
+  process.exit(0);
+}
+if (flags.version) { console.log(require('./package.json').version); process.exit(0); }
+
 const WIDTH = flags.width || 640;
 const HEIGHT = flags.height || 480;
 const PNG_EVERY = flags.pngEvery || 30;
@@ -170,7 +277,8 @@ if (inlineSource !== null) {
 }
 
 // --- Compile ---
-const r = compile(src);
+// v0.9.0: pass the source path so `^use "lib.ax"` resolves relative to the importing file.
+const r = compile(src, { filename: sourceLabel === '<eval>' || sourceLabel === '<stdin>' ? null : sourceLabel });
 
 // --- --check mode: print diagnostics, exit 0/1, no World creation ---
 if (flags.check) {
@@ -203,14 +311,71 @@ if (flags.sandbox) {
   w.setSandbox({
     allowNet: !!flags.allowNet,
     allowReadPaths: flags.allowReadPaths || [],
+    allowWritePaths: flags.allowWritePaths || [],
+    allowExec: !!flags.allowExec,
   });
   // In --json mode, suppress the sandbox log line (it would corrupt JSON output).
   if (!flags.json) {
     console.log(`Sandbox mode ACTIVE: !play stubbed, !save/!load in-memory only, network ${flags.allowNet ? 'allowed' : 'blocked'}, fs reads ${flags.allowReadPaths ? 'limited to: ' + flags.allowReadPaths.join(', ') : 'blocked'}`);
   }
 }
+// v0.9.0: SCRIPT MODE.
+//
+// A program with a `^main:` runs it once, immediately, before any frame loop. If the program
+// declares no entities (or --run was passed), that is the whole program: ^main returns, the
+// process exits with its return value as the exit code, and no renderer is ever loaded. This
+// is what makes AxiomScript usable for CLI tools, data processing, and mathematics — the
+// simulation loop became opt-in rather than mandatory.
+//
+// A program with BOTH a ^main and entities runs ^main as setup and then enters the loop, which
+// is the natural shape for a game that needs to build a level or load data before the first
+// frame.
+const scriptArgv = flags.scriptArgs || [];
+if (w.mainDecl) {
+  const loopFollows = !flags.run && w.entities.length > 0;
+  if (!flags.json && loopFollows) {
+    console.log(`Loaded ${sourceLabel}: running ^main, then ${w.entities.length} entities`);
+  }
+  try {
+    w.runMain(scriptArgv);
+  } catch (err) {
+    // exit() is an ordinary control-flow signal, not a failure.
+    if (err && err.__exit !== undefined) {
+      flushRuntimeDiagnostics(w);
+      process.exit(err.__exit);
+    }
+    console.error(`runtime error in ^main: ${err && err.message ? err.message : err}`);
+    flushRuntimeDiagnostics(w);
+    process.exit(1);
+  }
+  if (!loopFollows) {
+    flushRuntimeDiagnostics(w);
+    if (flags.json) {
+      console.log(JSON.stringify({
+        main_result: serializeForJson(w.mainResult),
+        log: w.log.map(l => l.msg).filter(Boolean),
+        diagnostics: w.runtimeDiagnostics,
+        exit_code: w.exitCode,
+      }, null, 2));
+    }
+    process.exit(w.exitCode || 0);
+  }
+} else if (flags.run) {
+  console.error(`--run needs a '^main:' entry point; ${sourceLabel} has none.`);
+  process.exit(1);
+}
+
+// Runtime diagnostics are worth printing even when the program "succeeded" — they are the
+// checker's runtime counterpart and each one names a bug the program did not notice.
+function flushRuntimeDiagnostics(world) {
+  if (flags.json) return;
+  for (const d of world.runtimeDiagnostics || []) {
+    console.error(`  [${d.error_code}] ${d.message_for_human}`);
+  }
+}
+
 // In --json mode, suppress the "Loaded ..." log line (it would corrupt JSON output).
-if (!flags.json) {
+if (!flags.json && !w.mainDecl) {
   console.log(`Loaded ${sourceLabel}: ${w.entities.length} entities (${w.entities.map(e => e._tagName).join(', ')}), version ${r.program.version || '(none)'}`);
 }
 
@@ -254,6 +419,30 @@ function dumpFrame(frameNum) {
   savePNG(pixels, WIDTH, HEIGHT, fpath);
   console.log(`  frame ${frameNum} → ${fpath}`);
   return fpath;
+}
+
+// v0.9.0: --sim — headless simulation with no renderer.
+if (flags.sim) {
+  const dt = 1 / 60;
+  for (let i = 0; i < flags.frames; i++) {
+    applyInput(inputSteps[i]);
+    w.update(dt);
+  }
+  flushRuntimeDiagnostics(w);
+  if (flags.json) {
+    console.log(JSON.stringify({
+      frames_run: flags.frames,
+      sim_time: w._simTime,
+      entities: w.entities.map(e => ({
+        tag: e._tagName,
+        fields: Object.fromEntries([...e.fields.entries()].map(([k, v]) => [k, serializeForJson(v)])),
+        pos: serializeForJson(e.locals.get('pose') ? e.locals.get('pose').pos : null),
+      })),
+      log: w.log.map(l => l.msg).filter(Boolean),
+      diagnostics: w.runtimeDiagnostics,
+    }, null, 2));
+  }
+  process.exit(w.runtimeDiagnostics.length ? 1 : 0);
 }
 
 // --- Mode detection ---

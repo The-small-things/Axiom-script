@@ -72,6 +72,11 @@ function walkExpr(node, visit) {
     // v0.8.7: comprehension — the iterable, the filter cond, and the projection expr all need
     // walking (zero-alloc will catch a `~=` inside the comprehension, for example).
     case 'Comprehension': walkExpr(node.iterable, visit); if (node.cond) walkExpr(node.cond, visit); walkExpr(node.expr, visit); return;
+    // v0.9.0: lambda bodies, pipelines, and value-calls are ordinary expression trees — walk
+    // them so every existing check (zero-alloc, sealed body, undefined function) sees inside.
+    case 'Lambda': walkExpr(node.body, visit); return;
+    case 'Pipe': walkExpr(node.left, visit); walkExpr(node.right, visit); return;
+    case 'CallValue': walkExpr(node.callee, visit); node.args.forEach(a => walkExpr(a.value, visit)); return;
     default: return;
   }
 }
@@ -121,6 +126,24 @@ function stmtExprRoots(stmt) {
       if (stmt.body) for (const s of stmt.body) roots.push(...stmtExprRoots(s));
       return roots;
     }
+    // v0.9.0: match arms, try/catch/finally bodies, and throw payloads.
+    case 'Match': {
+      const roots = [stmt.subject];
+      for (const arm of stmt.arms || []) {
+        if (arm.patterns) roots.push(...arm.patterns);
+        for (const s of arm.body || []) roots.push(...stmtExprRoots(s));
+      }
+      return roots;
+    }
+    case 'Try': {
+      const roots = [];
+      for (const s of stmt.body || []) roots.push(...stmtExprRoots(s));
+      for (const s of stmt.catchBody || []) roots.push(...stmtExprRoots(s));
+      for (const s of stmt.finallyBody || []) roots.push(...stmtExprRoots(s));
+      return roots;
+    }
+    case 'Throw': return stmt.expr ? [stmt.expr] : [];
+    case 'DestructureAssign': return [stmt.value];
     default: return [];
   }
 }
@@ -639,7 +662,7 @@ function fieldDefaultsDiffer(a, b) {
 
 // -----------------------------------------------------------------------------
 // v0.4 — Version pragma
-const KNOWN_VERSIONS = new Set(['0.1', '0.2', '0.3', '0.4', '0.5', '0.5.1', '0.6', '0.6.1', '0.7', '0.8', '0.8.1', '0.8.2', '0.8.3', '0.8.4', '0.8.5', '0.8.6', '0.8.7', '0.8.8', '0.8.9', '0.8.10', '0.8.11', '0.8.12', '0.8.13', '0.8.15', '0.8.16', '0.8.17']);
+const KNOWN_VERSIONS = new Set(['0.1', '0.2', '0.3', '0.4', '0.5', '0.5.1', '0.6', '0.6.1', '0.7', '0.8', '0.8.1', '0.8.2', '0.8.3', '0.8.4', '0.8.5', '0.8.6', '0.8.7', '0.8.8', '0.8.9', '0.8.10', '0.8.11', '0.8.12', '0.8.13', '0.8.15', '0.8.16', '0.8.17', '0.9', '0.9.0']);
 function checkVersionPragma(program, source) {
   if (!program.version) return [];
   if (KNOWN_VERSIONS.has(program.version)) return [];
@@ -808,7 +831,21 @@ function checkUnknownBlocks(program, source) {
 // Note: MethodCall nodes (obj.method()) are NOT checked here — the receiver's type isn't known
 // at compile time, and method names vary by type (Vec3.mag, BVec.push, etc.). Only free
 // function calls (name(args)) are checked.
+// v0.9.0: the intrinsic list is DERIVED from the runtime (engine intrinsics + the standard
+// library) instead of being retyped here. A hand-maintained copy drifted every release and
+// produced false "undefined function" advisories for functions that existed — the single
+// most expensive kind of checker bug, because the LLM then rewrites working code.
+const RUNTIME_INTRINSIC_NAMES = (() => {
+  try {
+    const { World } = require('./interpreter');
+    return Object.keys(new World().intrinsics);
+  } catch (e) {
+    return [];
+  }
+})();
+
 const KNOWN_INTRINSIC_NAMES = new Set([
+  ...RUNTIME_INTRINSIC_NAMES,
   // Original intrinsics:
   'v2', 'v3', 'q', 'euler', 'm4', 'persp', 'ortho', 'lookat', 'aabb', 'clamp', 'dist',
   'sphere', 'box', 'capsule', 'vision_cells', 'cell_to_world', 'bar',
@@ -850,14 +887,36 @@ function checkUndefinedFunctions(program, source) {
 
   // Walk every Call node in every block of every entity.
   forEachEntityBlock(program, (entityDecl, block) => {
+    // v0.9.0: names bound inside the block may hold a function (`h = \x: x + 1` then `h(2)`,
+    // a handler pulled out of a dict, a loop variable over a list of callbacks). Collecting
+    // them keeps this check from flagging calls that are perfectly valid — a false "undefined
+    // function" costs a full rewrite cycle, which is worse than the miss it prevents.
+    const boundNames = new Set(entityDecl.members.filter(m => m.type === 'FieldDecl').map(m => m.name));
+    const collect = (stmts) => {
+      for (const st of stmts || []) {
+        if (!st || typeof st !== 'object') continue;
+        if (st.type === 'Assign' && st.target) boundNames.add(st.target);
+        if (st.type === 'DestructureAssign') for (const n of st.names || []) boundNames.add(n);
+        if (st.type === 'ForLoop') { if (st.varName) boundNames.add(st.varName); for (const v of st.vars || []) boundNames.add(v); }
+        if (st.type === 'Try' && st.catchVar) boundNames.add(st.catchVar);
+        for (const key of ['body', 'ifBody', 'elseBody', 'catchBody', 'finallyBody']) {
+          if (Array.isArray(st[key])) collect(st[key]);
+        }
+        for (const arm of st.arms || []) collect(arm.body);
+        for (const root of stmtExprRoots(st)) {
+          walkExpr(root, (n) => { if (n.type === 'Lambda') for (const pn of n.params || []) boundNames.add(pn); });
+        }
+      }
+    };
+    collect(block.body);
     for (const stmt of block.body) {
       for (const root of stmtExprRoots(stmt)) {
         walkExpr(root, (node) => {
           if (node.type !== 'Call') return;
           const callee = node.callee;
           if (!callee) return;
-          // Skip if it's a known intrinsic or declared fn.
-          if (KNOWN_INTRINSIC_NAMES.has(callee) || declaredFns.has(callee)) return;
+          // Skip if it's a known intrinsic, a declared fn, or a name bound in this block.
+          if (KNOWN_INTRINSIC_NAMES.has(callee) || declaredFns.has(callee) || boundNames.has(callee)) return;
           // Skip `observe` (special form) and shape/prior calls in $-field decls (those are
           // validated by checkInferStrategies, not here).
           if (callee === 'observe') return;
@@ -1135,6 +1194,205 @@ function checkCrossEntityWrites(program, source) {
 }
 
 // -----------------------------------------------------------------------------
+// v0.9.0 — `^use "lib.ax"` module resolution.
+//
+// Imports are textual and include-once: every top-level declaration of the imported file is
+// added to the importing program unless a declaration of that name already exists locally
+// (local wins, and the shadowing is reported as an advisory). Cycles terminate because each
+// resolved absolute path is visited at most once.
+//
+// Why textual rather than namespaced: a namespace qualifier costs two tokens at every call
+// site, and the programs this language is written for are small. A flat namespace plus a
+// duplicate-name diagnostic buys the same safety for zero tokens.
+function resolveUses(program, opts) {
+  const fs = require('fs');
+  const path = require('path');
+  const out = [];
+  if (!program || !(program.uses || []).length) return out;
+  const baseDir = opts && opts.filename ? path.dirname(path.resolve(opts.filename)) : process.cwd();
+  const visited = new Set();
+  if (opts && opts.filename) visited.add(path.resolve(opts.filename));
+
+  const mergeDecls = (target, source, fromPath) => {
+    const lists = [
+      ['fns', (d) => d.name], ['procs', (d) => d.name], ['types', (d) => d.name],
+      ['events', (d) => d.name], ['mixins', (d) => d.name], ['materials', (d) => d.name],
+      ['entities', (d) => d.name], ['resources', (d) => d.name],
+      // v0.9.0: a library's `~NAME: value` globals come across too — a constants module is
+      // one of the most useful things to import.
+      ['globals', (d) => (d.names || []).join(',')],
+    ];
+    for (const [key, nameOf] of lists) {
+      target[key] = target[key] || [];
+      const have = new Set(target[key].map(nameOf));
+      for (const decl of source[key] || []) {
+        const nm = nameOf(decl);
+        if (have.has(nm)) {
+          out.push(makePayload({
+            code: 'AX-USE-002', severity: 'advisory', entity: null, block: null,
+            line: decl.line || null, col: decl.col || null,
+            rule: { section: 'v0.9.0', title: 'Imported declaration shadowed' },
+            snippet: null,
+            human: `'${nm}' is declared both locally and in '${fromPath}' — the local declaration wins.`,
+            agent: `The import '${fromPath}' declares '${nm}', which this file also declares. AxiomScript imports share one flat namespace and the importing file takes precedence. Rename one of them if the shadowing was not intentional.`,
+            fix: null, autoFixable: false,
+          }));
+          continue;
+        }
+        have.add(nm);
+        decl._fromFile = decl._fromFile || fromPath;
+        target[key].push(decl);
+      }
+    }
+  };
+
+  const visit = (prog, dir) => {
+    for (const u of prog.uses || []) {
+      for (const rel of u.paths) {
+        let resolved = path.resolve(dir, rel);
+        if (!fs.existsSync(resolved) && fs.existsSync(resolved + '.ax')) resolved += '.ax';
+        if (visited.has(resolved)) continue;
+        if (!fs.existsSync(resolved)) {
+          out.push(makePayload({
+            code: 'AX-USE-001', severity: 'fatal', entity: null, block: null, line: u.line, col: u.col,
+            rule: { section: 'v0.9.0', title: 'Import not found' },
+            snippet: null,
+            human: `^use "${rel}" — no such file (looked in ${dir}).`,
+            agent: `The import path is resolved relative to the importing file's directory, and '.ax' is appended if the literal path does not exist. Create '${rel}' or fix the path.`,
+            fix: null, autoFixable: false,
+          }));
+          continue;
+        }
+        visited.add(resolved);
+        let subSrc, sub;
+        try { subSrc = fs.readFileSync(resolved, 'utf8'); } catch (e) {
+          out.push(makePayload({
+            code: 'AX-USE-001', severity: 'fatal', entity: null, block: null, line: u.line, col: u.col,
+            rule: { section: 'v0.9.0', title: 'Import unreadable' }, snippet: null,
+            human: `^use "${rel}" — could not read the file: ${e.message}`,
+            agent: `Check permissions on '${resolved}'.`, fix: null, autoFixable: false,
+          }));
+          continue;
+        }
+        try { sub = parse(subSrc); } catch (e) {
+          out.push(makePayload({
+            code: 'AX-USE-003', severity: 'fatal', entity: null, block: null, line: u.line, col: u.col,
+            rule: { section: 'v0.9.0', title: 'Import failed to parse' }, snippet: null,
+            human: `^use "${rel}" — the imported file has a parse error: ${e.message}`,
+            agent: `Fix the syntax error inside '${rel}' (its own line numbers apply), then re-check this file.`,
+            fix: null, autoFixable: false,
+          }));
+          continue;
+        }
+        for (const perr of sub.parseErrors || []) {
+          out.push(makePayload({
+            code: 'AX-USE-003', severity: 'fatal', entity: null, block: null, line: u.line, col: u.col,
+            rule: { section: 'v0.9.0', title: 'Import failed to parse' }, snippet: null,
+            human: `^use "${rel}" (line ${perr.line}): ${perr.message}`,
+            agent: `Fix the syntax error inside '${rel}' at its line ${perr.line}.`,
+            fix: null, autoFixable: false,
+          }));
+        }
+        // Depth first, so a library's own imports are available to it.
+        visit(sub, path.dirname(resolved));
+        mergeDecls(program, sub, rel);
+        if (sub.main) {
+          out.push(makePayload({
+            code: 'AX-USE-004', severity: 'advisory', entity: null, block: null, line: u.line, col: u.col,
+            rule: { section: 'v0.9.0', title: 'Imported ^main ignored' }, snippet: null,
+            human: `'${rel}' declares a ^main — only the entry file's ^main runs.`,
+            agent: `A ^main in an imported file is ignored. Move the shared code into a ^fn/^proc so both programs can call it.`,
+            fix: null, autoFixable: false,
+          }));
+        }
+      }
+    }
+  };
+  visit(program, baseDir);
+  return out;
+}
+
+// v0.9.0 — a program must have something to run: a ^main (script) or at least one entity
+// (simulation). A file that declares only functions is a library, which is legitimate when it
+// is imported, so this is an advisory rather than an error.
+function checkEntryPoint(program, source) {
+  if (program.main) return [];
+  if ((program.entities || []).length) return [];
+  const hasDecls = (program.fns || []).length || (program.procs || []).length || (program.types || []).length;
+  if (!hasDecls) return [];
+  return [makePayload({
+    code: 'AX-MAIN-001', severity: 'advisory', entity: null, block: null, line: 1, col: 1,
+    rule: { section: 'v0.9.0', title: 'No entry point' },
+    snippet: sourceLine(source, 1),
+    human: `This program declares no ^main and no entities, so running it does nothing.`,
+    agent: `Add '^main:' with the statements to run, or declare an @Entity with a &tick/&physics block. This is expected for a library file that another program imports with ^use.`,
+    fix: { kind: 'text', detail: `Add a '^main:' block, or import this file from one that has one.` },
+    autoFixable: false,
+  })];
+}
+
+// v0.9.0 — undefined-function detection extended to ^fn/^proc/^main bodies. Parameters and
+// locals holding callables are excluded, so a callback invoked by name is never flagged.
+function checkUndefinedFunctionsInBodies(program, source) {
+  const out = [];
+  const declared = new Set();
+  for (const fn of program.fns || []) declared.add(fn.name);
+  for (const pr of program.procs || []) declared.add(pr.name);
+  for (const t of program.types || []) declared.add(t.name);
+
+  const scan = (decl, label) => {
+    // Names bound inside the body: parameters, assignment targets, loop variables, lambda
+    // parameters, catch variables. Any of these may hold a function.
+    const bound = new Set(decl.params || []);
+    bound.add('args');
+    const collectBindings = (stmts) => {
+      for (const st of stmts || []) {
+        if (!st || typeof st !== 'object') continue;
+        if (st.type === 'Assign' && st.target) bound.add(st.target);
+        if (st.type === 'DestructureAssign') for (const n of st.names || []) bound.add(n);
+        if (st.type === 'ForLoop') { if (st.varName) bound.add(st.varName); for (const v of st.vars || []) bound.add(v); }
+        if (st.type === 'Try' && st.catchVar) bound.add(st.catchVar);
+        for (const key of ['body', 'ifBody', 'elseBody', 'catchBody', 'finallyBody']) {
+          if (Array.isArray(st[key])) collectBindings(st[key]);
+        }
+        for (const arm of st.arms || []) collectBindings(arm.body);
+      }
+    };
+    collectBindings(decl.body);
+    const walkStmts = (stmts) => {
+      for (const st of stmts || []) {
+        for (const root of stmtExprRoots(st)) {
+          walkExpr(root, (node) => {
+            if (node.type === 'Lambda') { for (const pn of node.params || []) bound.add(pn); return; }
+            if (node.type !== 'Call' || !node.callee) return;
+            if (KNOWN_INTRINSIC_NAMES.has(node.callee) || declared.has(node.callee) || bound.has(node.callee)) return;
+            out.push(makePayload({
+              code: 'AX-UNDEF-FN-001', severity: 'advisory', entity: null, block: label,
+              line: node.line || st.line, col: node.col || st.col,
+              rule: { section: 'v0.9.0', title: 'Undefined Function' },
+              snippet: sourceLine(source, st.line),
+              human: `Call to undefined function '${node.callee}(...)' in ${label}.`,
+              agent: `'${node.callee}' is not a declared ^fn/^proc/^type, not a local holding a function, and not a standard-library name. Declare it, or check the spelling against the standard library (see STDLIB.md).`,
+              fix: null, autoFixable: false,
+            }));
+          });
+        }
+        for (const key of ['body', 'ifBody', 'elseBody', 'catchBody', 'finallyBody']) {
+          if (Array.isArray(st[key])) walkStmts(st[key]);
+        }
+        for (const arm of st.arms || []) walkStmts(arm.body);
+      }
+    };
+    walkStmts(decl.body);
+  };
+
+  for (const fn of program.fns || []) scan(fn, `^fn ${fn.name}`);
+  for (const pr of program.procs || []) scan(pr, `^proc ${pr.name}`);
+  if (program.main) scan(program.main, '^main');
+  return out;
+}
+
+// -----------------------------------------------------------------------------
 function parseErrorPayload(err, source) {
   const line = err && err.line ? err.line : null;
   const col = err && err.col ? err.col : null;
@@ -1148,13 +1406,22 @@ function parseErrorPayload(err, source) {
 }
 
 // §3 Rule ("batch, don't trickle")
-function compile(source) {
+// v0.9.0: `compile(source, opts)`.
+//   opts.filename   — path of the source, used to resolve `^use` imports (and reported in
+//                     diagnostics). Without it, imports resolve relative to the process cwd.
+//   opts.imports    — set false to skip import resolution (used by tools that only want to
+//                     check one file in isolation).
+function compile(source, opts) {
+  opts = opts || {};
   let program;
   try {
     program = parse(source);
   } catch (err) {
     return { ok: false, program: null, diagnostics: [parseErrorPayload(err, source)] };
   }
+  // Imports are spliced in BEFORE the semantic passes so that a function defined in an
+  // imported file counts as declared everywhere it is used.
+  const useDiagnostics = opts.imports === false ? [] : resolveUses(program, opts);
   // v0.8.8: surface recovered parse errors as diagnostics. The parser now collects errors
   // instead of throwing on the first one — program.parseErrors is an array of ParseError
   // instances. Each becomes an AX-PARSE-000 diagnostic. The program is still returned
@@ -1163,6 +1430,9 @@ function compile(source) {
   const diagnostics = [
     // v0.8.8: parse errors first (recovery mode — these were collected during parsing, not thrown).
     ...parseErrorPayloads,
+    // v0.9.0: import resolution problems rank with parse errors — nothing downstream is
+    // meaningful if a module is missing.
+    ...useDiagnostics,
     ...checkZeroAlloc(program, source),
     ...checkSealedBody(program, source),
     ...checkEvents(program, source),
@@ -1185,6 +1455,9 @@ function compile(source) {
     // they cost a runtime retry cycle.
     ...checkUndefinedFunctions(program, source),
     ...checkQueryArgs(program, source),
+    // v0.9.0: script-shaped programs — entry point and function-body call checking.
+    ...checkEntryPoint(program, source),
+    ...checkUndefinedFunctionsInBodies(program, source),
   ];
   const blocking = diagnostics.some(d => d.severity === 'fatal' || d.severity === 'contract_violation');
   return { ok: !blocking, program, diagnostics };
@@ -1199,6 +1472,8 @@ module.exports = {
   checkInlineMeshes, checkCrossEntityWrites,
   // v0.8.8: undefined function detection + query arg validation
   checkUndefinedFunctions, checkQueryArgs, KNOWN_INTRINSIC_NAMES,
+  // v0.9.0: module resolution, entry-point and function-body checks
+  resolveUses, checkEntryPoint, checkUndefinedFunctionsInBodies,
   RESERVED_XWRITE_PROPS,
   makePayload, RULE,
   // v0.8.1: Levenshtein distance + closest-block-name helper for AX-BLOCK-001 diagnostics
