@@ -2893,3 +2893,5 @@ NATIVE(e_vision_cells) {
 }
 
 void ax_engine_install_more(AxVM *vm) { def(vm, "vision_cells", e_vision_cells, 0, 5); }
+
+AxArr *ax_world_draw_list(AxVM *vm) { return W(vm) ? W(vm)->draw_list : NULL; }

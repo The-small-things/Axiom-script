@@ -8,7 +8,7 @@ CFLAGS  ?= -std=c11 -O2 -D_GNU_SOURCE -Wall -Wextra -Wno-unused-parameter -Wno-u
 LDFLAGS ?=
 LDLIBS  ?= -lm
 
-SRCS = value.c lexer.c parser.c interp.c stdlib.c engine.c host.c infer.c jsmath.c main.c
+SRCS = value.c lexer.c parser.c interp.c stdlib.c engine.c host.c infer.c jsmath.c term.c render.c main.c
 OBJS = $(SRCS:.c=.o)
 BIN  = axiom
 
@@ -17,7 +17,7 @@ all: $(BIN)
 $(BIN): $(OBJS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
 
-%.o: %.c axiom.h jsmath.h
+%.o: %.c axiom.h jsmath.h term.h render.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Debug build with the sanitizers on: how the memory discipline is actually checked.

@@ -1,5 +1,59 @@
 # AxiomScript — Change Log
 
+## v0.9.2 — The engine in C
+
+The native runtime now runs the engine as well as the language: entities, frame blocks, events,
+physics, collisions, navmesh, distributions and save/load, with results identical to the
+JavaScript runtime's — not approximately, to the bit.
+
+```
+cd native && make
+./axiom world.ax --sim 600 --json     # same JSON as `node main.js world.ax --sim 600 --json`
+./axiom world.ax                      # drawn in the terminal
+./axiom world.ax --headless 120       # PNG frames in screenshots/
+```
+
+### What was ported
+
+Everything in interpreter.js's engine half, rule for rule, including the ones that look
+arbitrary, because a simulation that runs on both runtimes has to produce the same numbers:
+the 60 Hz fixed step and its accumulator, `&tick` rates and their shared accumulators, the order
+broadcasts reach entities, `^Event` from a `&tick` being delivered at the next physics step,
+Body3D gravity/drag integration, the ground plane, all-pairs sphere/box/capsule collision with
+layers and masks, timers reading as numbers, tweens and easing, mixin composition, spawning
+names, the A* heap and its tie-breaking, the save schema check. See `native/README.md` for the
+full list and what differs (rendering and audio).
+
+### Math that agrees to the bit
+
+V8 computes `Math.*` with fdlibm; glibc disagrees with it in the last bit on 3–47% of inputs.
+`native/jsmath.c` carries the same algorithms (including two V8-specific details taken from its
+source), verified identical on 100 000 inputs for each of 18 functions, and `Math.hypot`
+reproduces V8's compensated sum. Without this, simulations drifted apart after a few hundred
+frames; with it, 1000-frame runs match exactly.
+
+### Rendering
+
+`render3d.js` is not part of this code base, so there was no renderer to port. The native
+build has a small software rasterizer instead (procedural box/sphere/plane meshes, `&Camera`,
+`&Light`, z-buffer, flat shading), and a port of terminal.js whose output is byte-identical to
+the original's for the same pixels.
+
+### Verification
+
+`native/difftest.sh` grew from 17 to 39 checks: 17 engine programs stepped on both runtimes and
+compared field by field (plus the files `!save` writes and a replayed `--input` script), the
+math check, the terminal check, and a render smoke test.
+
+### Fixed in the JavaScript runtime
+
+Found by the differential tests:
+
+- Loading any `#Mesh3D` resource crashed when `render3d.js` was absent (`box` was null).
+- Calling a lambda stored in an entity field failed with "field 'f' holds function, which is
+  not callable". A field holding a function is now callable by name.
+- `--json` dumped a stored function's syntax tree; it now prints `"<fn>"`.
+
 ## v0.9.1 — Patterns and the static safety net
 
 Two changes, both aimed at the same thing: writing a correct program in fewer tokens, and

@@ -1,0 +1,26 @@
+// A small scene for the native renderer: `axiom tests/render_scene.ax` draws it in the terminal,
+// `--headless 60` writes PNG frames to screenshots/.
+#Mesh3D Cube: "box.glb"
+#Mesh3D Ball: "sphere.glb"
+#Mesh3D Ground: "plane"
+
+@Cam &Camera at v3(0, 4, 9)
+  ~target: v3(0, 1, 0)
+  ~fov: 55
+
+@Sun &Light
+  ~dir: v3(-0.5, -1, -0.4)
+
+@Floor
+  ~n: 0
+  &render: !mesh(#Ground, color: 0x55aa55, scl: v3(12, 1, 12))
+
+@Crate at v3(-2, 0.5, 0)
+  &tick(30hz): pose.rot = euler(0, sim_t, 0.3)
+  ~sim_t: 0
+  &physics: sim_t += dt
+  &render: !mesh(#Cube, color: 0xd08040)
+
+@Bouncer &Body3D at v3(2, 4, 0)
+  ~hit: sphere(0.5)
+  &render: !mesh(#Ball, color: 0x4070e0)

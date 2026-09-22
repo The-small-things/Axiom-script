@@ -22,6 +22,11 @@
 #include <unistd.h>
 #include <limits.h>
 #include <ctype.h>
+#include <time.h>
+#include <sys/stat.h>
+#include <sys/ioctl.h>
+#include "term.h"
+#include "render.h"
 
 static char *read_file(const char *path) {
   FILE *f = fopen(path, "rb");
@@ -164,6 +169,15 @@ static void usage(void) {
     "  --input FILE        one line of WASD/space per frame, applied to input.move/jump\n"
     "  --run               run ^main and exit, even when the program declares entities\n"
     "\n"
+    "  --terminal [N], -t  draw N frames in the terminal (the default with entities)\n"
+    "  --ascii, -A         ASCII density characters instead of half-blocks\n"
+    "  --no-color, -C      no ANSI colour\n"
+    "  --subpixel, -S      ▌▐ half-cells: double horizontal resolution\n"
+    "  --term-fps N        terminal frame rate (default 15, 1..60)\n"
+    "  --headless N        step N frames and save PNGs to screenshots/ (see --png-every)\n"
+    "  --png-every N       with --headless, save every Nth frame (default 30)\n"
+    "  --width N, --height N   render resolution\n"
+    "\n"
     "  --sandbox           deny file writes, subprocesses, and unlisted reads\n"
     "  --allow-read PATH   permit reads under PATH\n"
     "  --allow-write PATH  permit writes under PATH\n"
@@ -185,7 +199,8 @@ int main(int argc, char **argv) {
   char **prog_args = NULL;
   int n_prog_args = 0;
   bool sim = false, json = false, run_only = false;
-  int frames = 60;
+  bool terminal = false, headless = false, ascii = false, no_color = false, subpixel = false;
+  int frames = 60, term_fps = 15, png_every = 30, width = 0, height = 0;
   const char *input_path = NULL;
 
   for (int i = 1; i < argc; i++) {
@@ -201,6 +216,19 @@ int main(int argc, char **argv) {
     if (strcmp(a, "--allow-write") == 0 && i + 1 < argc) { if (n_allow_write < 64) allow_write[n_allow_write++] = argv[++i]; continue; }
     if (strcmp(a, "--sim") == 0) { sim = true; if (i + 1 < argc) { frames = atoi(argv[++i]); if (frames <= 0) frames = 60; } continue; }
     if (strcmp(a, "--json") == 0) { json = true; continue; }
+    if (strcmp(a, "--terminal") == 0 || strcmp(a, "-t") == 0) {
+      terminal = true;
+      if (i + 1 < argc && argv[i + 1][0] && strspn(argv[i + 1], "0123456789") == strlen(argv[i + 1])) frames = atoi(argv[++i]);
+      continue;
+    }
+    if (strcmp(a, "--headless") == 0) { headless = true; if (i + 1 < argc) { frames = atoi(argv[++i]); if (frames <= 0) frames = 60; } continue; }
+    if (strcmp(a, "--ascii") == 0 || strcmp(a, "-A") == 0) { terminal = true; ascii = true; continue; }
+    if (strcmp(a, "--no-color") == 0 || strcmp(a, "-C") == 0) { no_color = true; continue; }
+    if (strcmp(a, "--subpixel") == 0 || strcmp(a, "-S") == 0) { terminal = true; subpixel = true; continue; }
+    if (strcmp(a, "--term-fps") == 0 && i + 1 < argc) { term_fps = atoi(argv[++i]); continue; }
+    if (strcmp(a, "--png-every") == 0 && i + 1 < argc) { png_every = atoi(argv[++i]); if (png_every <= 0) png_every = 30; continue; }
+    if (strcmp(a, "--width") == 0 && i + 1 < argc) { width = atoi(argv[++i]); continue; }
+    if (strcmp(a, "--height") == 0 && i + 1 < argc) { height = atoi(argv[++i]); continue; }
     if (strcmp(a, "--run") == 0 || strcmp(a, "-r") == 0) { run_only = true; continue; }
     if (strcmp(a, "--input") == 0 && i + 1 < argc) { input_path = argv[++i]; continue; }
     if (strcmp(a, "--no-restack") == 0) continue;   // accepted for command-line parity with main.js
@@ -298,8 +326,33 @@ int main(int argc, char **argv) {
     printf(", version %s\n", toks.version ? toks.version : "(none)");
   }
 
-  // The frame loop. Without --sim there is no renderer in this build, so it steps headless.
-  if (!sim && !json) fprintf(stderr, "axiom: this build has no display backend; stepping %d frames headless (use --sim N)\n", frames);
+  // The frame loop: --sim steps it with no rendering at all; --headless renders to PNG files;
+  // otherwise (as in main.js when there is no SDL window) it draws in the terminal.
+  bool draw_terminal = !sim && !headless;
+  (void)terminal;
+  AxTermOptions topt = { 0 };
+  int rw = width > 0 ? width : (draw_terminal ? 160 : 640), rh = height > 0 ? height : (draw_terminal ? 120 : 480);
+  if (draw_terminal) {
+    bool uni, col;
+    ax_term_detect(&uni, &col);
+    topt.unicode = ascii ? false : uni;
+    topt.color = no_color ? false : col;
+    topt.subpixel = subpixel && !ascii;
+    struct winsize ws;
+    int cols = 80, lines = 24;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col) { cols = ws.ws_col; lines = ws.ws_row; }
+    topt.term_width = cols < 80 ? cols : 80;
+    topt.term_height = lines - 2 < 40 ? lines - 2 : 40;
+    topt.is_tty = isatty(STDOUT_FILENO);
+    if (term_fps < 1) term_fps = 1;
+    if (term_fps > 60) term_fps = 60;
+    if (!json) {
+      fprintf(stderr, "\nMode: terminal @ %dx%d (%s%s, %s).\n", rw, rh, topt.unicode ? "unicode" : "ASCII", topt.subpixel ? "+subpixel" : "", topt.color ? "color" : "no color");
+      fprintf(stderr, "Running %d frames @ %d fps target.\n", frames, term_fps);
+    }
+  } else if (headless && !json) {
+    printf("\nMode: headless.\nRunning %d frames @ %dx%d, saving PNG every %d frames.\n", frames, rw, rh, png_every);
+  }
   char **input_lines = NULL;
   int n_input = 0;
   if (input_path) {
@@ -328,7 +381,25 @@ int main(int argc, char **argv) {
     }
     ax_engine_set_input(vm, mx, my, jump);
     ax_engine_update(vm, 1.0 / 60);
+    if (draw_terminal) {
+      uint8_t *px = ax_render_frame(vm, rw, rh);
+      char *text = ax_term_render(px, rw, rh, &topt);
+      fputs(text, stdout);
+      fflush(stdout);
+      free(text);
+      free(px);
+      struct timespec ts = { 0, (long)(1e9 / term_fps) };
+      nanosleep(&ts, NULL);
+    } else if (headless && ((f + 1) % png_every == 0 || f == frames - 1)) {
+      uint8_t *px = ax_render_frame(vm, rw, rh);
+      mkdir("screenshots", 0777);
+      char name[64];
+      snprintf(name, sizeof name, "screenshots/frame_%05d.png", f + 1);
+      if (ax_write_png(name, px, rw, rh) && !json) printf("  frame %d → %s\n", f + 1, name);
+      free(px);
+    }
   }
+  if (draw_terminal) fputs("\x1b[0m\n", stdout);
   if (!json) ax_engine_print_diags(vm, stderr);
   else ax_engine_print_json(vm, frames, stdout);
   fflush(stdout);

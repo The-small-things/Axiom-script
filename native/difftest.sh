@@ -99,5 +99,27 @@ else
 fi
 rm -rf "$MDIR"
 
+# Terminal output: the same pixel buffers through terminal.js and term.c must give the same bytes.
+TDIR=$(mktemp -d)
+if cc -O2 -o "$TDIR/termcheck" "$ROOT/native/tests/term/termcheck.c" "$ROOT/native/term.c" -lm \
+   && node "$ROOT/native/tests/term/gen.js" "$TDIR" && "$TDIR/termcheck" "$TDIR" > "$TDIR/out.txt" \
+   && COLORTERM=truecolor node "$ROOT/native/tests/term/gen.js" "$TDIR" && COLORTERM=truecolor "$TDIR/termcheck" "$TDIR" >> "$TDIR/out.txt"; then
+  pass=$((pass + 1)); printf 'OK   terminal output byte-identical to terminal.js (60 cases)\n'
+else
+  fail=$((fail + 1)); printf 'FAIL terminal output\n'; cat "$TDIR/out.txt" 2>/dev/null
+fi
+rm -rf "$TDIR"
+
+# Rendering has no JavaScript counterpart (render3d.js is not part of the code base), so this is
+# a smoke test: the scene renders, and the PNG is a valid image that is not just sky.
+RDIR=$(mktemp -d)
+if (cd "$RDIR" && "$NATIVE" "$ROOT/examples/scene.ax" --headless 30 --png-every 30 --width 160 --height 120 > /dev/null) \
+   && node -e "const b=require('fs').readFileSync('$RDIR/screenshots/frame_00030.png'); process.exit(b.slice(1,4).toString()==='PNG' && b.length > 50000 ? 0 : 1)"; then
+  pass=$((pass + 1)); printf 'OK   render examples/scene.ax to PNG\n'
+else
+  fail=$((fail + 1)); printf 'FAIL render examples/scene.ax\n'
+fi
+rm -rf "$RDIR"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

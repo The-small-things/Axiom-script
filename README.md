@@ -205,19 +205,25 @@ Full detail in [`CHANGES.md`](CHANGES.md).
 | | `node main.js` (JavaScript) | `native/axiom` (C11) |
 |---|---|---|
 | The language | complete | complete |
-| The engine — entities, frame blocks, 3D/terminal rendering | complete | refused with a message naming the JS runtime |
+| The engine — entities, blocks, events, physics, collisions, navmesh, save/load | complete | complete, same numbers to the bit |
+| Rendering | needs `render3d.js` (not in this repository) | built-in software rasterizer → terminal or PNG |
 | Start-up | ~45 ms | ~1.6 ms |
+| Simulations (`--sim`) | baseline | 1.7–14× faster |
 | Compute (fib, loops, dictionaries) | baseline | 1.8–2.7× faster |
-| Install | Node 18+ | `make`; one 186 KB binary, libc and libm only |
+| Install | Node 18+ | `make`; one ~400 KB binary, libc and libm only |
 
 ```
-cd native && make && ./axiom ../examples/calc.ax -- "2 * (3 + 4) - 10 / 5"
+cd native && make
+./axiom ../examples/calc.ax -- "2 * (3 + 4) - 10 / 5"
+./axiom ../examples/sim.ax --sim 400 --json      # a simulation, stepped headless
+./axiom ../examples/scene.ax                     # drawn in the terminal
 ```
 
-The two are kept byte-identical by differential testing: `native/difftest.sh` runs every
-conformance program and example on both and compares stdout and exit codes. See
-[`native/README.md`](native/README.md) for what the native build covers, how the split is drawn,
-and the divergences that testing turned up on each side.
+The two are kept identical by differential testing: `native/difftest.sh` runs every conformance
+program, example and engine test on both runtimes and compares stdout, exit codes and the final
+simulation state field by field. Both compute `Math.*` with the same fdlibm algorithms, so a
+simulation's numbers agree to the last bit, not approximately. See
+[`native/README.md`](native/README.md) for the details and the divergences testing turned up.
 
 ## Documentation
 

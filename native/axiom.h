@@ -36,7 +36,7 @@
 #include <stdio.h>
 #include <setjmp.h>
 
-#define AX_VERSION "0.9.1"
+#define AX_VERSION "0.9.2"
 
 // ============================================================================================
 // Values
