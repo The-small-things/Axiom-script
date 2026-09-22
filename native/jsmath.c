@@ -25,6 +25,9 @@ typedef union { double f; uint64_t u; } DW;
 #define GET_LOW_WORD(lo, v) do { DW w_; w_.f = (v); (lo) = (uint32_t)w_.u; } while (0)
 #define INSERT_WORDS(v, hi, lo) do { DW w_; w_.u = ((uint64_t)(uint32_t)(hi) << 32) | (uint32_t)(lo); (v) = w_.f; } while (0)
 #define SET_HIGH_WORD(v, hi) do { DW w_; w_.f = (v); w_.u = (w_.u & 0xffffffffULL) | ((uint64_t)(uint32_t)(hi) << 32); (v) = w_.f; } while (0)
+// fdlibm shifts negative exponents left; do it on the unsigned representation (same bits,
+// defined behaviour).
+#define SHL20(k) ((int32_t)((uint32_t)(k) << 20))
 #define SET_LOW_WORD(v, lo) do { DW w_; w_.f = (v); w_.u = (w_.u & 0xffffffff00000000ULL) | (uint32_t)(lo); (v) = w_.f; } while (0)
 
 // ---- argument reduction for the trigonometric functions --------------------------------------
@@ -228,7 +231,7 @@ static int32_t rem_pio2(double x, double *y) {
   GET_LOW_WORD(low, x);
   SET_LOW_WORD(z, low);
   e0 = (ix >> 20) - 1046;
-  SET_HIGH_WORD(z, ix - (e0 << 20));
+  SET_HIGH_WORD(z, ix - SHL20(e0));
   for (i = 0; i < 2; i++) {
     tx[i] = (double)((int32_t)(z));
     z = (z - tx[i]) * two24;
@@ -613,8 +616,8 @@ double js_exp(double x) {
     k = 0;
   }
   t = x * x;
-  if (k >= -1021) INSERT_WORDS(twopk, 0x3ff00000 + (k << 20), 0);
-  else INSERT_WORDS(twopk, 0x3ff00000 + ((k + 1000) << 20), 0);
+  if (k >= -1021) INSERT_WORDS(twopk, 0x3ff00000 + SHL20(k), 0);
+  else INSERT_WORDS(twopk, 0x3ff00000 + SHL20(k + 1000), 0);
   c = x - t * (P1 + t * (P2 + t * (P3 + t * (P4 + t * P5))));
   if (k == 0) return one - ((x * c) / (c - 2.0) - x);
   y = one - ((lo - (x * c) / (2.0 - c)) - hi);
@@ -808,7 +811,7 @@ double js_expm1(double x) {
   t = 3.0 - r1 * hfx;
   e = hxs * ((r1 - t) / (6.0 - x * t));
   if (k == 0) return x - (x * e - hxs);
-  INSERT_WORDS(twopk, 0x3ff00000 + (k << 20), 0);
+  INSERT_WORDS(twopk, 0x3ff00000 + SHL20(k), 0);
   e = (x * (e - c) - c);
   e -= hxs;
   if (k == -1) return 0.5 * (x - e) - 0.5;
@@ -1168,7 +1171,7 @@ double js_pow(double x, double y) {
   r = (z * t1) / ((t1 - two) - (w + z * w));
   z = one - (r - z);
   GET_HIGH_WORD(j, z);
-  j += (n << 20);
+  j += SHL20(n);
   if ((j >> 20) <= 0) z = scalbn(z, n);
   else SET_HIGH_WORD(z, j);
   return s * z;
