@@ -3273,7 +3273,7 @@ function defaultIntrinsics() {
     float: (s) => parseFloat(s),
     str: (v) => v == null ? 'null' : typeof v === 'object' ? JSON.stringify(v) : String(v),
     // v0.9.0: `type()` reports a record's declared ^type name and recognizes functions.
-    type: (v) => v == null ? 'null' : typeof v === 'function' ? 'fn' : Array.isArray(v) ? 'array' : typeof v === 'object' ? (v.__callable ? 'fn' : v.__type ? v.__type : v instanceof Atom ? 'atom' : v instanceof Vec3 ? 'vec3' : v instanceof Vec2 ? 'vec2' : v instanceof Quat ? 'quat' : v instanceof EntityInstance ? 'entity' : v instanceof Transform ? 'transform' : v instanceof Mat4 ? 'mat4' : 'object') : typeof v,
+    type: (v) => v == null ? 'null' : typeof v === 'function' ? 'fn' : Array.isArray(v) ? 'array' : typeof v === 'object' ? (v.__callable ? 'fn' : v.__type ? v.__type : v instanceof Atom ? 'atom' : v instanceof Vec3 ? 'vec3' : v instanceof Vec2 ? 'vec2' : v instanceof Quat ? 'quat' : v instanceof EntityInstance ? 'entity' : v instanceof Transform ? 'transform' : v instanceof Mat4 ? 'mat4' : 'dict') : typeof v,
     is_null: (v) => v == null,
     is_number: (v) => typeof v === 'number',
     is_string: (v) => typeof v === 'string',
@@ -3483,8 +3483,20 @@ function evalExpr(node, ctx) {
       const idx = evalExpr(node.index, ctx);
       if (obj instanceof Distribution) return obj.massAt(idx);
       // v0.8.11: string indexing — "hello"[0] → "h"
-      if (typeof obj === 'string') { const i = Math.floor(idx); if (i < 0 || i >= obj.length) return undefined; return obj[i]; }
-      if (Array.isArray(obj)) return obj[idx];
+      // v0.9.1: a negative index counts from the end (`xs[-1]` is the last element), which
+      // saves the `xs[len(xs) - 1]` dance — 7 tokens — and is the form every model reaches for.
+      if (typeof obj === 'string') {
+        let i = Math.floor(idx);
+        if (i < 0) i += obj.length;
+        if (i < 0 || i >= obj.length) return null;
+        return obj[i];
+      }
+      if (Array.isArray(obj)) {
+        let i = typeof idx === 'number' ? Math.floor(idx) : idx;
+        if (typeof i === 'number' && i < 0) i += obj.length;
+        const v = obj[i];
+        return v === undefined ? null : v;
+      }
       if (obj instanceof BVec) return obj.get(idx);
       if (obj instanceof BMap) return obj.get(idx);
       if (obj instanceof Map) return obj.get(idx);
@@ -3786,6 +3798,9 @@ function binaryOp(op, l, r) {
     if (typeof r === 'object') return Object.prototype.hasOwnProperty.call(r, stringifyKey(l));
     return false;
   }
+  // v0.9.1: array + array concatenates. JavaScript would stringify both sides ("12"), which is
+  // never what the program meant.
+  if (Array.isArray(l) && Array.isArray(r) && op === '+') return l.concat(r);
   switch (op) {
     case '+': return l + r; case '-': return l - r; case '*': return l * r; case '/': return l / r;
     case '%': return l % r;  // v0.8.8: modulo (numbers only — Vec3 has no modulo)
@@ -4315,11 +4330,11 @@ function callFunction(name, argNodes, ctx) {
   }
   // v0.8.13: print() as a callable function (2 tokens vs !log's 3). Works in ^fn/^proc bodies.
   if (name === 'print') {
-    const parts = argNodes.map(a => {
-      if (!a || !a.value) return '';
-      const v = evalExpr(a.value, ctx);
-      return (typeof v === 'string') ? v : stringifyFStringVal(v);
-    });
+    // v0.9.1: evaluate every argument first, then render. Rendering as we went made the output
+    // depend on side effects between arguments (`print(xs, xs.pop())` showed the pre-pop array),
+    // which no reader would predict and the native runtime does not reproduce.
+    const values = argNodes.map(a => (a && a.value) ? evalExpr(a.value, ctx) : '');
+    const parts = values.map(v => (typeof v === 'string') ? v : stringifyFStringVal(v));
     const msg = parts.join(' ');
     ctx.world.log.push({ type: 'log', msg, level: 'info', entity: ctx.entity ? ctx.entity.decl.name : '<fn>' });
     if (!ctx.world._suppressConsole) console.log(msg);

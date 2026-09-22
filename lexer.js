@@ -598,6 +598,20 @@ function tokenizeLine(text, lineNo, out) {
         s += '.'; j++;
         while (j < n && isDigit(text[j])) { s += text[j]; j++; }
       }
+      // v0.9.1: scientific notation — `1e21`, `1.5e-7`, `6.02e23`. Without it, `1e21` lexed as
+      // the number 1 with the unit "e21", and `1.5e-7` as `1.5` minus the atom `e7`: both
+      // silently wrong, which is the worst way for a literal to fail. The exponent is only
+      // taken when a digit actually follows, so `10hz` and `3f` still read as unit suffixes.
+      if ((text[j] === 'e' || text[j] === 'E')) {
+        let k = j + 1;
+        if (text[k] === '+' || text[k] === '-') k++;
+        if (isDigit(text[k])) {
+          s += text[j];
+          if (text[j + 1] === '+' || text[j + 1] === '-') s += text[j + 1];
+          j = k;
+          while (j < n && isDigit(text[j])) { s += text[j]; j++; }
+        }
+      }
       let unit = null;
       if (isAlpha(text[j])) {
         let u = '';

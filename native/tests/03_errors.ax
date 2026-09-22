@@ -1,0 +1,47 @@
+// Errors: throw, catch, finally, rethrow, retry, engine faults.
+^fn flaky(n):
+  ?n < 3:
+    ^throw "not yet"
+  ^return "ok"
+
+^main:
+  ^try:
+    ^throw "boom"
+  ^catch e:
+    print("caught", e.msg)
+  ^try:
+    ^throw {code: "E_IO", msg: "no file"}
+  ^catch e:
+    print(e.code, e.msg)
+  trace = []
+  ^try:
+    trace.push("body")
+  ^catch e:
+    trace.push("catch")
+  ^fin:
+    trace.push("fin")
+  print(trace.join(","))
+  attempt = 0
+  *attempt < 5:
+    ^try:
+      r = flaky(attempt)
+      print("succeeded at", attempt)
+      ~break
+    ^catch e:
+      attempt += 1
+  ^try:
+    x = null
+    y = x[0]
+  ^catch e:
+    print("index error caught:", e.code)
+  ^try:
+    check_eq(1, 2, "mismatch")
+  ^catch e:
+    print(e.code)
+  ^try:
+    ^try:
+      ^throw "inner"
+    ^catch e:
+      ^throw f"re: {e.msg}"
+  ^catch e2:
+    print(e2.msg)

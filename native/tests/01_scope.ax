@@ -1,0 +1,30 @@
+// Scope, recursion, closures, defaults, varargs.
+^fn fib(n) = n < 2 ? n : fib(n-1) + fib(n-2)
+^fn counter(start):
+  n = start
+  ^return \d: n + d
+^fn box(v, lo = 0, hi = 10) = min(max(v, lo), hi)
+^fn variadic(a) = len(args)
+^fn shadow(n):
+  n = n + 1
+  ^return n
+~G: 7
+^fn uses_global() = G * 2
+
+^main:
+  print(fib(18))
+  f = counter(10)
+  print(f(1), f(2))
+  print(box(99), box(-5, -1), box(5, 0, 3))
+  print(variadic(1, 2, 3))
+  print(shadow(1))
+  print(uses_global())
+  total = 0
+  *i in 0..100:
+    sq = i * i
+    total += sq
+  print(total)
+  fs = []
+  *i in 0..3:
+    fs.push(\x: x + i)
+  print(fs[0](0), fs[1](0), fs[2](0))

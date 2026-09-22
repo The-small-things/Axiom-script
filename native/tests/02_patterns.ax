@@ -1,0 +1,33 @@
+// Pattern matching, records, guards.
+^type Add: l, r
+^type Mul: l, r
+^type Num: v
+^fn ev(n):
+  ?* n:
+    Add(a, b): ^return ev(a) + ev(b)
+    Mul(a, b): ^return ev(a) * ev(b)
+    Num(x): ^return x
+    _: ^throw "bad node"
+
+^main:
+  print(ev(Add(Num(2), Mul(Num(3), Num(4)))))
+  ?* [1, 2, 3]:
+    [a, b, c]: print(a * 100 + b * 10 + c)
+  ?* {name: "ada", age: 36, city: "x"}:
+    {name, age}: print(name, age)
+  ?* 42:
+    n if n > 100: print("huge")
+    n if n > 10: print(n * 2)
+    _: print("small")
+  s = idle
+  ?* s:
+    running: print("go")
+    idle: print("wait")
+  ?* Num(5):
+    Add: print("add")
+    Num: print("num")
+  ?* [0, 0]:
+    [0, 0]: print("origin")
+    _: print("elsewhere")
+  p = Add(Num(1), Num(2))
+  print(type(p), len(p), is_dict(p))

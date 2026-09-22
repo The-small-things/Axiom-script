@@ -15,7 +15,8 @@
     "test": "node run_all_tests.js",
     "test:file": "node",
     "prepare": "node -e \"if(require('fs').existsSync('.githooks')){require('child_process').execSync('git config core.hooksPath .githooks',{stdio:'inherit'})}\"",
-    "test:lang": "node test_v090_general.js && node test_v0817_features.js"
+    "test:lang": "node test_v090_general.js && node test_v0817_features.js",
+    "test:native": "cd native && make && ./difftest.sh"
   },
   "license": "MIT",
   "keywords": [
@@ -35,6 +36,7 @@
     "*.md",
     "*.nav",
     "*.ax",
-    "examples/"
+    "examples/",
+    "native/"
   ]
 }

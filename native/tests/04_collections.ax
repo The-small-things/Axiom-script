@@ -1,0 +1,35 @@
+// Collections, dicts, destructuring, comprehensions.
+^main:
+  xs = [5, 3, 9, 1, 3]
+  print(sorted(xs))
+  print(sort_by([{a: 3}, {a: 1}], "a").map(\r: r.a))
+  print(uniq(xs), reversed(xs), take(xs, 2), drop(xs, 3))
+  print(sum(xs), mean(xs), median(xs), min(xs), max(xs))
+  print(zip([1,2],[3,4]), enumerate(["a","b"]))
+  print(chunk(range(0, 7), 3), windows([1,2,3], 2))
+  print(flatten([[1,[2]],[3]]))
+  print(partition(range(0, 6), \n: n % 2 == 0))
+  print(union([1,2],[2,3]), intersect([1,2],[2,3]), difference([1,2],[2]))
+  print(group_by([1,2,3,4], \n: n % 2))
+  print(count_by(["a","b","a"], \s: s))
+  print(min_by(xs, \v: v), max_by(xs, \v: v))
+  d = {a: 1, "k-2": 2, [1 + 1]: 3}
+  print(keys(d), values(d), len(d))
+  print(has_key(d, "a"), d.get("nope", "dflt"))
+  print(merge({a: 1}, {b: 2}))
+  print(dict(items({x: 1, y: 2})))
+  q, r = divmod(17, 5)
+  print(q, r)
+  a, b = [10, 20]
+  print(a + b)
+  print([n * n for n in range(0, 6) if n % 2 == 0])
+  print([x + y for x, y in zip([1,2],[10,20])])
+  total = 0
+  *k, v in items({a: 1, b: 2}):
+    total += v
+  print(total)
+  print([1,2,3] |> map(\v: v * 2) |> sum)
+  print(3 in [1,2,3], "ell" in "hello", "a" in {a: 1}, 9 !in [1])
+  grid3 = grid(2, 3, \y, x: y * 3 + x)
+  print(grid3, transpose(grid3))
+  print([1,2] == [1,2], {a: 1} == {a: 1}, [1,2] == [2,1])

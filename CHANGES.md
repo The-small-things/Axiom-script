@@ -56,10 +56,58 @@ The checks know about entity fields, mixin fields, `&on(Event)` payload fields, 
 bindings, lambda parameters, comprehension variables, and loop variables. The six shipped
 examples compile with zero diagnostics, and the suite asserts that they continue to.
 
+### Native runtime (`native/`)
+
+A second implementation of the language in C11 — one dependency-free binary, no Node:
+
+```
+cd native && make && ./axiom prog.ax -- args
+```
+
+- Runs the whole **language**: `^main`, functions and closures, records, globals, pattern
+  matching with bindings and guards, errors, destructuring, comprehensions, pipelines, `in`,
+  default parameters, f-strings, and ~190 standard-library functions (statistics, collections,
+  dicts, strings, regex, JSON, time, files, process, seeded randomness, functional helpers).
+- Does **not** run the engine — entities, frame blocks, events, resources, queries, vectors, the
+  rasterizer. Those constructs are refused by the parser with a message naming the JavaScript
+  runtime, never half-executed. The language is what programs are written in; the engine is one
+  host for them.
+- **Start-up 1.6 ms against Node's 45 ms**, and 1.8–2.7× on compute (`fib(27)`, a 3M-iteration
+  loop, 200k dictionary updates). For scripts and CLI tools, start-up *is* the runtime.
+- C, not C++ or assembly, and `native/README.md` explains why: a 16-byte tagged value, one
+  ownership convention, `setjmp` for `^try`, and a binary any host can link. Assembly would be
+  slower than what the compiler produces for a branch-heavy dispatch loop, and unmaintainable.
+- Verified by **differential testing**: `native/difftest.sh` runs 10 conformance programs and 6
+  example invocations on both runtimes and requires byte-identical stdout and exit codes. The
+  corpus also runs clean under ASan and UBSan (`make debug`).
+
+### Semantics fixed while reconciling the two runtimes
+
+Differential testing found real divergences; each was fixed on whichever side was wrong. These
+four are changes to the JavaScript runtime's behaviour:
+
+- **Scientific notation** now lexes: `1e21` was read as the number 1 with the unit `e21`, and
+  `1.5e-7` as `1.5` minus the atom `e7` — both silently wrong, the worst way for a literal to
+  fail.
+- **Negative indexing**: `xs[-1]` is the last element, `s[-1]` the last character. It saves the
+  seven tokens of `xs[len(xs) - 1]` and is the form every model reaches for first.
+- **`[1] + [2]` concatenates** to `[1, 2]` instead of producing the string `"12"`.
+- **`type({})` reports `"dict"`**, which is what STDLIB.md always said; it had been reporting
+  JavaScript's `"object"`.
+- **`print` evaluates every argument before rendering any of them**, so a later argument's side
+  effect can no longer change what an earlier one prints.
+
+The native runtime was fixed for its own share: a range literal (`0..5`) lexing as a malformed
+number, `%g` reaching for exponent notation inside the plain-decimal range, f-string literal
+parts not decoding escapes, a call not skipping a same-named local holding data, and
+JavaScript's integer-keys-first dictionary order (observable in any printed `group_by`), which
+the native dictionary now maintains as entries are inserted.
+
 ### Tests
 
 `test_v090_general.js` grew to 215 assertions, adding sections for pattern matching and for
-each new check, including the negative cases that guard against false positives.
+each new check, including the negative cases that guard against false positives. The native
+runtime adds 16 differential cases in `native/tests/` and `native/difftest.sh`.
 
 ### Version bumps
 

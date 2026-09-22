@@ -200,6 +200,25 @@ Full detail in [`CHANGES.md`](CHANGES.md).
 
 ---
 
+## Two runtimes
+
+| | `node main.js` (JavaScript) | `native/axiom` (C11) |
+|---|---|---|
+| The language | complete | complete |
+| The engine — entities, frame blocks, 3D/terminal rendering | complete | refused with a message naming the JS runtime |
+| Start-up | ~45 ms | ~1.6 ms |
+| Compute (fib, loops, dictionaries) | baseline | 1.8–2.7× faster |
+| Install | Node 18+ | `make`; one 186 KB binary, libc and libm only |
+
+```
+cd native && make && ./axiom ../examples/calc.ax -- "2 * (3 + 4) - 10 / 5"
+```
+
+The two are kept byte-identical by differential testing: `native/difftest.sh` runs every
+conformance program and example on both and compares stdout and exit codes. See
+[`native/README.md`](native/README.md) for what the native build covers, how the split is drawn,
+and the divergences that testing turned up on each side.
+
 ## Documentation
 
 * [`STDLIB.md`](STDLIB.md) — every standard-library function, grouped
@@ -231,6 +250,7 @@ node test_v0817_features.js   # v0.8.17 regression suite
 | `stdlib.js` | the standard library |
 | `main.js` | CLI: script mode, headless simulation, terminal and window rendering |
 | `render3d.js`, `terminal.js`, `input_gamepad.js` | the optional rendering and input backends |
+| `native/` | the C11 runtime: same language, no Node, ~1.6 ms start-up |
 
 The renderer is optional: with `render3d.js` absent, scripts, functions, checks, and `--sim`
 all still run.
