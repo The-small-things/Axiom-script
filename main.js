@@ -105,6 +105,7 @@ const mergeKeyboardGamepad = (...a) => gamepad().mergeKeyboardGamepad(...a);
 function serializeForJson(v) {
   if (v === null || v === undefined) return null;
   if (typeof v === 'number' || typeof v === 'string' || typeof v === 'boolean') return v;
+  if (typeof v === 'function') return '<fn>';
   if (Array.isArray(v)) return v.map(serializeForJson);
   // Duck-type Vec3/Vec2/Quat by checking for the x/y/z props (avoids importing the classes).
   if (typeof v === 'object') {
@@ -115,6 +116,8 @@ function serializeForJson(v) {
     if (v.constructor && v.constructor.name === 'EntityInstance') return { entity: v._tagName || v.decl.name };
     if (v.__timer) return { timer: { remaining: v.remaining, total: v.total } };
     if (v.__hud) return { hud: { kind: v.kind, pos: v.pos ? [v.pos.x, v.pos.y, v.pos.z] : null } };
+    // v0.9.2: a function in the state dump is a marker, not its syntax tree.
+    if (v.__callable) return '<fn>';
     // Plain object — serialize own enumerable props.
     const out = {};
     for (const [k, val] of Object.entries(v)) {

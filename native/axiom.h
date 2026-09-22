@@ -489,6 +489,17 @@ AxArr *ax_host_seq(AxValue v);                             // iteration order of
 double ax_host_len(AxValue v);
 bool ax_host_contains(AxVM *vm, AxValue hay, AxValue needle);
 AxValue ax_host_index(AxVM *vm, AxValue obj, AxValue idx);
+bool ax_json_parse(const char *text, AxValue *out);
+double ax_rng_next(AxVM *vm);                              // the seeded generator random() uses
+double ax_js_hypot(int n, const double *vals);
+AxValue ax_entity_pos(AxEntity *e);
+struct AxXform *ax_entity_pose(AxEntity *e);
+int ax_world_entities(AxVM *vm, AxEntity ***out);
+AxDict *ax_world_channels(AxVM *vm);
+AxDict *ax_world_saves(AxVM *vm);
+const char *ax_world_version(AxVM *vm);
+void ax_engine_set_version(AxVM *vm, const char *v);
+void ax_world_diag(AxVM *vm, AxEntity *e, AxStr *block, const char *code, const char *severity, const char *title, const char *human);
 void ax_engine_set_input(AxVM *vm, double mx, double my, bool jump);
 
 // Hooks the interpreter calls when it meets an engine construct.

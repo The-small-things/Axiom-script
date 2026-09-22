@@ -255,6 +255,7 @@ int main(int argc, char **argv) {
   ax_program_declare(vm, pr.program);
   bool has_entities = ax_engine_load(vm, pr.program, source);
   if (json) ax_engine_quiet(vm, true);
+  ax_engine_set_version(vm, toks.version);
   int n_entities = ax_engine_entity_count(vm);
   bool has_main = false;
   for (int i = 0; i < pr.program->nlist; i++) if (pr.program->list[i]->kind == N_MAIN) has_main = true;

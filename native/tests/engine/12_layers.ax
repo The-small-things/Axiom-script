@@ -1,0 +1,31 @@
+@A &Body3D at v3(0, 1, 0)
+  ~hit: sphere(1)
+  ~collision_layer: 1
+  ~collision_mask: 2
+  ~hits: 0
+  &on(Collide):
+    hits += 1
+
+@B &Body3D at v3(0.5, 1, 0)
+  ~hit: sphere(1)
+  ~collision_layer: 2
+  ~collision_mask: 1
+  ~hits: 0
+  &on(Collide):
+    hits += 1
+
+@C &Body3D at v3(-0.5, 1, 0)
+  ~hit: sphere(1)
+  ~collision_layer: 4
+  ~collision_mask: 4
+  ~hits: 0
+  &on(Collide):
+    hits += 1
+
+@D at v3(0, 1, 0.8)
+  ~hit: capsule(0.4, 2)
+  ~hits: 0
+  &on(Collide):
+    hits += 1
+    ?other == "A":
+      !despawn(#C)

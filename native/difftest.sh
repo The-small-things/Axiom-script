@@ -9,6 +9,7 @@ set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 NATIVE="$ROOT/native/axiom"
 NODE_RUN="node $ROOT/main.js"
+cd "$ROOT/native" || exit 2   # engine tests name their .nav files relative to this directory
 pass=0
 fail=0
 
@@ -54,10 +55,20 @@ run_case "examples/wordcount.ax" "$ROOT/examples/wordcount.ax" -- "$ROOT/example
 # fields, positions, log, sim time — exactly; diagnostics by code, entity, block and line).
 sim_case() {
   desc="$1"; file="$2"; frames="$3"; shift 3
+  rm -rf saves
   $NODE_RUN "$file" --sim "$frames" --json "$@" > /tmp/ax_js.json 2>/dev/null
   js_code=$?
+  [ -d saves ] && rm -rf /tmp/ax_js_saves && mv saves /tmp/ax_js_saves
   "$NATIVE" "$file" --sim "$frames" --json "$@" > /tmp/ax_c.json 2>/dev/null
   c_code=$?
+  # !save writes saves/<slot>.json; the files must match too.
+  if [ -d /tmp/ax_js_saves ] || [ -d saves ]; then
+    if ! diff -r /tmp/ax_js_saves saves > /tmp/ax_cmp_saves.txt 2>&1; then
+      rm -rf saves /tmp/ax_js_saves
+      fail=$((fail + 1)); printf 'FAIL %s (save files differ)\n' "$desc"; head -6 /tmp/ax_cmp_saves.txt; return
+    fi
+    rm -rf saves /tmp/ax_js_saves
+  fi
   if node "$ROOT/native/simcmp.js" /tmp/ax_js.json /tmp/ax_c.json > /tmp/ax_cmp.txt 2>&1 && [ "$js_code" = "$c_code" ]; then
     pass=$((pass + 1))
     printf 'OK   %s\n' "$desc"
@@ -74,7 +85,7 @@ for f in "$ROOT"/native/tests/engine/*.ax; do
 done
 sim_case "sim examples/sim.ax (1000 frames)" "$ROOT/examples/sim.ax" 1000
 if [ -e "$ROOT/native/tests/engine/input.txt" ]; then
-  sim_case "sim with --input" "$ROOT/native/tests/engine/01_physics.ax" 120 --input "$ROOT/native/tests/engine/input.txt"
+  sim_case "sim 11_misc.ax with --input" "$ROOT/native/tests/engine/11_misc.ax" 240 --input "$ROOT/native/tests/engine/input.txt"
 fi
 
 # Math: V8 computes Math.* with fdlibm, and so does jsmath.c; check them against each other.

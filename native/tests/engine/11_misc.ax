@@ -1,0 +1,60 @@
+^type Stat: name, value
+
+^fn speed_of(e) = e.speed * 2
+
+~GLOBAL_BONUS: 5
+
+@Player &Body3D at v3(0, 0, 0)
+  ~speed: 4
+  ~moves: 0
+  ~jumps: 0
+  ~trail: []
+  ~stat: Stat("str", 7)
+  ~inv: {gold: 3, keys: ["a"]}
+  &physics:
+    ?input.move:
+      moves += 1
+      pose.vel.x = input.move.x * speed
+      pose.vel.z = input.move.y * speed
+    ?input.jump && pose.pos.y <= 0.001:
+      jumps += 1
+      !impulse(v3(0, 5, 0))
+  &tick(4hz):
+    trail.push(round(pose.pos.x * 100) / 100)
+    stat.value += 1
+    inv.gold += GLOBAL_BONUS
+    ~tmp: speed_of(self)
+    boost = tmp + 1
+
+@Sword
+  ~parent: #Player
+  ~seen: null
+  &tick(2hz):
+    pose.pos = v3(1, 0, 0)
+    seen = wpose.pos
+
+@Camera &Camera
+  ~target: null
+  ~follow: 0
+  &tick(10hz):
+    #Camera.target = #Player.pos
+    #Player.speed += 0.01
+    follow = dist(#Player.pos, pose.pos)
+    !move(v2(0.1, 0))
+
+@Scripted
+  ~log2: []
+  ~f: null
+  ~kind: null
+  &tick(1hz):
+    ?f == null:
+      f = \v: v * speed_of(#Player)
+    log2.push(f(2))
+    a, b = [1, 2]
+    ?* a + b:
+      3: kind = three
+      _: kind = other
+    *i in 0..3:
+      ?i == 1: ~continue
+      log2.push(i)
+    ^emit stats.speed(1, 2)

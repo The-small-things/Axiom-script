@@ -695,6 +695,12 @@ static AxValue eval_node(AxVM *vm, AxNode *n, AxScope *scope) {
     }
     case N_METHOD: {
       AxValue obj = eval_node(vm, n->a, scope);
+      if (obj.t == AX_HOST) {
+        // `belief.any(>0.3)` needs the predicate operator from the argument node itself.
+        extern bool ax_dist_any(AxVM *vm, AxValue obj, AxNode *call, AxScope *scope, AxValue *out);
+        AxValue out;
+        if (ax_dist_any(vm, obj, n, scope, &out)) { ax_release(obj); return out; }
+      }
       AxValue *args = n->nlist ? calloc(n->nlist, sizeof(AxValue)) : NULL;
       for (int i = 0; i < n->nlist; i++) args[i] = eval_node(vm, n->list[i]->b, scope);
       AxValue out;
@@ -839,6 +845,27 @@ static AxValue eval_call_named(AxVM *vm, AxNode *n, AxScope *scope) {
     }
     ax_release(fields);
     return ax_dictv(d);
+  }
+  // A field of the running entity that holds a function is callable by name.
+  if (vm->ctx.entity) {
+    AxValue fv;
+    if (ax_entity_get(vm->ctx.entity, n->str, &fv)) {
+      if (fv.t == AX_FN) {
+        AxValue *args = n->nlist ? calloc(n->nlist, sizeof(AxValue)) : NULL;
+        for (int i = 0; i < n->nlist; i++) args[i] = eval_node(vm, n->list[i]->b, scope);
+        AxValue out = ax_call(vm, fv, args, n->nlist);
+        for (int i = 0; i < n->nlist; i++) ax_release(args[i]);
+        free(args);
+        ax_release(fv);
+        return out;
+      }
+      if (!found_any) {
+        const char *tn = ax_type_name(fv);
+        ax_release(fv);
+        ax_throw(vm, "AX-CALL-001", "field '%s' holds %s, which is not callable", n->str->data, tn);
+      }
+      ax_release(fv);
+    }
   }
   if (found_any) {
     AxValue v;

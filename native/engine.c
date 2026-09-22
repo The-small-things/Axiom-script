@@ -304,6 +304,8 @@ typedef struct {
 
 typedef struct {
   char code[32];
+  char severity[16];     // "fatal" for faults; !load's schema check can be "advisory"
+  char title[64];
   char human[512];
   AxStr *entity, *block;
   int line, col;
@@ -344,6 +346,7 @@ typedef struct AxWorld {
   DebugEntry ring[DEBUG_RING];
   int ring_head, ring_count;
   const char *source;
+  const char *version;
   bool suppress_console;
 } AxWorld;
 
@@ -1268,6 +1271,8 @@ void ax_engine_install(AxVM *vm) {
   def(vm, "cell_to_world", e_cell_to_world, 0, 1);
   def(vm, "bar", e_bar, 0, 4);
   def(vm, "hypot", e_hypot, 0, 2);   // V8's rounding, so both runtimes agree to the bit
+  extern void ax_engine_install_more(AxVM *vm);
+  ax_engine_install_more(vm);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1284,6 +1289,8 @@ static void push_diag(AxVM *vm, AxEntity *e, AxStr *block, AxNode *stmt) {
   Diag *d = &w->diags[w->ndiags++];
   memset(d, 0, sizeof *d);
   snprintf(d->code, sizeof d->code, "%s", vm->error_code[0] ? vm->error_code : "AX-RUNTIME-000");
+  snprintf(d->severity, sizeof d->severity, "fatal");
+  snprintf(d->title, sizeof d->title, "Runtime Fault");
   AxValue msg;
   if (vm->error.t == AX_DICT && ax_dict_get((AxDict *)vm->error.o, ax_internz("msg"), &msg)) {
     AxStr *s = ax_to_str(msg);
@@ -2690,7 +2697,7 @@ static void json_diag(JB *b, Diag *d, int depth) {
   const int I = 2;
   jb(b, "{");
   jpad(b, I, depth + 1); jb(b, "\"error_code\": "); jstr(b, d->code, strlen(d->code)); jb(b, ",");
-  jpad(b, I, depth + 1); jb(b, "\"severity\": \"fatal\",");
+  jpad(b, I, depth + 1); jb(b, "\"severity\": "); jstr(b, d->severity, strlen(d->severity)); jb(b, ",");
   jpad(b, I, depth + 1); jb(b, "\"location\": {");
   jpad(b, I, depth + 2); jb(b, "\"entity\": "); if (d->entity) jstr(b, d->entity->data, d->entity->len); else jb(b, "null"); jb(b, ",");
   jpad(b, I, depth + 2); jb(b, "\"block\": "); if (d->block) jstr(b, d->block->data, d->block->len); else jb(b, "null"); jb(b, ",");
@@ -2699,10 +2706,10 @@ static void json_diag(JB *b, Diag *d, int depth) {
   jpad(b, I, depth + 1); jb(b, "},");
   jpad(b, I, depth + 1); jb(b, "\"violated_rule\": {");
   jpad(b, I, depth + 2); jb(b, "\"section\": \"runtime\",");
-  jpad(b, I, depth + 2); jb(b, "\"title\": \"Runtime Fault\"");
+  jpad(b, I, depth + 2); jb(b, "\"title\": "); jstr(b, d->title, strlen(d->title));
   jpad(b, I, depth + 1); jb(b, "},");
   jpad(b, I, depth + 1); jb(b, "\"context_snippet\": "); if (d->has_snippet) jstr(b, d->snippet, strlen(d->snippet)); else jb(b, "null"); jb(b, ",");
-  const char *human = classify_human(d->code, d->human);
+  const char *human = d->title[0] == 'S' ? d->human : classify_human(d->code, d->human);
   jpad(b, I, depth + 1); jb(b, "\"message_for_human\": "); jstr(b, human, strlen(human)); jb(b, ",");
   char agent[1200];
   snprintf(agent, sizeof agent, "%s Raw error: \"%s\".", human, d->human);
@@ -2804,3 +2811,85 @@ void ax_engine_print_log_json(AxVM *vm, FILE *out, int depth) {
   fputs(b.buf, out);
   free(b.buf);
 }
+
+
+// ---------------------------------------------------------------------------------------------
+// The small surface infer.c (distributions, navmesh, save/load) needs from the world
+// ---------------------------------------------------------------------------------------------
+
+AxValue ax_entity_pos(AxEntity *e) {
+  init_keys();
+  AxXform *p = e ? ent_pose(e) : NULL;
+  return p ? ax_copy(p->pos) : ax_null();
+}
+int ax_world_entities(AxVM *vm, AxEntity ***out) { *out = W(vm) ? W(vm)->ents : NULL; return W(vm) ? W(vm)->nents : 0; }
+AxDict *ax_world_channels(AxVM *vm) { return W(vm) ? W(vm)->channels : NULL; }
+AxDict *ax_world_saves(AxVM *vm) { return W(vm) ? W(vm)->save_slots : NULL; }
+const char *ax_world_version(AxVM *vm) { return W(vm) && W(vm)->version ? W(vm)->version : NULL; }
+void ax_engine_set_version(AxVM *vm, const char *v) { if (W(vm)) W(vm)->version = v; }
+AxXform *ax_entity_pose(AxEntity *e) { init_keys(); return ent_pose(e); }
+
+void ax_world_diag(AxVM *vm, AxEntity *e, AxStr *block, const char *code, const char *severity, const char *title, const char *human) {
+  AxWorld *w = W(vm);
+  if (!w) return;
+  if (w->ndiags == w->capdiags) {
+    w->capdiags = w->capdiags ? w->capdiags * 2 : 8;
+    w->diags = realloc(w->diags, sizeof(Diag) * w->capdiags);
+  }
+  Diag *d = &w->diags[w->ndiags++];
+  memset(d, 0, sizeof *d);
+  snprintf(d->code, sizeof d->code, "%s", code);
+  snprintf(d->severity, sizeof d->severity, "%s", severity);
+  snprintf(d->title, sizeof d->title, "%s", title);
+  snprintf(d->human, sizeof d->human, "%s", human);
+  d->entity = e ? e->name : NULL;
+  d->block = block;
+}
+
+// `vision_cells(origin, facing, player_pos, range, half_angle_deg)` — which cells of a 10×10
+// grid are in view, and whether the player's cell is one of them (the observation a `$belief`
+// grid is updated with).
+static AxValue cell_dict(int x, int y) {
+  AxDict *c = ax_dict_new();
+  ax_dict_set(c, K_x, ax_num(x));
+  ax_dict_set(c, K_y, ax_num(y));
+  return ax_dictv(c);
+}
+
+NATIVE(e_vision_cells) {
+  const int W_ = 10, H_ = 10;
+  V3 origin = v3of(A(0));
+  AxValue facing = A(1), player = A(2);
+  double range = N(3), half = N(4);
+  AxArr *visible = ax_arr_new(16);
+  for (int y = 0; y < H_; y++) for (int x = 0; x < W_; x++) {
+    V3 c = v3(x + 0.5, 0, y + 0.5);
+    V3 to = v3sub(c, origin);
+    double d = v3mag(to);
+    if (d > range) continue;
+    if (d > 1e-6) {
+      V3 f = A(0).t == AX_VEC3 ? v3of(facing) : v3norm(v3(ax_vecp(facing)->x, 0, ax_vecp(facing)->y));
+      double cosA = js_clamp(v3dot(f, v3norm(to)), -1, 1);
+      double ang = acos(cosA) * 180 / M_PI;
+      if (ang > half) continue;
+    }
+    ax_arr_push(visible, cell_dict(x, y));
+  }
+  V3 pp = v3of(player);
+  double pz = player.t == AX_VEC3 ? pp.z : pp.y;
+  if (isnan(pz)) pz = 0;
+  int px = (int)js_clamp(floor(pp.x), 0, W_ - 1), py = (int)js_clamp(floor(pz), 0, H_ - 1);
+  AxValue seen = ax_null();
+  for (uint32_t i = 0; i < visible->len; i++) {
+    AxValue cx, cy;
+    ax_dict_get((AxDict *)visible->items[i].o, K_x, &cx);
+    ax_dict_get((AxDict *)visible->items[i].o, K_y, &cy);
+    if (cx.num == px && cy.num == py) { seen = cell_dict(px, py); break; }
+  }
+  AxDict *out = ax_dict_new();
+  AxStr *k = ax_internz("visibleCells"); ax_dict_set(out, k, ax_arrv(visible)); ax_release(ax_strv(k));
+  k = ax_internz("seenCell"); ax_dict_set(out, k, seen); ax_release(ax_strv(k));
+  return ax_dictv(out);
+}
+
+void ax_engine_install_more(AxVM *vm) { def(vm, "vision_cells", e_vision_cells, 0, 5); }

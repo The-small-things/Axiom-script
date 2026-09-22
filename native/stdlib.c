@@ -1449,6 +1449,14 @@ NATIVE(n_to_json) {
   free(sb.buf);
   return r;
 }
+// Parse JSON text into a value (dicts for objects); false when it is not valid JSON.
+bool ax_json_parse(const char *text, AxValue *out) {
+  JP j = { text, true };
+  *out = json_read(&j);
+  if (!j.ok) { ax_release(*out); *out = ax_null(); }
+  return j.ok;
+}
+
 NATIVE(n_from_json) {
   AxStr *s = arg_str(ARG(0));
   JP j = { s->data, true };
@@ -1557,7 +1565,9 @@ NATIVE(n_re_split) {
 
 // --- randomness -------------------------------------------------------------------------------
 
-static double rng_next(AxVM *vm) {
+double ax_rng_next(AxVM *vm);
+static double rng_next(AxVM *vm) { return ax_rng_next(vm); }
+double ax_rng_next(AxVM *vm) {
   // mulberry32, the same generator the reference uses, so a seeded run matches.
   uint32_t a = (vm->rng_state += 0x6D2B79F5u);
   uint32_t t = a;

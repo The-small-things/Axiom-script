@@ -4400,7 +4400,11 @@ function callFunction(name, argNodes, ctx) {
     }
   }
   if (ctx.entity && ctx.entity.get(name) !== undefined) {
-    throw new AxiomError(`field '${name}' holds ${typeNameOf(ctx.entity.get(name))}, which is not callable`, 'AX-CALL-001');
+    // v0.9.2: a field holding a function is callable by name, like a local holding one.
+    // Before this the call failed with "field 'f' holds function, which is not callable".
+    const fv = ctx.entity.get(name);
+    if (isCallable(fv, ctx.world)) return callValue(fv, argNodes.map(a => evalExpr(a.value, ctx)), ctx, name);
+    throw new AxiomError(`field '${name}' holds ${typeNameOf(fv)}, which is not callable`, 'AX-CALL-001');
   }
   throw new AxiomError(`unknown function '${name}(...)'`, 'AX-RUNTIME-FUNC');
 }
