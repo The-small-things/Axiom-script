@@ -39,10 +39,14 @@ $ node main.js hello.ax
 | `a ?? b`, `x ??= v`, `x += 1`, `++x` | each replaces a 4–7 token conditional |
 | `~NAME: value` globals | no config dict threaded through every call |
 | a guessable stdlib (`sum`, `uniq`, `group_by`, `re_sub`, `read_json`) | reimplementation, and the bugs that come with it |
+| `Add(l, r):` patterns | a test plus two field reads per branch, in every tree-shaped program |
 | diagnostics that name the fix | a whole generate-run-fail-retry cycle, the most expensive thing a model can do |
 
 The checker's messages are written **for the model**: every diagnostic carries a
-`message_for_agent` explaining what to change, not just what went wrong.
+`message_for_agent` explaining what to change, not just what went wrong. It catches, before
+anything runs: calls with the wrong number of arguments, fields a record type does not declare,
+mistyped names (which the language would otherwise turn silently into atoms), literals that
+contradict a declared type, undefined functions, unreachable code, and missing event fields.
 
 ---
 
@@ -113,6 +117,14 @@ Arrays, dicts, and records compare **structurally** (`[1,2] == [1,2]` is true).
   "add", "plus": r = a + b
   "neg": r = -a
   _: ^throw f"unknown {cmd}"
+
+?* node:                   // patterns take a value apart and name the pieces
+  Add(l, r): v = ev(l) + ev(r)      // record pattern — binds l and r
+  Num(v) if v > 0: acc += v         // guard, sees the bindings
+  [x, y]: v = x + y                 // array pattern
+  {name, age}: greet(name, age)     // dict pattern — binds by key
+  n if n > 10: v = n                // guarded capture
+  _: ^throw "?"
 ```
 
 ### Functions and data flow

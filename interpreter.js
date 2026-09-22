@@ -4414,11 +4414,90 @@ function constructRecord(typeDecl, argNodes, ctx) {
 // by atom equality (`idle`, `running`), which is how state machines are written; everything
 // else is an ordinary expression compared by value. A record pattern `P` (a ^type name) matches
 // any record carrying that `__type`, so `?* node:` can dispatch on shape.
-function matchesPattern(subject, patNode, ctx) {
-  if (patNode.type === 'Ident' && ctx.world && ctx.world.typeDecls.has(patNode.name)) {
-    return !!(subject && typeof subject === 'object' && subject.__type === patNode.name);
+// v0.9.1: PATTERN MATCHING WITH BINDINGS.
+//
+// A match arm can now take a value apart and name the pieces in one step:
+//
+//   ?* node:
+//     Add(l, r): ^return ev(l) + ev(r)      // record pattern — binds l and r
+//     Num(v) if v > 0: ^return v            // guard, sees the bindings
+//     [x, y]: ^return x + y                 // array pattern
+//     {name, age}: ^return f"{name}:{age}"  // dict pattern — binds by key
+//     _: ^throw "?"
+//
+// Every tree-shaped program — an interpreter, a JSON walker, a state machine carrying data —
+// used to spend a conditional plus two or three field reads per case. This is the single
+// largest token saving left in the language, and it removes the class of bug where the test
+// and the field access disagree about which variant is in hand.
+//
+// The binding rule, stated once:
+//   * INSIDE a pattern (a constructor's arguments, an array's elements, a dict's values), a
+//     bare lowercase name BINDS whatever is in that position, and `_` matches without binding.
+//   * At the TOP level of an arm, a bare name still compares — `idle:` tests the atom `idle`,
+//     as it always has, because atom-valued state machines are the language's oldest idiom.
+//     To capture the whole subject, use `_ if cond:` or match on the type name.
+//   * Literals always compare. A capitalised name that is a declared ^type matches by type.
+//
+// `bindings` is a Map filled as the match proceeds; on a successful arm it becomes the arm's
+// scope frame, so a failed arm leaves nothing behind.
+function matchPatternInner(subject, patNode, ctx, bindings) {
+  switch (patNode.type) {
+    case 'Ident': {
+      if (patNode.name === '_') return true;                      // wildcard, binds nothing
+      if (ctx.world && ctx.world.typeDecls.has(patNode.name)) {    // bare type name: match by type
+        return !!(subject && typeof subject === 'object' && subject.__type === patNode.name);
+      }
+      bindings.set(patNode.name, subject);
+      return true;
+    }
+    case 'Call': {
+      // Constructor pattern: `Point(x, y)`. Positional arguments follow the declared field
+      // order; named arguments (`Point(y: b)`) pick fields out by name.
+      const typeDecl = ctx.world && ctx.world.typeDecls.get(patNode.callee);
+      if (!typeDecl) return equalsVal(subject, evalExpr(patNode, ctx));
+      if (!subject || typeof subject !== 'object') return false;
+      if (subject.__type !== undefined && subject.__type !== typeDecl.name) return false;
+      let pos = 0;
+      for (const arg of patNode.args) {
+        if (!arg || !arg.value) continue;
+        const fieldName = arg.name ? arg.name : (typeDecl.fields[pos++] || {}).name;
+        if (fieldName === undefined) return false;
+        if (!matchPatternInner(subject[fieldName], arg.value, ctx, bindings)) return false;
+      }
+      return true;
+    }
+    case 'ArrayLit': {
+      if (!Array.isArray(subject)) return false;
+      if (subject.length !== patNode.elements.length) return false;
+      for (let i = 0; i < patNode.elements.length; i++) {
+        if (!matchPatternInner(subject[i], patNode.elements[i], ctx, bindings)) return false;
+      }
+      return true;
+    }
+    case 'DictLit': {
+      if (!subject || typeof subject !== 'object' || Array.isArray(subject)) return false;
+      for (const pair of patNode.pairs) {
+        const key = pair.keyExpr !== undefined ? stringifyKey(evalExpr(pair.keyExpr, ctx)) : pair.key;
+        if (!Object.prototype.hasOwnProperty.call(subject, key)) return false;
+        if (!matchPatternInner(subject[key], pair.value, ctx, bindings)) return false;
+      }
+      return true;   // a dict pattern matches on the keys it names; extra keys are ignored
+    }
+    default:
+      return equalsVal(subject, evalExpr(patNode, ctx));
   }
-  return equalsVal(subject, evalExpr(patNode, ctx));
+}
+
+// Top level of an arm: a bare identifier compares as an atom rather than binding (see above).
+function matchesPattern(subject, patNode, ctx, bindings) {
+  if (patNode.type === 'Ident') {
+    if (patNode.name === '_') return true;
+    if (ctx.world && ctx.world.typeDecls.has(patNode.name)) {
+      return !!(subject && typeof subject === 'object' && subject.__type === patNode.name);
+    }
+    return equalsVal(subject, evalExpr(patNode, ctx));
+  }
+  return matchPatternInner(subject, patNode, ctx, bindings || new Map());
 }
 
 function readVar(name, ctx) {
@@ -4505,15 +4584,33 @@ function execStmtInner(stmt, ctx) {
     // v0.9.0: `?* subject:` — multiway match on value equality, `_` arm is the default.
     case 'Match': {
       const subject = evalExpr(stmt.subject, ctx);
+      const parentScope = ctx.scope || ctx.world.globalScope;
       for (const arm of stmt.arms) {
         let hit = false;
-        if (arm.patterns === null) hit = true;   // `_` default
+        let bindings = null;
+        if (arm.patterns === null) hit = true;   // `_` catch-all (possibly guarded)
         else {
           for (const pat of arm.patterns) {
-            if (matchesPattern(subject, pat, ctx)) { hit = true; break; }
+            const b = new Map();
+            // A GUARDED arm whose pattern is a bare name captures the subject instead of
+            // comparing against an atom of that name: `n if n > 10:` reads as "call it n, and
+            // only take this arm when n > 10", which is the only reading that makes sense —
+            // comparing a subject to an atom and then testing that atom is never useful.
+            if (arm.guard && pat.type === 'Ident' && pat.name !== '_'
+                && !(ctx.world && ctx.world.typeDecls.has(pat.name))) {
+              b.set(pat.name, subject);
+              hit = true; bindings = b; break;
+            }
+            if (matchesPattern(subject, pat, ctx, b)) { hit = true; bindings = b; break; }
           }
         }
-        if (hit) return execBody(arm.body, ctx, new Scope(ctx.scope || ctx.world.globalScope));
+        if (!hit) continue;
+        // The arm's bindings are its scope frame, so the guard and the body see the same names
+        // and a failed guard discards them cleanly.
+        const armScope = new Scope(parentScope);
+        if (bindings) for (const [k, v] of bindings) armScope.declare(k, v);
+        if (arm.guard && !truthy(evalExpr(arm.guard, { ...ctx, scope: armScope }))) continue;
+        return execBody(arm.body, ctx, armScope);
       }
       return;
     }

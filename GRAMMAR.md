@@ -279,7 +279,27 @@ stmt = assert_stmt
    default arm and must come last. A bare identifier naming a ^type matches any record of that
    type. A match is a statement, not an expression — assign inside the arms. *)
 match_stmt = '?' '*' expr ':' NEWLINE INDENT { match_arm } DEDENT ;
-match_arm  = ( expr { ',' expr } | '_' ) ':' inline_or_block_body ;
+match_arm  = ( pattern { ',' pattern } | '_' ) [ 'if' expr ] ':' inline_or_block_body ;
+
+(* v0.9.1: PATTERNS. A pattern is parsed with the expression grammar and interpreted by these
+   rules, so no new syntax is needed:
+
+     IDENT '(' pattern-args ')'   a record of that ^type; arguments match its fields in
+                                  declaration order, or by name (`P(y: b)`)
+     '[' pattern { ',' pattern } ']'   an array of exactly that length, element-wise
+     '{' key ':' pattern … '}'    a dict containing at least those keys (extra keys ignored);
+                                  `{x, y}` is the shorthand that binds those keys
+     IDENT                        INSIDE a pattern: binds whatever is in that position
+                                  AT THE TOP LEVEL of an arm: compares (so `idle:` still tests
+                                  the atom `idle`) — unless the arm has a guard, where a bare
+                                  name captures the subject (`n if n > 10:`)
+     '_'                          matches anything and binds nothing
+     IDENT (a declared ^type)     matches any record of that type, binding nothing
+     any other expression         evaluated and compared by value (structurally, for arrays
+                                  and dicts)
+
+   Bindings become the arm's scope frame, so the guard and the body see them and a failed arm
+   leaves nothing behind. *)
 
 (* v0.9.0: structured error handling. `^catch` may bind a variable, which receives
    {msg, code, value}; engine faults (bad index, unknown method, sandbox denial) are catchable

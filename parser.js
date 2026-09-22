@@ -1204,18 +1204,32 @@ class Parser {
     const arms = [];
     let sawDefault = false;
     while (!this.at(TT.DEDENT)) {
-      if (this.at(TT.IDENT) && this.peek().value === '_' && this.peek(1).type === TT.COLON) {
-        this.advance(); this.advance();
-        arms.push({ patterns: null, body: this.parseIndentedOrInlineBody() });
-        sawDefault = true;
+      if (this.at(TT.IDENT) && this.peek().value === '_'
+          && (this.peek(1).type === TT.COLON || (this.peek(1).type === TT.IDENT && this.peek(1).value === 'if'))) {
+        this.advance();
+        // v0.9.1: `_ if cond:` — a guarded catch-all. Unlike a bare `_`, it may fail, so it is
+        // not treated as the final default and later arms are still reachable.
+        let guard = null;
+        if (this.at(TT.IDENT) && this.peek().value === 'if') { this.advance(); guard = this.parseExpr(); }
+        this.expect(TT.COLON);
+        arms.push({ patterns: null, guard, body: this.parseIndentedOrInlineBody() });
+        if (!guard) sawDefault = true;
         this.skipNewlines();
         continue;
       }
       if (sawDefault) throw new ParseError('the `_` default arm must be last in a ?* match', this.peek());
       const patterns = [this.parseExpr()];
       while (this.at(TT.COMMA)) { this.advance(); patterns.push(this.parseExpr()); }
+      // v0.9.1: arm guard — `pattern if cond:`. The guard is evaluated with the pattern's
+      // bindings already in scope, so it can test what the pattern just pulled apart:
+      //   Node(l, r) if l > r: ...
+      let guard = null;
+      if (this.at(TT.IDENT) && this.peek().value === 'if') {
+        this.advance();
+        guard = this.parseExpr();
+      }
       this.expect(TT.COLON);
-      arms.push({ patterns, body: this.parseIndentedOrInlineBody() });
+      arms.push({ patterns, guard, body: this.parseIndentedOrInlineBody() });
       this.skipNewlines();
     }
     this.expect(TT.DEDENT);

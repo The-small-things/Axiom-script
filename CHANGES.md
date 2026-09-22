@@ -1,5 +1,71 @@
 # AxiomScript — Change Log
 
+## v0.9.1 — Patterns and the static safety net
+
+Two changes, both aimed at the same thing: writing a correct program in fewer tokens, and
+finding out about the incorrect ones before they run.
+
+### Pattern matching with bindings
+
+A `?*` arm can now take a value apart and name the pieces in one step:
+
+```axiom
+?* node:
+  Add(l, r): ^return ev(l) + ev(r)      // record pattern — binds l and r
+  Num(v) if v > 0: ^return v            // guard, evaluated with the bindings in scope
+  [x, y]: ^return x + y                 // array pattern, exact length
+  {name, age}: ^return f"{name} {age}"  // dict pattern — binds by key, extra keys ignored
+  n if n > 10: ^return n                // guarded capture of the whole subject
+  _: ^throw "?"
+```
+
+- Record patterns follow the `^type`'s field order, or name fields directly (`P(y: b)`).
+- `_` matches without binding, in any position.
+- **The binding rule**: inside a pattern a bare name binds; at the top level of an arm a bare
+  name still compares, so `idle:` keeps testing the atom `idle` — the language's oldest idiom
+  is untouched. An arm with a guard is the exception: there a bare name captures the subject,
+  because comparing against an atom and then guarding it is never what was meant.
+- Bindings form the arm's scope frame, so a failed arm leaves nothing behind.
+- Arm guards (`pattern if cond:`) and guarded catch-alls (`_ if cond:`) were added with them;
+  a guarded `_` is not the final default, so later arms stay reachable.
+
+Every tree-shaped program — an interpreter, a JSON walker, a state machine carrying data —
+previously spent a conditional plus two or three field reads per case, and had to keep the test
+and the field access in agreement by hand.
+
+### The static safety net
+
+Four new advisory checks, each with a conservative trigger, because a false positive makes a
+model rewrite working code and is worse than the miss it prevents:
+
+- **AX-ARITY-001** — a call to a declared `^fn`/`^proc` with too few or too many arguments,
+  including in `!name(...)` action position. Parameters with defaults are optional, and a
+  function that reads its `args` array is treated as variadic.
+- **AX-FIELD-001** — a field the record's `^type` does not declare, for a local that is assigned
+  exactly once from a constructor and never reassigned. Suggests the nearest declared field.
+- **AX-UNDEF-VAR-001** — an identifier that is bound nowhere, used where an atom cannot be
+  meant: arithmetic, an ordering comparison, an index, or a member access. Until now a mistyped
+  variable name silently became an atom (`helth - 10` produced NaN, not an error), which was the
+  last remaining way for a typo to survive to runtime. Atoms used as atoms — `state == idle`,
+  `!play(step)` — are untouched.
+- **AX-TYPE-001** — a literal that contradicts a declared type, on a `^type` field or a `^fn`
+  return. Only fires where both sides are known statically, so it cannot produce a false
+  positive; annotations stay documentation, the runtime is unchanged.
+
+The checks know about entity fields, mixin fields, `&on(Event)` payload fields, pattern
+bindings, lambda parameters, comprehension variables, and loop variables. The six shipped
+examples compile with zero diagnostics, and the suite asserts that they continue to.
+
+### Tests
+
+`test_v090_general.js` grew to 215 assertions, adding sections for pattern matching and for
+each new check, including the negative cases that guard against false positives.
+
+### Version bumps
+
+- `package.json` → `0.9.1`
+- `checker.js` `KNOWN_VERSIONS` → added `'0.9.1'`
+
 ## v0.9.0 — General Purpose
 
 AxiomScript was a language for describing game worlds. As of v0.9.0 it is a general-purpose

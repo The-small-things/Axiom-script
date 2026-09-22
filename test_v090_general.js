@@ -662,5 +662,122 @@ section('17. Documentation coverage');
     readme.includes('^main') && readme.includes('--run'));
 }
 
+// =========================================================================================
+section('18. Pattern matching with bindings (v0.9.1)');
+// =========================================================================================
+{
+  const tree = `
+^type Add: l, r
+^type Mul: l, r
+^type Num: v
+^fn ev(n):
+  ?* n:
+    Add(a, b): ^return ev(a) + ev(b)
+    Mul(a, b): ^return ev(a) * ev(b)
+    Num(x): ^return x
+    _: ^throw "bad node"
+`;
+  eq('18.1 record pattern binds its fields',
+    run(`${tree}\n^main:\n  ^return ev(Add(Num(2), Mul(Num(3), Num(4))))\n`).result, 14);
+  eq('18.2 nested patterns match structurally',
+    run(`${tree}\n^main:\n  ?* Add(Num(1), Num(2)):\n    Add(Num(a), Num(b)): ^return a + b\n    _: ^return -1\n`).result, 3);
+  eq('18.3 a literal inside a pattern still compares',
+    run(`^type P: x, y\n^main:\n  ?* P(1, 9):\n    P(2, y): ^return "no"\n    P(1, y): ^return y\n    _: ^return -1\n`).result, 9);
+  eq('18.4 named arguments in a pattern pick fields by name',
+    run(`^type P: x, y\n^main:\n  ?* P(4, 5):\n    P(y: b): ^return b\n`).result, 5);
+  eq('18.5 array pattern binds elements',
+    run(`^main:\n  ?* [1, 2, 3]:\n    [a, b, c]: ^return a * 100 + b * 10 + c\n`).result, 123);
+  eq('18.6 array pattern requires the same length',
+    run(`^main:\n  ?* [1, 2]:\n    [a, b, c]: ^return "three"\n    [a, b]: ^return "two"\n`).result, 'two');
+  eq('18.7 dict pattern binds by key and ignores extra keys',
+    run(`^main:\n  ?* {name: "ada", age: 36, city: "london"}:\n    {name, age}: ^return f"{name} {age}"\n`).result, 'ada 36');
+  eq('18.8 `_` inside a pattern matches without binding',
+    run(`^type P: x, y\n^main:\n  ?* P(7, 8):\n    P(_, b): ^return b\n`).result, 8);
+  eq('18.9 a guard sees the pattern bindings',
+    run(`^type P: x, y\n^main:\n  ?* P(1, 2):\n    P(a, b) if a > b: ^return "gt"\n    P(a, b) if a < b: ^return "lt"\n    _: ^return "eq"\n`).result, 'lt');
+  eq('18.10 a guarded bare name captures the subject',
+    run(`^main:\n  ?* 42:\n    n if n > 100: ^return "huge"\n    n if n > 10: ^return n * 2\n    _: ^return 0\n`).result, 84);
+  eq('18.11 an unguarded bare name still compares as an atom (v0.8 idiom)',
+    run(`^main:\n  s = idle\n  ?* s:\n    running: ^return "go"\n    idle: ^return "wait"\n`).result, 'wait');
+  eq('18.12 `_ if` is a guarded catch-all, not the final default',
+    run(`^main:\n  ?* 3:\n    _ if 1 > 2: ^return "never"\n    3: ^return "three"\n`).result, 'three');
+  eq('18.13 a failed arm leaves no bindings behind',
+    run(`^type P: x\n^main:\n  a = "outer"\n  ?* P(1):\n    P(a) if a > 5: ^return "no"\n    _: ^return a\n`).result, 'outer');
+  eq('18.14 a type pattern still matches by type alone',
+    run(`^type Leaf: v\n^type Node: l, r\n^main:\n  ?* Leaf(1):\n    Node: ^return "node"\n    Leaf: ^return "leaf"\n`).result, 'leaf');
+  // Patterns work on the values a real program has in hand, not just on literals.
+  eq('18.15 pattern matching drives a recursive walk',
+    run(`
+^type Leaf: v
+^type Pair: a, b
+^fn total(n):
+  ?* n:
+    Pair(x, y): ^return total(x) + total(y)
+    Leaf(v): ^return v
+    _: ^return 0
+^main:
+  t = Pair(Leaf(1), Pair(Leaf(2), Pair(Leaf(3), Leaf(4))))
+  ^return total(t)
+`).result, 10);
+}
+
+// =========================================================================================
+section('19. The static safety net (v0.9.1)');
+// =========================================================================================
+{
+  const diags = (src) => compile(src, { imports: false }).diagnostics;
+  const has = (src, code) => diags(src).some(d => d.error_code === code);
+
+  ok('19.1 too few arguments is reported',
+    has(`^fn f(a, b) = a + b\n^main:\n  ^return f(1)\n`, 'AX-ARITY-001'));
+  ok('19.2 too many arguments is reported',
+    has(`^fn f(a) = a\n^main:\n  ^return f(1, 2)\n`, 'AX-ARITY-001'));
+  ok('19.3 a default parameter makes the argument optional',
+    !has(`^fn f(a, b = 2) = a + b\n^main:\n  ^return f(1)\n`, 'AX-ARITY-001'));
+  ok('19.4 a function that reads args is variadic and not flagged',
+    !has(`^fn f(a):\n  ^return len(args)\n^main:\n  ^return f(1, 2, 3)\n`, 'AX-ARITY-001'));
+  ok('19.5 arity is checked in action position too',
+    has(`^proc p(a, b):\n  print(a)\n@E\n  ~x: 0\n  &tick(10hz):\n    !p(1)\n`, 'AX-ARITY-001'));
+
+  ok('19.6 an unknown field on a record is reported',
+    has(`^type P: x, y\n^main:\n  p = P(1, 2)\n  ^return p.z\n`, 'AX-FIELD-001'));
+  ok('19.7 a declared field is not reported',
+    !has(`^type P: x, y\n^main:\n  p = P(1, 2)\n  ^return p.y\n`, 'AX-FIELD-001'));
+  ok('19.8 a reassigned variable is not tracked (no false positive)',
+    !has(`^type P: x\n^main:\n  p = P(1)\n  p = {anything: 1}\n  ^return p.anything\n`, 'AX-FIELD-001'));
+
+  ok('19.9 a mistyped variable used in arithmetic is reported',
+    has(`^main:\n  health = 100\n  ^return helth - 10\n`, 'AX-UNDEF-VAR-001'));
+  ok('19.10 the suggestion names the intended variable',
+    diags(`^main:\n  health = 100\n  ^return helth - 10\n`).some(d => d.message_for_human.includes("health")));
+  ok('19.11 an atom compared with == is NOT reported',
+    !has(`^main:\n  state = idle\n  ?state == idle:\n    ^return 1\n`, 'AX-UNDEF-VAR-001'));
+  ok('19.12 an atom passed as an argument is NOT reported',
+    !has(`@E\n  ~x: 0\n  &tick(10hz):\n    !play(step)\n`, 'AX-UNDEF-VAR-001'));
+  ok('19.13 entity fields, mixin fields and event payloads are known names',
+    !has(`^event Hit:\n  damage:: number\n^mix M:\n  ~armor: 1\n@E +M\n  ~hp: 10\n  &on(Hit):\n    hp -= damage * armor\n`, 'AX-UNDEF-VAR-001'));
+  ok('19.14 pattern bindings are known names',
+    !has(`^type P: x, y\n^main:\n  ?* P(1, 2):\n    P(a, b): ^return a + b\n`, 'AX-UNDEF-VAR-001'));
+  ok('19.15 lambda and comprehension variables are known names',
+    !has(`^main:\n  ^return [n * 2 for n in range(0, 3)].map(\\v: v - 1)\n`, 'AX-UNDEF-VAR-001'));
+
+  ok('19.16 a literal contradicting a declared field type is reported',
+    has(`^type P: x:: number\n^main:\n  ^return P("s").x\n`, 'AX-TYPE-001'));
+  ok('19.17 a literal contradicting a declared return type is reported',
+    has(`^fn f() -> number = "s"\n^main:\n  ^return f()\n`, 'AX-TYPE-001'));
+  ok('19.18 a matching literal is not reported',
+    !has(`^type P: x:: number\n^main:\n  ^return P(1).x\n`, 'AX-TYPE-001'));
+  ok('19.19 an unannotated field is not reported',
+    !has(`^type P: x\n^main:\n  ^return P("s").x\n`, 'AX-TYPE-001'));
+
+  // The safety net must not fire on the shipped examples — they are the corpus that proves it.
+  for (const name of ['fizzbuzz', 'stats', 'wordcount', 'life', 'calc', 'sim']) {
+    const src = fs.readFileSync(path.join(__dirname, 'examples', `${name}.ax`), 'utf8');
+    const ds = compile(src, { filename: path.join(__dirname, 'examples', `${name}.ax`) }).diagnostics;
+    ok(`19.20.${name} examples/${name}.ax compiles with no diagnostics at all`,
+      ds.length === 0, ds.map(d => `${d.error_code} L${d.location && d.location.line}: ${d.message_for_human}`).join(' | '));
+  }
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed === 0 ? 0 : 1);

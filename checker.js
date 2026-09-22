@@ -662,7 +662,7 @@ function fieldDefaultsDiffer(a, b) {
 
 // -----------------------------------------------------------------------------
 // v0.4 — Version pragma
-const KNOWN_VERSIONS = new Set(['0.1', '0.2', '0.3', '0.4', '0.5', '0.5.1', '0.6', '0.6.1', '0.7', '0.8', '0.8.1', '0.8.2', '0.8.3', '0.8.4', '0.8.5', '0.8.6', '0.8.7', '0.8.8', '0.8.9', '0.8.10', '0.8.11', '0.8.12', '0.8.13', '0.8.15', '0.8.16', '0.8.17', '0.9', '0.9.0']);
+const KNOWN_VERSIONS = new Set(['0.1', '0.2', '0.3', '0.4', '0.5', '0.5.1', '0.6', '0.6.1', '0.7', '0.8', '0.8.1', '0.8.2', '0.8.3', '0.8.4', '0.8.5', '0.8.6', '0.8.7', '0.8.8', '0.8.9', '0.8.10', '0.8.11', '0.8.12', '0.8.13', '0.8.15', '0.8.16', '0.8.17', '0.9', '0.9.0', '0.9.1']);
 function checkVersionPragma(program, source) {
   if (!program.version) return [];
   if (KNOWN_VERSIONS.has(program.version)) return [];
@@ -1194,6 +1194,373 @@ function checkCrossEntityWrites(program, source) {
 }
 
 // -----------------------------------------------------------------------------
+// v0.9.1 — THE STATIC SAFETY NET
+//
+// Everything in this section exists for one reason: an error the checker reports costs the
+// model a line of context, while an error that survives to runtime costs an entire
+// generate-run-fail-regenerate cycle. These passes catch the four mistakes that were still
+// getting through — a call with the wrong number of arguments, a field name that does not
+// exist on a record, a mistyped variable (which the language silently turns into an atom),
+// and a literal that contradicts a declared type.
+//
+// All four are ADVISORY. Each has a conservative trigger: they fire only where the code cannot
+// be right, never where it is merely unusual, because a false positive makes a model rewrite
+// working code — strictly worse than the miss it would have prevented.
+
+// Names a pattern binds. Mirrors matchPatternInner in interpreter.js: inside a pattern a bare
+// name binds, `_` binds nothing, a declared ^type name matches by type, and literals compare.
+function patternBindings(patNode, typeNames, out, topLevel) {
+  if (!patNode || typeof patNode !== 'object') return out;
+  switch (patNode.type) {
+    case 'Ident':
+      if (patNode.name === '_' || topLevel) return out;   // top level compares, never binds
+      if (typeNames.has(patNode.name)) return out;
+      out.add(patNode.name);
+      return out;
+    case 'Call':
+      if (!typeNames.has(patNode.callee)) return out;
+      for (const a of patNode.args || []) if (a && a.value) patternBindings(a.value, typeNames, out, false);
+      return out;
+    case 'ArrayLit':
+      for (const e of patNode.elements || []) patternBindings(e, typeNames, out, false);
+      return out;
+    case 'DictLit':
+      for (const pr of patNode.pairs || []) patternBindings(pr.value, typeNames, out, false);
+      return out;
+    default:
+      return out;
+  }
+}
+
+// Every name a statement list binds, wherever it binds it. Flow-insensitive on purpose: a name
+// assigned anywhere in the body counts as known everywhere in it, so the checks below never
+// depend on statement order (which they would get wrong for loops and early returns).
+function collectBoundNames(stmts, typeNames, out) {
+  for (const st of stmts || []) {
+    if (!st || typeof st !== 'object') continue;
+    if (st.type === 'Assign' && st.target) out.add(st.target);
+    if (st.type === 'DestructureAssign') for (const n of st.names || []) out.add(n);
+    if (st.type === 'ForLoop') { if (st.varName) out.add(st.varName); for (const v of st.vars || []) out.add(v); }
+    if (st.type === 'Try' && st.catchVar) out.add(st.catchVar);
+    if (st.type === 'MemberAssign' && st.obj) out.add(st.obj);
+    if (st.type === 'DeepAssign' && st.path && st.path.length) out.add(st.path[0]);
+    if (st.type === 'IndexAssign' && st.obj) out.add(st.obj);
+    for (const key of ['body', 'ifBody', 'elseBody', 'catchBody', 'finallyBody']) {
+      if (Array.isArray(st[key])) collectBoundNames(st[key], typeNames, out);
+    }
+    for (const arm of st.arms || []) {
+      for (const pat of arm.patterns || []) patternBindings(pat, typeNames, out, true);
+      if (arm.guard && arm.patterns && arm.patterns.length === 1 && arm.patterns[0].type === 'Ident'
+          && arm.patterns[0].name !== '_' && !typeNames.has(arm.patterns[0].name)) {
+        out.add(arm.patterns[0].name);       // guarded capture: `n if n > 10:`
+      }
+      collectBoundNames(arm.body, typeNames, out);
+    }
+    for (const root of stmtExprRoots(st)) {
+      walkExpr(root, (n) => {
+        if (n.type === 'Lambda') for (const pn of n.params || []) out.add(pn);
+        if (n.type === 'Comprehension') for (const v of n.vars || []) out.add(v);
+      });
+    }
+  }
+  return out;
+}
+
+// Signature of every callable the program declares, for the arity check.
+function declaredSignatures(program) {
+  const sigs = new Map();
+  for (const fn of program.fns || []) sigs.set(fn.name, { kind: '^fn', params: fn.params || [], defaults: fn.defaults || {}, decl: fn });
+  for (const pr of program.procs || []) sigs.set(pr.name, { kind: '^proc', params: pr.params || [], defaults: pr.defaults || {}, decl: pr });
+  return sigs;
+}
+
+// Walk every statement list in the program — entity blocks, functions, procedures, and ^main —
+// handing each to `fn` with a label and the names in scope around it.
+function forEachBody(program, fn) {
+  const typeNames = new Set((program.types || []).map(t => t.name));
+  forEachEntityBlock(program, (entityDecl, block) => {
+    const scopeNames = new Set();
+    for (const m of entityDecl.members || []) if (m.type === 'FieldDecl') scopeNames.add(m.name);
+    // Mixin fields land on the entity at composition time, so they are in scope here too.
+    for (const inc of entityDecl.mixins || []) {
+      const mix = (program.mixins || []).find(m => m.name === inc);
+      for (const m of (mix && mix.members) || []) if (m.type === 'FieldDecl') scopeNames.add(m.name);
+    }
+    // An `&on(Event)` block reads the event's payload fields as bare names.
+    if (block.name === 'on' && block.eventArg) {
+      const ev = (program.events || []).find(e => e.name === block.eventArg);
+      for (const f of (ev && ev.fields) || []) scopeNames.add(f.name);
+      scopeNames.add('source');
+    }
+    fn({ body: block.body, label: `&${block.name}`, entity: entityDecl, block, scopeNames, typeNames, inEntity: true });
+  });
+  for (const f of program.fns || []) fn({ body: f.body, label: `^fn ${f.name}`, decl: f, scopeNames: new Set(f.params || []), typeNames, inEntity: false });
+  for (const p of program.procs || []) fn({ body: p.body, label: `^proc ${p.name}`, decl: p, scopeNames: new Set(p.params || []), typeNames, inEntity: false });
+  if (program.main) fn({ body: program.main.body, label: '^main', decl: program.main, scopeNames: new Set(program.main.params || []), typeNames, inEntity: false });
+}
+
+// --- AX-ARITY-001: a call with the wrong number of arguments -------------------------------
+// Calling `^fn f(a, b)` with one argument binds `b` to null and fails somewhere else entirely;
+// calling it with three silently drops the third. Both are always bugs, and both are invisible
+// at runtime until the wrong value propagates.
+function checkArity(program, source) {
+  const out = [];
+  const sigs = declaredSignatures(program);
+  if (!sigs.size) return out;
+  forEachBody(program, ({ body, label, entity, block }) => {
+    const visit = (stmts) => {
+      for (const st of stmts || []) {
+        // `!name(args)` in statement position calls a ^proc/^fn too.
+        if (st.type === 'Action' && sigs.has(st.name)) report(st.name, (st.args || []).length, st);
+        for (const root of stmtExprRoots(st)) {
+          walkExpr(root, (node) => {
+            if (node.type === 'Call' && sigs.has(node.callee)) report(node.callee, (node.args || []).length, node, st);
+          });
+        }
+        for (const key of ['body', 'ifBody', 'elseBody', 'catchBody', 'finallyBody']) if (Array.isArray(st[key])) visit(st[key]);
+        for (const arm of st.arms || []) visit(arm.body);
+      }
+    };
+    const report = (name, given, node, st) => {
+      const sig = sigs.get(name);
+      const required = sig.params.filter(p => !(p in sig.defaults)).length;
+      const total = sig.params.length;
+      if (given >= required && given <= total) return;
+      // A function that reads `args` is deliberately variadic — never flag it.
+      if (given > total && bodyReadsArgs(sig.decl)) return;
+      const line = (node && node.line) || (st && st.line) || (sig.decl && sig.decl.line);
+      const shape = required === total ? `${total}` : `${required}–${total}`;
+      out.push(makePayload({
+        code: 'AX-ARITY-001', severity: 'advisory', entity: entity ? entity.name : null, block: block ? block.name : label,
+        line, col: (node && node.col) || (st && st.col) || null,
+        rule: { section: 'v0.9.1', title: 'Wrong number of arguments' },
+        snippet: sourceLine(source, line),
+        human: `'${name}(...)' takes ${shape} argument${required === 1 && total === 1 ? '' : 's'}, but ${given === 1 ? '1 was' : `${given} were`} given.`,
+        agent: `${sig.kind} ${name}(${sig.params.join(', ')}) expects ${shape} argument(s); this call passes ${given}. Missing arguments bind to null (or their default) and extra ones are dropped, so the failure will surface far from here. Fix the call, or give the parameter a default (\`${sig.params[given] || 'x'} = <value>\`) if it is meant to be optional.`,
+        fix: null, autoFixable: false,
+      }));
+    };
+    visit(body);
+  });
+  return out;
+}
+
+// True when a function reads its `args` array — the language's variadic escape hatch.
+function bodyReadsArgs(decl) {
+  if (!decl || !decl.body) return false;
+  let found = false;
+  const visit = (stmts) => {
+    for (const st of stmts || []) {
+      for (const root of stmtExprRoots(st)) walkExpr(root, (n) => { if (n.type === 'Ident' && n.name === 'args') found = true; });
+      for (const key of ['body', 'ifBody', 'elseBody', 'catchBody', 'finallyBody']) if (Array.isArray(st[key])) visit(st[key]);
+      for (const arm of st.arms || []) visit(arm.body);
+    }
+  };
+  visit(decl.body);
+  return found;
+}
+
+// --- AX-FIELD-001: a field that the record type does not declare ---------------------------
+// Only fires for a local assigned exactly once from a `^type` constructor and never reassigned,
+// so the variable's shape is certain. `p = Point(1, 2)` then `p.z` is a guaranteed null.
+function checkRecordFields(program, source) {
+  const out = [];
+  const types = new Map((program.types || []).map(t => [t.name, new Set((t.fields || []).map(f => f.name))]));
+  if (!types.size) return out;
+  forEachBody(program, ({ body, label, entity, block, typeNames }) => {
+    const assignedType = new Map();   // var -> type name  (null marks "not certain")
+    const noteAssign = (stmts) => {
+      for (const st of stmts || []) {
+        if (st.type === 'Assign' && st.target) {
+          const v = st.value;
+          const t = (v && v.type === 'Call' && types.has(v.callee)) ? v.callee : null;
+          if (assignedType.has(st.target)) assignedType.set(st.target, null);   // reassigned: give up
+          else assignedType.set(st.target, t);
+        }
+        if (st.type === 'DestructureAssign') for (const n of st.names || []) assignedType.set(n, null);
+        if (st.type === 'ForLoop') { if (st.varName) assignedType.set(st.varName, null); for (const v of st.vars || []) assignedType.set(v, null); }
+        for (const key of ['body', 'ifBody', 'elseBody', 'catchBody', 'finallyBody']) if (Array.isArray(st[key])) noteAssign(st[key]);
+        for (const arm of st.arms || []) noteAssign(arm.body);
+      }
+    };
+    noteAssign(body);
+    const visit = (stmts) => {
+      for (const st of stmts || []) {
+        for (const root of stmtExprRoots(st)) {
+          walkExpr(root, (node) => {
+            if (node.type !== 'Member' && node.type !== 'MethodCall') return;
+            if (!node.obj || node.obj.type !== 'Ident') return;
+            const tname = assignedType.get(node.obj.name);
+            if (!tname) return;
+            const fields = types.get(tname);
+            const prop = node.type === 'Member' ? node.prop : node.method;
+            if (fields.has(prop)) return;
+            if (node.type === 'MethodCall') return;      // a field may hold a function; don't guess
+            const line = node.line || st.line;
+            const known = [...fields];
+            let best = null, bestD = Infinity;
+            for (const f of known) { const d = levenshtein(prop, f); if (d < bestD) { bestD = d; best = f; } }
+            out.push(makePayload({
+              code: 'AX-FIELD-001', severity: 'advisory', entity: entity ? entity.name : null, block: block ? block.name : label,
+              line, col: node.col || st.col,
+              rule: { section: 'v0.9.1', title: 'Unknown field on a record' },
+              snippet: sourceLine(source, line),
+              human: `'${node.obj.name}' is a ${tname}, which has no field '${prop}'${bestD <= 3 ? ` — did you mean '${best}'?` : '.'}`,
+              agent: `^type ${tname} declares: ${known.join(', ')}. Reading '${prop}' yields null, which will surface as a confusing failure later. Fix the field name, or add '${prop}' to the ^type declaration.`,
+              fix: bestD <= 3 ? { kind: 'text', detail: `Replace '.${prop}' with '.${best}'.` } : null,
+              autoFixable: false,
+            }));
+          });
+        }
+        for (const key of ['body', 'ifBody', 'elseBody', 'catchBody', 'finallyBody']) if (Array.isArray(st[key])) visit(st[key]);
+        for (const arm of st.arms || []) visit(arm.body);
+      }
+    };
+    visit(body);
+  });
+  return out;
+}
+
+// --- AX-UNDEF-VAR-001: a name that is nothing, used where an atom cannot be meant -----------
+// An unbound identifier evaluates to an ATOM (`state = idle` is the language's enum idiom), so
+// a mistyped variable name has always been silently legal: `helth - 10` produces NaN, not an
+// error. This pass restores the diagnostic without giving up atoms, by reporting only the
+// positions where an atom is definitionally wrong — arithmetic, ordering comparisons, indexing,
+// and member access.
+const ATOM_HOSTILE_OPS = new Set(['+', '-', '*', '/', '%', '**', '>', '<', '>=', '<=']);
+const IMPLICIT_NAMES = new Set([
+  'dt', 'self', 'null', 'true', 'false', 'input', 'args', 'it',
+  'pose', 'wpose', 'pos', 'vel', 'rot', 'scl', 'position', 'velocity', 'facing',
+]);
+function checkUnknownNames(program, source) {
+  const out = [];
+  const globalNames = new Set();
+  for (const g of program.globals || []) for (const n of g.names || []) globalNames.add(n);
+  for (const f of program.fns || []) globalNames.add(f.name);
+  for (const p of program.procs || []) globalNames.add(p.name);
+  for (const t of program.types || []) globalNames.add(t.name);
+  for (const m of program.materials || []) globalNames.add(m.name);
+
+  forEachBody(program, ({ body, label, entity, block, scopeNames, typeNames }) => {
+    const known = new Set([...scopeNames, ...globalNames, ...IMPLICIT_NAMES, ...KNOWN_INTRINSIC_NAMES]);
+    collectBoundNames(body, typeNames, known);
+    const suspect = new Map();   // name -> first node seen in a hostile position
+    const note = (node, st) => {
+      if (!node || node.type !== 'Ident' || node.sigil === '$') return;
+      if (known.has(node.name)) return;
+      if (!suspect.has(node.name)) suspect.set(node.name, { node, st });
+    };
+    const visit = (stmts) => {
+      for (const st of stmts || []) {
+        for (const root of stmtExprRoots(st)) {
+          walkExpr(root, (node) => {
+            if (node.type === 'Binary' && ATOM_HOSTILE_OPS.has(node.op)) { note(node.left, st); note(node.right, st); }
+            else if (node.type === 'Unary' && node.op === '-') note(node.expr, st);
+            else if (node.type === 'Index') note(node.obj, st);
+            else if (node.type === 'Member' || node.type === 'MethodCall') note(node.obj, st);
+          });
+        }
+        for (const key of ['body', 'ifBody', 'elseBody', 'catchBody', 'finallyBody']) if (Array.isArray(st[key])) visit(st[key]);
+        for (const arm of st.arms || []) visit(arm.body);
+      }
+    };
+    visit(body);
+    for (const [name, { node, st }] of suspect) {
+      let best = null, bestD = Infinity;
+      for (const cand of known) { const d = levenshtein(name, cand); if (d < bestD) { bestD = d; best = cand; } }
+      const line = node.line || st.line;
+      out.push(makePayload({
+        code: 'AX-UNDEF-VAR-001', severity: 'advisory', entity: entity ? entity.name : null, block: block ? block.name : label,
+        line, col: node.col || st.col,
+        rule: { section: 'v0.9.1', title: 'Unknown name used as a value' },
+        snippet: sourceLine(source, line),
+        human: `'${name}' is not declared anywhere${bestD <= 3 ? ` (did you mean '${best}'?)` : ''} — used like this it becomes the atom \`${name}\`, not a value.`,
+        agent: `An identifier that is not a parameter, local, loop variable, field, global, or standard-library name evaluates to an ATOM (the language's symbol type, as in \`state = idle\`). Here '${name}' is used in arithmetic, an ordering comparison, an index, or a member access, where an atom can never be right — arithmetic on it yields NaN and member access yields null. Declare '${name}', or correct the spelling${bestD <= 3 ? ` (closest known name: '${best}')` : ''}.`,
+        fix: bestD <= 3 ? { kind: 'text', detail: `Replace '${name}' with '${best}'.` } : null,
+        autoFixable: false,
+      }));
+    }
+  });
+  return out;
+}
+
+// --- AX-TYPE-001: a literal that contradicts a declared type -------------------------------
+// The language is dynamically typed and the annotations on ^type fields and ^fn returns are
+// documentation. Where BOTH sides are known statically — a literal against a declared type —
+// checking costs nothing and cannot produce a false positive.
+const LITERAL_KINDS = { NumberLit: 'number', StringLit: 'string', FString: 'string', ArrayLit: 'array', DictLit: 'dict', Lambda: 'fn' };
+const TYPE_ALIASES = { number: 'number', num: 'number', int: 'number', float: 'number', string: 'string', str: 'string', text: 'string', bool: 'bool', array: 'array', list: 'array', dict: 'dict', map: 'dict', fn: 'fn' };
+function literalKind(node) {
+  if (!node) return null;
+  if (node.type === 'Ident' && (node.name === 'true' || node.name === 'false')) return 'bool';
+  return LITERAL_KINDS[node.type] || null;
+}
+function checkLiteralTypes(program, source) {
+  const out = [];
+  const types = new Map((program.types || []).map(t => [t.name, t]));
+  const report = (declared, node, kind, whatHuman, whatAgent, line, col, entity, block) => {
+    out.push(makePayload({
+      code: 'AX-TYPE-001', severity: 'advisory', entity, block, line, col,
+      rule: { section: 'v0.9.1', title: 'Literal contradicts a declared type' },
+      snippet: sourceLine(source, line),
+      human: `${whatHuman} is declared \`${declared}\` but the value here is a ${kind}.`,
+      agent: `${whatAgent} Either pass a ${declared}, change the declared type, or drop the annotation — annotations are documentation, so the runtime will not stop this, but the mismatch is almost always a real mistake.`,
+      fix: null, autoFixable: false,
+    }));
+  };
+  // Record construction: P(1, "two") against ^type P: x:: number, y:: number
+  forEachBody(program, ({ body, entity, block, label }) => {
+    const visit = (stmts) => {
+      for (const st of stmts || []) {
+        for (const root of stmtExprRoots(st)) {
+          walkExpr(root, (node) => {
+            if (node.type !== 'Call' || !types.has(node.callee)) return;
+            const decl = types.get(node.callee);
+            let pos = 0;
+            for (const a of node.args || []) {
+              if (!a || !a.value) continue;
+              const field = a.name ? (decl.fields || []).find(f => f.name === a.name) : (decl.fields || [])[pos++];
+              if (!field || !field.ftype) continue;
+              const want = TYPE_ALIASES[String(field.ftype)];
+              const kind = literalKind(a.value);
+              if (!want || !kind || want === kind) continue;
+              report(field.ftype, a.value, kind, `Field '${field.name}' of ${node.callee}`,
+                `^type ${node.callee} declares ${field.name}:: ${field.ftype}, and this call passes a ${kind} literal.`,
+                node.line || st.line, node.col || st.col, entity ? entity.name : null, block ? block.name : label);
+            }
+          });
+        }
+        for (const key of ['body', 'ifBody', 'elseBody', 'catchBody', 'finallyBody']) if (Array.isArray(st[key])) visit(st[key]);
+        for (const arm of st.arms || []) visit(arm.body);
+      }
+    };
+    visit(body);
+  });
+  // Declared return type against a literal `^return`.
+  for (const fn of program.fns || []) {
+    if (!fn.retType) continue;
+    const want = TYPE_ALIASES[String(fn.retType)];
+    if (!want) continue;
+    const visit = (stmts) => {
+      for (const st of stmts || []) {
+        if (st.type === 'Return' && st.expr) {
+          const kind = literalKind(st.expr);
+          if (kind && kind !== want) {
+            report(fn.retType, st.expr, kind, `The return value of ^fn ${fn.name}`,
+              `^fn ${fn.name} is declared -> ${fn.retType}, but this ^return yields a ${kind} literal.`,
+              st.line, st.col, null, `^fn ${fn.name}`);
+          }
+        }
+        for (const key of ['body', 'ifBody', 'elseBody', 'catchBody', 'finallyBody']) if (Array.isArray(st[key])) visit(st[key]);
+        for (const arm of st.arms || []) visit(arm.body);
+      }
+    };
+    visit(fn.body);
+  }
+  return out;
+}
+
+// -----------------------------------------------------------------------------
 // v0.9.0 — `^use "lib.ax"` module resolution.
 //
 // Imports are textual and include-once: every top-level declaration of the imported file is
@@ -1458,6 +1825,12 @@ function compile(source, opts) {
     // v0.9.0: script-shaped programs — entry point and function-body call checking.
     ...checkEntryPoint(program, source),
     ...checkUndefinedFunctionsInBodies(program, source),
+    // v0.9.1: the static safety net — wrong arity, unknown record field, mistyped name,
+    // literal against a declared type.
+    ...checkArity(program, source),
+    ...checkRecordFields(program, source),
+    ...checkUnknownNames(program, source),
+    ...checkLiteralTypes(program, source),
   ];
   const blocking = diagnostics.some(d => d.severity === 'fatal' || d.severity === 'contract_violation');
   return { ok: !blocking, program, diagnostics };
@@ -1474,6 +1847,9 @@ module.exports = {
   checkUndefinedFunctions, checkQueryArgs, KNOWN_INTRINSIC_NAMES,
   // v0.9.0: module resolution, entry-point and function-body checks
   resolveUses, checkEntryPoint, checkUndefinedFunctionsInBodies,
+  // v0.9.1: static safety net
+  checkArity, checkRecordFields, checkUnknownNames, checkLiteralTypes,
+  patternBindings, collectBoundNames, forEachBody,
   RESERVED_XWRITE_PROPS,
   makePayload, RULE,
   // v0.8.1: Levenshtein distance + closest-block-name helper for AX-BLOCK-001 diagnostics
