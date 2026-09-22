@@ -35,6 +35,14 @@ for f in "$ROOT"/native/tests/*.ax; do
   run_case "$(basename "$f")" "$f"
 done
 
+# Imports: a three-file program with a diamond, built in a temp directory.
+IMPDIR=$(mktemp -d)
+printf '~TWO: 2\n^fn triple(x) = x * 3\n' > "$IMPDIR/mathlib.ax"
+printf '^use "mathlib.ax"\n^fn sextuple(x) = triple(x) * TWO\n' > "$IMPDIR/util.ax"
+printf '^use "util.ax", "mathlib.ax"\n^main:\n  print(sextuple(2), triple(3), TWO)\n' > "$IMPDIR/app.ax"
+run_case "^use imports" "$IMPDIR/app.ax"
+rm -rf "$IMPDIR"
+
 run_case "examples/fizzbuzz.ax" "$ROOT/examples/fizzbuzz.ax"
 run_case "examples/stats.ax"    "$ROOT/examples/stats.ax"
 run_case "examples/calc.ax"     "$ROOT/examples/calc.ax"

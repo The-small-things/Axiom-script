@@ -39,8 +39,12 @@ A program that uses an engine construct is **refused by the parser** with a mess
 JavaScript runtime — never half-run. The split is deliberate: the language is what programs are
 written in, the engine is one host for them.
 
-Also absent: `^use` imports (the parser accepts them; resolution is not implemented yet),
-arbitrary-precision `big()`, and `sh()` argument escaping beyond what the shell does.
+`^use "lib.ax"` imports work, with the reference's rules: resolved relative to the importing
+file, `.ax` inferred, include-once (so diamonds and cycles terminate), and the importing file
+winning a name clash.
+
+Also absent: arbitrary-precision `big()`, and `sh()` argument escaping beyond what the shell
+already does.
 
 ## Conformance
 
@@ -49,7 +53,7 @@ verification story is differential: run each program on **both** runtimes and re
 stdout and identical exit codes.
 
 ```
-./difftest.sh        # 10 conformance programs + 6 example invocations, all byte-identical
+./difftest.sh        # 10 conformance programs, imports, and 6 example invocations
 make debug           # ASan + UBSan build; the corpus runs clean under both
 ```
 

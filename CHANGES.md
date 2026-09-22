@@ -77,9 +77,11 @@ cd native && make && ./axiom prog.ax -- args
 - C, not C++ or assembly, and `native/README.md` explains why: a 16-byte tagged value, one
   ownership convention, `setjmp` for `^try`, and a binary any host can link. Assembly would be
   slower than what the compiler produces for a branch-heavy dispatch loop, and unmaintainable.
-- Verified by **differential testing**: `native/difftest.sh` runs 10 conformance programs and 6
-  example invocations on both runtimes and requires byte-identical stdout and exit codes. The
-  corpus also runs clean under ASan and UBSan (`make debug`).
+- `^use "lib.ax"` imports resolve with the reference's rules: relative to the importing file,
+  `.ax` inferred, include-once so diamonds and cycles terminate, importing file wins a clash.
+- Verified by **differential testing**: `native/difftest.sh` runs 10 conformance programs, an
+  import case, and 6 example invocations on both runtimes and requires byte-identical stdout
+  and exit codes. The corpus also runs clean under ASan and UBSan (`make debug`).
 
 ### Semantics fixed while reconciling the two runtimes
 
@@ -107,7 +109,7 @@ the native dictionary now maintains as entries are inserted.
 
 `test_v090_general.js` grew to 215 assertions, adding sections for pattern matching and for
 each new check, including the negative cases that guard against false positives. The native
-runtime adds 16 differential cases in `native/tests/` and `native/difftest.sh`.
+runtime adds 17 differential cases in `native/tests/` and `native/difftest.sh`.
 
 ### Version bumps
 
