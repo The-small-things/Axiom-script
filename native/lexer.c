@@ -295,7 +295,8 @@ static void scan_line(AxTokens *t, const char *line, int len, int lineno) {
       tok->num = val;
       // Unit suffix: letters immediately after the digits (3s, 10hz, 2v, 3f).
       int u = 0;
-      while (j < len && isalpha((unsigned char)line[j]) && u < 7) tok->unit[u++] = line[j++];
+      if (j < len && isalpha((unsigned char)line[j]))
+        while (j < len && isalnum((unsigned char)line[j]) && u < 7) tok->unit[u++] = line[j++];
       tok->unit[u] = '\0';
       i = j;
       continue;
@@ -324,6 +325,7 @@ static void scan_line(AxTokens *t, const char *line, int len, int lineno) {
       if (i + 2 < len && line[i + 2] == ':') { push_tok(t, T_QMARKEQ, lineno, col); i += 2; continue; }
       push_tok(t, T_QUESTION, lineno, col); i += 1; continue;
     }
+    TWO('?', '>', T_QMARKGT)
     TWO('?', '?', T_NULLCOAL)
     TWO('&', '&', T_ANDAND)
     TWO('|', '|', T_OROR)
@@ -336,6 +338,10 @@ static void scan_line(AxTokens *t, const char *line, int len, int lineno) {
     TWO('<', '=', T_LE)
     TWO('-', '>', T_ARROW)
     TWO('~', '>', T_TILDEGT)
+    TWO('~', '=', T_TILDEEQ)
+    // The two vector operators are spelled with their mathematical glyphs (UTF-8).
+    if ((unsigned char)c == 0xC2 && i + 1 < len && (unsigned char)line[i + 1] == 0xB7) { push_tok(t, T_MIDDOT, lineno, col); i += 2; continue; }
+    if ((unsigned char)c == 0xC3 && i + 1 < len && (unsigned char)line[i + 1] == 0x97) { push_tok(t, T_CROSS, lineno, col); i += 2; continue; }
     TWO(':', ':', T_COLONCOLON)
     TWO('.', '.', T_DOTDOT)
     TWO('+', '=', T_PLUSEQ)

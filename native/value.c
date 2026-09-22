@@ -153,6 +153,7 @@ static void obj_free(AxObj *o) {
     }
     case AX_FN: {
       AxFn *f = (AxFn *)o;
+      if (f->entity) { AxValue ev; ev.t = AX_ENTITY; ev.o = (AxObj *)f->entity; ax_release(ev); }
       if (f->native) { if (f->has_bound) ax_release(f->bound); }
       if (!f->native) {
         for (int i = 0; i < f->nparams; i++) {
@@ -168,6 +169,28 @@ static void obj_free(AxObj *o) {
       return;
     }
     case AX_RANGE: free(o); return;
+    case AX_XFORM: {
+      AxXform *x = (AxXform *)o;
+      ax_release(x->pos); ax_release(x->rot); ax_release(x->scl); ax_release(x->vel);
+      free(x);
+      return;
+    }
+    case AX_SHAPE: {
+      AxShape *sh = (AxShape *)o;
+      AxValue kv; kv.t = AX_STR; kv.o = (AxObj *)sh->kind;
+      ax_release(kv);
+      for (int i = 0; i < sh->nparams; i++) ax_release(sh->params[i]);
+      free(sh);
+      return;
+    }
+    case AX_ENTITY: {
+      AxEntity *e = (AxEntity *)o;
+      ax_release(ax_dictv(e->fields));
+      ax_release(ax_dictv(e->locals));
+      free(e);
+      return;
+    }
+    case AX_HOST: ax_host_free((AxHost *)o); return;
     default: free(o); return;
   }
 }
@@ -417,7 +440,11 @@ bool ax_truthy(AxValue v) {
     case AX_NUM:  return v.num != 0 && !isnan(v.num);
     case AX_STR:  return ((AxStr *)v.o)->len > 0;
     case AX_ARR:  return ((AxArr *)v.o)->len > 0;
-    default:      return true;   // atoms, dicts, functions, ranges
+    // A vector is "true" when it is meaningfully non-zero, as in the reference — which is what
+    // makes `?input.move:` read as "is the stick being pushed".
+    case AX_VEC2: { AxVec *q = (AxVec *)v.o; return hypot(q->x, q->y) > 0.1; }
+    case AX_VEC3: { AxVec *q = (AxVec *)v.o; return sqrt(q->x * q->x + q->y * q->y + q->z * q->z) > 0.1; }
+    default:      return true;   // atoms, dicts, functions, ranges, engine objects
   }
 }
 
@@ -430,6 +457,11 @@ static bool equals_depth(AxValue a, AxValue b, int depth) {
     case AX_STR:
     case AX_ATOM: return ax_str_eq((AxStr *)a.o, (AxStr *)b.o);
     case AX_FN:   return a.o == b.o;
+    case AX_VEC2: { AxVec *x = (AxVec *)a.o, *y = (AxVec *)b.o; return x->x == y->x && x->y == y->y; }
+    case AX_VEC3: { AxVec *x = (AxVec *)a.o, *y = (AxVec *)b.o; return x->x == y->x && x->y == y->y && x->z == y->z; }
+    case AX_QUAT: { AxVec *x = (AxVec *)a.o, *y = (AxVec *)b.o; return x->x == y->x && x->y == y->y && x->z == y->z && x->w == y->w; }
+    case AX_MAT4: case AX_XFORM: case AX_TIMER: case AX_SHAPE: case AX_ENTITY: case AX_HOST:
+      return a.o == b.o;
     case AX_RANGE: {
       AxRange *x = (AxRange *)a.o, *y = (AxRange *)b.o;
       return x->lo == y->lo && x->hi == y->hi && x->step == y->step;
@@ -516,6 +548,9 @@ static void fmt_num(double d, char *buf, size_t n) {
   snprintf(buf, n, "%.17g", d);
 }
 
+void ax_fmt_num(double d, char *buf, size_t n) { fmt_num(d, buf, n); }
+
+void ax_str_append(char **buf, size_t *len, size_t *cap, const char *s, size_t n);
 static void str_append(char **buf, size_t *len, size_t *cap, const char *s, size_t n) {
   if (*len + n + 1 > *cap) {
     while (*len + n + 1 > *cap) *cap = *cap ? *cap * 2 : 64;
@@ -585,7 +620,7 @@ static void render(AxValue v, char **buf, size_t *len, size_t *cap, int depth) {
       fmt_num(r->hi, tmp, sizeof tmp); str_append(buf, len, cap, tmp, strlen(tmp));
       return;
     }
-    default: return;
+    default: ax_render_engine(v, buf, len, cap); return;
   }
 }
 
@@ -611,7 +646,13 @@ const char *ax_type_name(AxValue v) {
     case AX_DICT: return "dict";
     case AX_FN: return "fn";
     case AX_RANGE: return "range";
-    default: return "unknown";
+    case AX_VEC2: return "vec2";
+    case AX_VEC3: return "vec3";
+    case AX_QUAT: return "quat";
+    case AX_MAT4: return "mat4";
+    case AX_XFORM: return "transform";
+    case AX_ENTITY: return "entity";
+    default: return "dict";   // timers, colliders, pools: plain objects in the reference
   }
 }
 
@@ -620,6 +661,7 @@ double ax_to_num(AxValue v) {
     case AX_NUM: return v.num;
     case AX_BOOL: return v.b ? 1 : 0;
     case AX_NULL: return 0;
+    case AX_TIMER: return ((AxTimer *)v.o)->remaining;   // a timer reads as its remaining time
     case AX_STR: {
       AxStr *s = (AxStr *)v.o;
       char *end = NULL;
@@ -714,6 +756,7 @@ bool ax_scope_lookup(AxScope *s, AxStr *name, AxValue *out) {
 
 bool ax_scope_set_existing(AxScope *s, AxStr *name, AxValue v) {
   for (AxScope *p = s; p; p = p->parent) {
+    if (p->builtin) break;   // the library is read-only: assigning `sum = 3` makes a new binding
     int32_t i = scope_slot(p, name);
     if (i >= 0) { ax_release(p->vals[i]); p->vals[i] = v; return true; }
   }
@@ -731,4 +774,54 @@ void ax_scope_declare(AxScope *s, AxStr *name, AxValue v) {
   s->keys[j] = name;
   s->vals[j] = v;
   s->len++;
+}
+
+void ax_str_append(char **buf, size_t *len, size_t *cap, const char *s, size_t n) { str_append(buf, len, cap, s, n); }
+
+// ---------------------------------------------------------------------------------------------
+// Engine value constructors
+// ---------------------------------------------------------------------------------------------
+
+static AxValue vec_new(uint8_t t, double x, double y, double z, double w) {
+  AxVec *v = xalloc(sizeof(AxVec));
+  v->hdr.rc = 1;
+  v->hdr.type = t;
+  v->x = x; v->y = y; v->z = z; v->w = w;
+  AxValue out; out.t = t; out.o = (AxObj *)v;
+  return out;
+}
+AxValue ax_vec2(double x, double y) { return vec_new(AX_VEC2, x, y, 0, 0); }
+AxValue ax_vec3(double x, double y, double z) { return vec_new(AX_VEC3, x, y, z, 0); }
+AxValue ax_quat(double x, double y, double z, double w) { return vec_new(AX_QUAT, x, y, z, w); }
+
+AxValue ax_mat4_new(const double *d) {
+  AxMat4 *m = xalloc(sizeof(AxMat4));
+  m->hdr.rc = 1;
+  m->hdr.type = AX_MAT4;
+  if (d) memcpy(m->d, d, sizeof m->d);
+  AxValue out; out.t = AX_MAT4; out.o = (AxObj *)m;
+  return out;
+}
+
+AxValue ax_xform_new(void) {
+  AxXform *x = xalloc(sizeof(AxXform));
+  x->hdr.rc = 1;
+  x->hdr.type = AX_XFORM;
+  x->pos = ax_vec3(0, 0, 0);
+  x->rot = ax_quat(0, 0, 0, 1);
+  x->scl = ax_vec3(1, 1, 1);
+  x->vel = ax_vec3(0, 0, 0);
+  AxValue out; out.t = AX_XFORM; out.o = (AxObj *)x;
+  return out;
+}
+
+AxValue ax_timer_new(double remaining, const char *unit) {
+  AxTimer *t = xalloc(sizeof(AxTimer));
+  t->hdr.rc = 1;
+  t->hdr.type = AX_TIMER;
+  t->remaining = remaining;
+  t->total = remaining;
+  snprintf(t->unit, sizeof t->unit, "%s", unit ? unit : "s");
+  AxValue out; out.t = AX_TIMER; out.o = (AxObj *)t;
+  return out;
 }

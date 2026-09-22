@@ -1,10 +1,10 @@
 // parser.c — recursive-descent parser producing an arena-allocated AST.
 //
-// The grammar is the one in GRAMMAR.md, restricted to the *language* half: declarations
-// (`^fn`, `^proc`, `^main`, `^type`, `^use`, `~globals`), statements, and expressions. Entity
-// declarations and the frame-block forms are rejected with a message pointing at the JS
-// runtime, rather than half-parsed — a native binary that accepted `@Player` and then ignored
-// its `&physics` block would be worse than one that says plainly what it does not do.
+// The grammar is the one in GRAMMAR.md: the language (`^fn`, `^proc`, `^main`, `^type`, `^use`,
+// `~globals`, statements, expressions) and the engine (`@entities` with their `~fields` and
+// `&blocks`, `^event`, `^mix`, `^mat`, `#resources`, broadcasts, transitions, queries and
+// cross-entity writes). Each engine form follows parser.js rule for rule, including its
+// one-line shorthands, because a program has to mean the same thing on both runtimes.
 //
 // The AST is immutable after parsing and lives in a bump arena freed in one call, so nodes
 // carry no ownership bookkeeping. Identifier and key strings are interned, which is what makes
@@ -163,6 +163,8 @@ static void name_push(NameList *l, AxStr *s) {
 
 static AxNode *parse_expr(P *p);
 static AxNode *parse_ternary(P *p);
+static AxNode *parse_tagref(P *p);
+static bool is_known_query(AxStr *name);
 static AxNode *parse_stmt(P *p);
 static void parse_body(P *p, NodeList *out);
 
@@ -191,8 +193,24 @@ static void parse_args(P *p, NodeList *out) {
         name = tok_name_str(advance(p));
         advance(p);
       }
+      // A bare predicate argument — `belief.any(>0.3)` — carries its operator in `op`.
+      int pred = OP_NONE;
+      if (!name) {
+        switch (peek(p, 0)->type) {
+          case T_GT: pred = OP_GT; break;
+          case T_LT: pred = OP_LT; break;
+          case T_GE: pred = OP_GE; break;
+          case T_LE: pred = OP_LE; break;
+          case T_EQEQ: pred = OP_EQ; break;
+          case T_NE: pred = OP_NE; break;
+          default: break;
+        }
+        if (pred) advance(p);
+      }
       AxNode *v = parse_expr(p);
-      nl_push(out, pair_node(p, name, NULL, v));
+      AxNode *pr = pair_node(p, name, NULL, v);
+      pr->op = (uint8_t)pred;
+      nl_push(out, pr);
       if (at(p, T_COMMA)) { advance(p); if (at(p, T_RPAREN)) break; continue; }
       break;
     }
@@ -283,6 +301,26 @@ static AxNode *parse_fstring(P *p, AxTok *tok) {
   n->list = parts.items;
   n->nlist = parts.n;
   return n;
+}
+
+// `#Tag.a.b` — a reference to an entity (or resource), with an optional member path.
+static AxNode *parse_tagref(P *p) {
+  expect(p, T_HASH, NULL);
+  AxNode *n = node(p, N_TAGREF);
+  NameList path = {0};
+  name_push(&path, tok_name_str(expect(p, T_IDENT, "after '#'")));
+  while (at(p, T_DOT) && peek(p, 1)->type == T_IDENT) { advance(p); name_push(&path, tok_name_str(advance(p))); }
+  n->names = path.items;
+  n->nnames = path.n;
+  return n;
+}
+
+// Names that parse as queries even without the leading `?` (parser.js KNOWN_QUERY_NAMES), so
+// `nearest(#Enemy)` and `?nearest(#Enemy)` are the same thing in every position.
+static bool is_known_query(AxStr *name) {
+  static const char *known[] = { "nearest", "exists", "path", "raycast", "block_cell", "unblock_cell", "is_blocked" };
+  for (size_t i = 0; i < sizeof known / sizeof *known; i++) if (strcmp(name->data, known[i]) == 0) return true;
+  return false;
 }
 
 static AxNode *parse_primary(P *p) {
@@ -400,8 +438,29 @@ static AxNode *parse_primary(P *p) {
       return e;
     }
     case T_QUESTION: {
-      // Prefix ternary: ? cond : then : else
       advance(p);
+      // `?!#Tag` — shorthand for `?exists(#Tag)`.
+      if (at(p, T_BANG) && peek(p, 1)->type == T_HASH) {
+        advance(p);
+        AxNode *q = node(p, N_QUERY);
+        q->str = ax_internz("exists");
+        NodeList args = {0};
+        nl_push(&args, pair_node(p, NULL, NULL, parse_tagref(p)));
+        q->list = args.items;
+        q->nlist = args.n;
+        return q;
+      }
+      // `?name(args)` — a query on the running entity (or a global query).
+      if (at(p, T_IDENT) && peek(p, 1)->type == T_LPAREN) {
+        AxNode *q = node(p, N_QUERY);
+        q->str = tok_name_str(advance(p));
+        NodeList args = {0};
+        parse_args(p, &args);
+        q->list = args.items;
+        q->nlist = args.n;
+        return q;
+      }
+      // Prefix ternary: ? cond : then : else
       AxNode *n = node(p, N_TERNARY);
       n->a = parse_expr(p);
       expect(p, T_COLON, "in the prefix ternary");
@@ -423,9 +482,7 @@ static AxNode *parse_primary(P *p) {
       n->str = tok_name_str(id);
       return n;
     }
-    case T_HASH:
-      perr(p, "'#Tag' references belong to the entity runtime, which the native build does not host — run this program with the JavaScript runtime");
-      return NULL;
+    case T_HASH: return parse_tagref(p);
     default:
       perr(p, "unexpected %s in an expression", tok_name(t->type));
       return NULL;
@@ -468,7 +525,10 @@ static AxNode *parse_postfix(P *p) {
       NodeList args = {0};
       parse_args(p, &args);
       AxNode *n;
-      if (e->kind == N_IDENT) {
+      if (e->kind == N_IDENT && is_known_query(e->str)) {
+        n = node(p, N_QUERY);
+        n->str = e->str;
+      } else if (e->kind == N_IDENT) {
         n = node(p, N_CALL);
         n->str = e->str;
       } else {
@@ -519,6 +579,8 @@ static AxNode *parse_multiplicative(P *p) {
     if (at(p, T_STAR)) op = OP_MUL;
     else if (at(p, T_SLASH)) op = OP_DIV;
     else if (at(p, T_PERCENT)) op = OP_MOD;
+    else if (at(p, T_MIDDOT)) op = OP_DOT;
+    else if (at(p, T_CROSS)) op = OP_CROSS;
     else break;
     advance(p);
     left = bin_node(p, op, left, parse_exponent(p));
@@ -550,6 +612,7 @@ static AxNode *parse_comparison(P *p) {
     else if (at(p, T_LE)) op = OP_LE;
     else if (at(p, T_EQEQ)) op = OP_EQ;
     else if (at(p, T_NE)) op = OP_NE;
+    else if (at(p, T_QMARKGT)) op = OP_RAY;
     else if (at_kw(p, "in")) op = OP_IN;
     else if (at(p, T_BANG) && at_kw_off(p, 1, "in")) {
       advance(p); advance(p);
@@ -563,9 +626,22 @@ static AxNode *parse_comparison(P *p) {
   return left;
 }
 
-static AxNode *parse_and(P *p) {
+// `dist ~> argmax` — draw a concrete value from a distribution.
+static AxNode *parse_infer(P *p) {
   AxNode *left = parse_comparison(p);
-  while (at(p, T_ANDAND)) { advance(p); left = bin_node(p, OP_AND, left, parse_comparison(p)); }
+  if (at(p, T_TILDEGT)) {
+    advance(p);
+    AxNode *n = node(p, N_INFER);
+    n->a = left;
+    n->str = tok_name_str(expect(p, T_IDENT, "after '~>'"));
+    left = n;
+  }
+  return left;
+}
+
+static AxNode *parse_and(P *p) {
+  AxNode *left = parse_infer(p);
+  while (at(p, T_ANDAND)) { advance(p); left = bin_node(p, OP_AND, left, parse_infer(p)); }
   return left;
 }
 
@@ -588,6 +664,13 @@ static AxNode *parse_ternary(P *p) {
   AxNode *n = node(p, N_TERNARY);
   n->a = cond;
   n->b = parse_ternary(p);            // right-associative, so `a ? 1 : b ? 2 : 3` chains
+  // `obj ?name(args)` with no ':' is a query with an explicit receiver.
+  if (!at(p, T_COLON) && (n->b->kind == N_CALL || (n->b->kind == N_QUERY && !n->b->a))) {
+    AxNode *q = n->b;
+    q->kind = N_QUERY;
+    q->a = cond;
+    return q;
+  }
   expect(p, T_COLON, "in the ternary");
   n->c = parse_ternary(p);
   return n;
@@ -652,15 +735,76 @@ static bool at_assign_op(P *p) {
   return t == T_ASSIGN || compound_op_of(t) != OP_NONE;
 }
 
+static AxNode *exists_query(P *p) {
+  AxNode *q = node(p, N_QUERY);
+  q->str = ax_internz("exists");
+  NodeList args = {0};
+  nl_push(&args, pair_node(p, NULL, NULL, parse_tagref(p)));
+  q->list = args.items;
+  q->nlist = args.n;
+  return q;
+}
+
+static bool starts_stmt_only(P *p) {
+  AxTokType t = peek(p, 0)->type;
+  if (t == T_BANG || t == T_CARET || t == T_PLUSPLUS || t == T_MINUSMINUS || t == T_TILDE || t == T_HASH || t == T_DOLLAR) return true;
+  return false;
+}
+
+static void parse_indented_into(P *p, NodeList *out) {
+  expect(p, T_INDENT, "to start a block");
+  while (!at(p, T_DEDENT) && !at(p, T_EOF)) {
+    nl_push(out, parse_stmt(p));
+    skip_newlines(p);
+  }
+  expect(p, T_DEDENT, "to end a block");
+}
+
 static AxNode *parse_cond(P *p) {
   // ?cond: body  [ ?!: else | elif … | else: … ]
   AxNode *n = node(p, N_IF);
-  if (at(p, T_QUESTION)) advance(p);
-  else advance(p);                       // `if` keyword
-  n->a = parse_expr(p);
+  bool sigil = at(p, T_QUESTION);
+  advance(p);                            // `?`, `if` or `elif`
+  if (sigil && at(p, T_BANG) && peek(p, 1)->type == T_HASH) {
+    advance(p);                          // `?!#Tag:` is the exists-shorthand
+    n->a = exists_query(p);
+  } else {
+    n->a = parse_expr(p);
+  }
   expect(p, T_COLON, "after the condition");
   NodeList body = {0};
-  parse_body(p, &body);
+  if (at(p, T_NEWLINE)) {
+    parse_body(p, &body);
+  } else if (starts_stmt_only(p)) {
+    // `?c: !act()` followed by an indented block: the block continues the body.
+    nl_push(&body, parse_stmt(p));
+    if (at(p, T_INDENT)) parse_indented_into(p, &body);
+  } else {
+    // `?c: expr` alone on the line is an expression statement; `?c: guard` followed by an
+    // indented block ANDs the guard with the condition (parser.js); anything else is a
+    // statement, so back up and parse it as one.
+    int start = p->pos;
+    jmp_buf saved;
+    memcpy(saved, p->bail, sizeof saved);
+    AxNode *e = NULL;
+    if (setjmp(p->bail) == 0) e = parse_expr(p);
+    else { p->res->err[0] = '\0'; p->res->nerrors--; e = NULL; }
+    memcpy(p->bail, saved, sizeof saved);
+    if (e && at(p, T_NEWLINE)) {
+      advance(p);
+      if (at(p, T_INDENT)) {
+        n->b = e;
+        parse_indented_into(p, &body);
+      } else {
+        AxNode *es = node(p, N_EXPRSTMT);
+        es->a = e;
+        nl_push(&body, es);
+      }
+    } else {
+      p->pos = start;
+      nl_push(&body, parse_stmt(p));
+    }
+  }
   n->list = body.items;
   n->nlist = body.n;
   // Else / elif. A DEDENT may separate the block from its else clause.
@@ -808,18 +952,16 @@ static AxNode *parse_stmt(P *p) {
     end_stmt(p);
     return n;
   }
-  // !action(...) — in the native build this is a plain call statement.
+  // !action(...) — an engine action, or a call to a ^proc/^fn/library function whose result
+  // is not wanted.
   if (at(p, T_BANG)) {
+    AxNode *n = node(p, N_ACTION);
     advance(p);
-    AxTok *name = expect(p, T_IDENT, "after '!'");
-    AxNode *call = node(p, N_CALL);
-    call->str = tok_name_str(name);
+    n->str = tok_name_str(expect(p, T_IDENT, "after '!'"));
     NodeList args = {0};
     if (at(p, T_LPAREN)) parse_args(p, &args);
-    call->list = args.items;
-    call->nlist = args.n;
-    AxNode *n = node(p, N_EXPRSTMT);
-    n->a = call;
+    n->list = args.items;
+    n->nlist = args.n;
     end_stmt(p);
     return n;
   }
@@ -878,8 +1020,53 @@ static AxNode *parse_stmt(P *p) {
     }
     if (at_kw_off(p, 1, "try")) return parse_try(p);
     if (at_kw_off(p, 1, "catch") || at_kw_off(p, 1, "fin")) perr(p, "^%s without a preceding ^try:", peek(p, 1)->payload);
-    if (at_kw_off(p, 1, "emit")) perr(p, "^emit belongs to the entity runtime, which the native build does not host");
-    perr(p, "'^%s' is a broadcast, which belongs to the entity runtime — the native build runs the language, not the engine", peek(p, 1)->type == T_IDENT ? peek(p, 1)->payload : "?");
+    if (at_kw_off(p, 1, "emit")) {
+      // ^emit a.b(args) — publish on a channel.
+      AxNode *n = node(p, N_EMIT);
+      advance(p); advance(p);
+      NameList path = {0};
+      name_push(&path, tok_name_str(expect(p, T_IDENT, "as a channel name")));
+      while (at(p, T_DOT)) { advance(p); name_push(&path, tok_name_str(expect(p, T_IDENT, "in the channel path"))); }
+      NodeList args = {0};
+      parse_args(p, &args);
+      n->names = path.items;
+      n->nnames = path.n;
+      n->list = args.items;
+      n->nlist = args.n;
+      end_stmt(p);
+      return n;
+    }
+    // ^Event(args) [to #Tag | to(#Tag) | within(r[, origin: e])] — a broadcast.
+    AxNode *n = node(p, N_BROADCAST);
+    advance(p);
+    n->str = tok_name_str(expect(p, T_IDENT, "as the event name"));
+    NodeList args = {0};
+    parse_args(p, &args);
+    n->list = args.items;
+    n->nlist = args.n;
+    if (at_kw(p, "to")) {
+      advance(p);
+      bool paren = at(p, T_LPAREN);
+      if (paren) advance(p);
+      expect(p, T_HASH, "before the broadcast target");
+      n->str2 = tok_name_str(expect(p, T_IDENT, "as the broadcast target"));
+      if (paren) expect(p, T_RPAREN, NULL);
+      n->op = 1;
+    } else if (at_kw(p, "within")) {
+      advance(p);
+      expect(p, T_LPAREN, NULL);
+      n->a = parse_expr(p);
+      if (at(p, T_COMMA)) {
+        advance(p);
+        expect(p, T_IDENT, "('origin')");
+        expect(p, T_COLON, NULL);
+        n->b = parse_expr(p);
+      }
+      expect(p, T_RPAREN, NULL);
+      n->op = 2;
+    }
+    end_stmt(p);
+    return n;
   }
   // ?* match
   if (at(p, T_QUESTION) && peek(p, 1)->type == T_STAR) return parse_match(p);
@@ -912,8 +1099,60 @@ static AxNode *parse_stmt(P *p) {
       return n;
     }
   }
-  if (at(p, T_AT)) perr(p, "@entity declarations belong to the engine runtime — run this program with the JavaScript runtime (node main.js)");
-  if (at(p, T_AMP)) perr(p, "&blocks belong to the engine runtime — run this program with the JavaScript runtime (node main.js)");
+  if (at(p, T_AT)) perr(p, "an @entity is declared at the top level, not inside a block");
+  if (at(p, T_AMP)) perr(p, "an &block belongs directly inside an @entity, not inside another block");
+
+  // `#Tag.field = v` (and op=) — a write to another entity's field.
+  if (at(p, T_HASH)) {
+    AxNode *n = node(p, N_MEMBER_ASSIGN);
+    advance(p);
+    n->str2 = tok_name_str(expect(p, T_IDENT, "after '#'"));
+    NameList path = {0};
+    while (at(p, T_DOT)) { advance(p); name_push(&path, tok_name_str(expect(p, T_IDENT, "in the field path"))); }
+    if (!path.n) perr(p, "expected .field after #%s in an assignment", n->str2->data);
+    if (!at_assign_op(p)) perr(p, "expected = after #%s.%s (cross-entity writes must assign)", n->str2->data, path.items[0]->data);
+    AxTokType opt = advance(p)->type;
+    n->op = (uint8_t)(opt == T_ASSIGN ? OP_NONE : compound_op_of(opt));
+    n->names = path.items;
+    n->nnames = path.n;
+    n->a = parse_expr(p);
+    end_stmt(p);
+    return n;
+  }
+  // `$belief ~= observe(...)` / `$x = …` — the sigil is decoration on an ordinary name.
+  if (at(p, T_DOLLAR) && peek(p, 1)->type == T_IDENT) advance(p);
+
+  // `state -> chase if near -> idle` — a guarded transition chain.
+  if (at(p, T_IDENT) && peek(p, 1)->type == T_ARROW) {
+    AxNode *n = node(p, N_TRANSITION);
+    n->str = tok_name_str(advance(p));
+    NodeList clauses = {0};
+    while (at(p, T_ARROW)) {
+      advance(p);
+      AxNode *c = node(p, N_BLOCK);
+      c->str = tok_name_str(expect(p, T_IDENT, "as a transition target"));
+      NodeList args = {0};
+      if (at(p, T_LPAREN)) parse_args(p, &args);
+      c->list = args.items;
+      c->nlist = args.n;
+      if (at_kw(p, "if")) { advance(p); c->a = parse_expr(p); }
+      nl_push(&clauses, c);
+    }
+    n->list = clauses.items;
+    n->nlist = clauses.n;
+    end_stmt(p);
+    return n;
+  }
+  // `belief ~= observe(...)`
+  if (at(p, T_IDENT) && peek(p, 1)->type == T_TILDEEQ) {
+    AxNode *n = node(p, N_ASSIGN);
+    n->str = tok_name_str(advance(p));
+    advance(p);
+    n->op = OP_OBSERVE;
+    n->a = parse_expr(p);
+    end_stmt(p);
+    return n;
+  }
 
   // Assignments and expression statements.
   if (at(p, T_IDENT)) {
@@ -1110,6 +1349,333 @@ static AxNode *parse_use(P *p) {
   return n;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Engine declarations — each follows the rule of the same name in parser.js.
+// ---------------------------------------------------------------------------------------------
+
+// `IDENT (args)?` — the shape/prior/infer calls of a `$` distribution field.
+static AxNode *parse_call_like(P *p) {
+  AxNode *n = node(p, N_CALL);
+  n->str = tok_name_str(expect(p, T_IDENT, "as a constructor name"));
+  NodeList args = {0};
+  if (at(p, T_LPAREN)) parse_args(p, &args);
+  n->list = args.items;
+  n->nlist = args.n;
+  return n;
+}
+
+// `&Pool(T, n)`, `&Vec(T, n)`, `&Map(K, V, n)` — the bounded containers a field may hold.
+static AxNode *parse_pool_type(P *p) {
+  expect(p, T_AMP, NULL);
+  AxNode *n = node(p, N_POOLTYPE);
+  AxTok *kw = expect(p, T_IDENT, "after '&'");
+  n->str = tok_name_str(kw);
+  if (strcmp(kw->payload, "Pool") && strcmp(kw->payload, "Vec") && strcmp(kw->payload, "Map"))
+    perr(p, "'&%s' is not a recognized field-type constructor (only '&Pool', '&Vec', '&Map' are defined)", kw->payload);
+  expect(p, T_LPAREN, NULL);
+  n->str2 = tok_name_str(expect(p, T_IDENT, "as the element type"));
+  expect(p, T_COMMA, NULL);
+  if (strcmp(kw->payload, "Map") == 0) {
+    NameList vt = {0};
+    name_push(&vt, tok_name_str(expect(p, T_IDENT, "as the value type")));
+    n->names = vt.items;
+    n->nnames = vt.n;
+    expect(p, T_COMMA, NULL);
+  }
+  n->num = expect(p, T_NUM, "as the capacity")->num;
+  expect(p, T_RPAREN, NULL);
+  return n;
+}
+
+static AxNode *field_node(P *p, AxStr *name, int sigil, AxNode *value) {
+  AxNode *f = node(p, N_FIELD);
+  f->str = name;
+  f->op = (uint8_t)sigil;
+  f->a = value;
+  return f;
+}
+
+static AxNode *field_value(P *p) {
+  if (!at(p, T_COLON)) return NULL;
+  advance(p);
+  return at(p, T_AMP) ? parse_pool_type(p) : parse_expr(p);
+}
+
+// One `~field` (or the multi-name `~a,b,c: v`) or `$belief: Grid(…) ~ Prior infer: s(n)`.
+static void parse_field(P *p, NodeList *out) {
+  if (at(p, T_TILDE)) {
+    advance(p);
+    AxStr *name = tok_name_str(expect(p, T_IDENT, "as a field name"));
+    if (at(p, T_COMMA) && peek(p, 1)->type == T_IDENT && !at_kw_off(p, 1, "at")) {
+      // `~a,b,c: v` only when the names run straight into the colon.
+      int i = 1;
+      while (peek(p, i)->type == T_COMMA && peek(p, i + 1)->type == T_IDENT) i += 2;
+      if (peek(p, i)->type == T_COLON || peek(p, i)->type == T_NEWLINE) {
+        NameList names = {0};
+        name_push(&names, name);
+        while (at(p, T_COMMA)) { advance(p); name_push(&names, tok_name_str(expect(p, T_IDENT, "as a field name"))); }
+        AxNode *value = field_value(p);
+        for (int k = 0; k < names.n; k++) nl_push(out, field_node(p, names.items[k], 0, value));
+        return;
+      }
+    }
+    if (at(p, T_BANG)) advance(p);       // `~hp!: 50` overrides a mixin default on purpose
+    nl_push(out, field_node(p, name, 0, field_value(p)));
+    return;
+  }
+  if (at(p, T_DOLLAR)) {
+    advance(p);
+    AxNode *f = field_node(p, tok_name_str(expect(p, T_IDENT, "as a field name")), 1, NULL);
+    expect(p, T_COLON, "after the distribution name");
+    f->a = parse_call_like(p);
+    if (at(p, T_TILDE)) { advance(p); f->b = parse_call_like(p); }
+    if (at_kw(p, "infer")) { advance(p); expect(p, T_COLON, NULL); f->c = parse_call_like(p); }
+    nl_push(out, f);
+    return;
+  }
+  perr(p, "expected a field");
+}
+
+// A field followed by comma continuations: `~speed: 8, mass: 1, cd: 0s` — a bare name after
+// the comma inherits the sigil of the field before it.
+static void parse_fields(P *p, NodeList *out) {
+  parse_field(p, out);
+  while (at(p, T_COMMA)) {
+    advance(p);
+    if (at_kw(p, "at")) break;
+    if (at(p, T_IDENT)) {
+      int sigil = out->n ? out->items[out->n - 1]->op : 0;
+      AxStr *name = tok_name_str(advance(p));
+      if (at(p, T_BANG)) advance(p);
+      nl_push(out, field_node(p, name, sigil, field_value(p)));
+    } else {
+      parse_field(p, out);
+    }
+  }
+}
+
+// `&name:` / `&tick(10hz):` / `&on(Event):` — a scheduled block, indented or on one line with
+// `;` between statements.
+static AxNode *parse_eblock(P *p) {
+  AxNode *n = node(p, N_EBLOCK);
+  expect(p, T_AMP, NULL);
+  n->str = tok_name_str(expect(p, T_IDENT, "as a block name"));
+  if (at(p, T_LPAREN)) {
+    advance(p);
+    if (at(p, T_NUM)) n->num = advance(p)->num;
+    else n->str2 = tok_name_str(expect(p, T_IDENT, "as a frequency or an event name"));
+    expect(p, T_RPAREN, NULL);
+  }
+  expect(p, T_COLON, "after the block header");
+  NodeList body = {0};
+  if (at(p, T_NEWLINE)) {
+    advance(p);
+    parse_indented_into(p, &body);
+  } else {
+    nl_push(&body, parse_stmt(p));
+    while (p->pos > 0 && p->toks->toks[p->pos - 1].type == T_SEMI
+           && !at(p, T_NEWLINE) && !at(p, T_EOF) && !at(p, T_DEDENT) && !at(p, T_INDENT)) {
+      nl_push(&body, parse_stmt(p));
+    }
+  }
+  n->list = body.items;
+  n->nlist = body.n;
+  return n;
+}
+
+static AxNode *parse_entity(P *p);
+
+// One line of an entity body: fields, a block, or a nested entity.
+static void parse_member_line(P *p, NodeList *out) {
+  if (at(p, T_AT)) { parse_entity(p); skip_newlines(p); return; }   // nested: parsed, not instantiated
+  if (at(p, T_AMP)) { nl_push(out, parse_eblock(p)); return; }
+  if (at(p, T_TILDE) || at(p, T_DOLLAR)) {
+    parse_fields(p, out);
+    end_stmt(p);
+    return;
+  }
+  perr(p, "unexpected %s starting an entity member (expected ~field, $field, &block or @entity)", tok_name(peek(p, 0)->type));
+}
+
+// `&Name` right after `@Entity` is the base type — unless it is a one-line block
+// (`&tick(10hz): …` or `&physics: stmt`).
+static bool header_amp_is_block(P *p) {
+  if (peek(p, 1)->type != T_IDENT) return false;
+  AxTokType after = peek(p, 2)->type;
+  if (after == T_LPAREN) return true;
+  if (after == T_COLON) {
+    AxTokType body = peek(p, 3)->type;
+    return body != T_NEWLINE && body != T_EOF && body != T_SEMI;
+  }
+  return false;
+}
+
+static AxNode *parse_entity(P *p) {
+  AxNode *n = node(p, N_ENTITY);
+  expect(p, T_AT, NULL);
+  n->str = tok_name_str(expect(p, T_IDENT, "as the entity name"));
+  NodeList members = {0};
+  NameList mixins = {0};
+  for (;;) {
+    if (at(p, T_SEMI)) { advance(p); continue; }
+    if (at(p, T_AMP)) {
+      if (header_amp_is_block(p)) { nl_push(&members, parse_eblock(p)); continue; }
+      advance(p);
+      n->str2 = tok_name_str(expect(p, T_IDENT, "as the base type"));
+      continue;
+    }
+    if (at(p, T_PLUS)) {
+      advance(p);
+      name_push(&mixins, tok_name_str(expect(p, T_IDENT, "as a mixin name")));
+      while (at(p, T_COMMA)) { advance(p); name_push(&mixins, tok_name_str(expect(p, T_IDENT, "as a mixin name"))); }
+      continue;
+    }
+    if (at(p, T_TILDE) || at(p, T_DOLLAR)) { parse_fields(p, &members); continue; }
+    if (at_kw(p, "at")) { advance(p); n->a = parse_expr(p); continue; }
+    if (at(p, T_COLON)) { advance(p); continue; }
+    break;
+  }
+  if (at(p, T_NEWLINE)) advance(p);
+  if (at(p, T_INDENT)) {
+    advance(p);
+    while (!at(p, T_DEDENT) && !at(p, T_EOF)) { parse_member_line(p, &members); skip_newlines(p); }
+    expect(p, T_DEDENT, "to end the entity");
+  } else if (!members.n) {
+    perr(p, "entity '@%s' has no body (expected INDENT after header)", n->str->data);
+  }
+  n->list = members.items;
+  n->nlist = members.n;
+  n->names = mixins.items;
+  n->nnames = mixins.n;
+  return n;
+}
+
+// `^event Name: amount:: number, source:: #Entity?` — the schema of a broadcast. A trailing
+// `?` marks a field optional (omitted → null rather than defaulted).
+static AxNode *parse_event(P *p) {
+  AxNode *n = node(p, N_EVENT);
+  advance(p);   // ^
+  advance(p);   // event
+  n->str = tok_name_str(expect(p, T_IDENT, "as the event name"));
+  expect(p, T_COLON, "after the event name");
+  NodeList fields = {0};
+  bool inline_form = !at(p, T_NEWLINE);
+  if (!inline_form) { advance(p); expect(p, T_INDENT, "to start the field list"); }
+  for (;;) {
+    if (!inline_form && (at(p, T_DEDENT) || at(p, T_EOF))) break;
+    AxNode *f = node(p, N_IDENT);
+    f->str = tok_name_str(expect(p, T_IDENT, "as a field name"));
+    if (at(p, T_COLONCOLON)) { advance(p); if (at(p, T_HASH)) advance(p); expect(p, T_IDENT, "as a field type"); }
+    if (at(p, T_QUESTION)) { advance(p); f->flag = true; }
+    nl_push(&fields, f);
+    if (at(p, T_COMMA)) { advance(p); continue; }
+    if (inline_form) break;
+    expect(p, T_NEWLINE, "after a field");
+  }
+  if (inline_form) end_stmt(p);
+  else expect(p, T_DEDENT, "to end the field list");
+  n->list = fields.items;
+  n->nlist = fields.n;
+  return n;
+}
+
+// `^mix Stats: ~hp: 100, max: 100` or an indented body of fields and blocks.
+static AxNode *parse_mixin(P *p) {
+  AxNode *n = node(p, N_MIXIN);
+  advance(p);   // ^
+  advance(p);   // mix
+  n->str = tok_name_str(expect(p, T_IDENT, "as the mixin name"));
+  expect(p, T_COLON, "after the mixin name");
+  NodeList members = {0};
+  if (!at(p, T_NEWLINE)) {
+    if (!at(p, T_TILDE) && !at(p, T_DOLLAR)) perr(p, "expected ~ or $ for inline mixin field");
+    parse_fields(p, &members);
+    end_stmt(p);
+  } else {
+    advance(p);
+    expect(p, T_INDENT, "to start the mixin body");
+    while (!at(p, T_DEDENT) && !at(p, T_EOF)) {
+      if (at(p, T_AMP)) nl_push(&members, parse_eblock(p));
+      else if (at(p, T_TILDE) || at(p, T_DOLLAR)) { parse_fields(p, &members); end_stmt(p); }
+      else perr(p, "unexpected %s in mixin body", tok_name(peek(p, 0)->type));
+      skip_newlines(p);
+    }
+    expect(p, T_DEDENT, "to end the mixin");
+  }
+  n->list = members.items;
+  n->nlist = members.n;
+  return n;
+}
+
+// `^mat Wall: albedo: #Tex, rough: 0.5` — the colon after the name is optional.
+static AxNode *parse_material(P *p) {
+  AxNode *n = node(p, N_MATERIAL);
+  advance(p);   // ^
+  advance(p);   // mat
+  n->str = tok_name_str(expect(p, T_IDENT, "as the material name"));
+  if (at(p, T_COLON)) advance(p);
+  NodeList props = {0};
+  bool block = at(p, T_NEWLINE);
+  if (block) { advance(p); expect(p, T_INDENT, "to start the material body"); }
+  for (;;) {
+    if (block && (at(p, T_DEDENT) || at(p, T_EOF))) break;
+    AxStr *name = tok_name_str(expect(p, T_IDENT, "as a material property"));
+    expect(p, T_COLON, "after a material property");
+    nl_push(&props, pair_node(p, name, NULL, parse_expr(p)));
+    if (at(p, T_COMMA)) { advance(p); continue; }
+    if (!block) break;
+    expect(p, T_NEWLINE, "after a material property");
+  }
+  if (block) expect(p, T_DEDENT, "to end the material");
+  else end_stmt(p);
+  n->list = props.items;
+  n->nlist = props.n;
+  return n;
+}
+
+// `#Mesh3D Name: "file.glb"`, `#Mesh3D Name: base64("…")`, or a `glb:` heredoc of quoted chunks.
+static AxNode *parse_resource(P *p) {
+  AxNode *n = node(p, N_RESOURCE);
+  expect(p, T_HASH, NULL);
+  n->str = tok_name_str(expect(p, T_IDENT, "as the resource kind"));
+  n->str2 = tok_name_str(expect(p, T_IDENT, "as the resource name"));
+  expect(p, T_COLON, "after the resource name");
+  if (at_kw(p, "base64") && peek(p, 1)->type == T_LPAREN) {
+    advance(p); advance(p);
+    AxTok *t = expect(p, T_STR, "as the base64 payload");
+    n->b = node(p, N_STR);
+    n->b->str = ax_str_new(t->payload, t->len);
+    expect(p, T_RPAREN, NULL);
+    end_stmt(p);
+    return n;
+  }
+  if (at_kw(p, "glb") && peek(p, 1)->type == T_COLON) {
+    advance(p); advance(p);
+    expect(p, T_NEWLINE, NULL);
+    expect(p, T_INDENT, "to start the glb heredoc");
+    char *buf = NULL;
+    size_t len = 0, cap = 0;
+    int chunks = 0;
+    while (!at(p, T_DEDENT) && !at(p, T_EOF)) {
+      AxTok *t = expect(p, T_STR, "as a base64 chunk");
+      ax_str_append(&buf, &len, &cap, t->payload, t->len);
+      expect(p, T_NEWLINE, NULL);
+      chunks++;
+    }
+    expect(p, T_DEDENT, NULL);
+    if (!chunks) perr(p, "#%s %s: glb: heredoc requires at least one quoted base64 chunk", n->str->data, n->str2->data);
+    n->b = node(p, N_STR);
+    n->b->str = ax_str_new(buf, len);
+    free(buf);
+    return n;
+  }
+  AxTok *t = expect(p, T_STR, "as the resource path");
+  n->a = node(p, N_STR);
+  n->a->str = ax_str_new(t->payload, t->len);
+  end_stmt(p);
+  return n;
+}
+
 bool ax_parse(AxTokens *toks, AxParseResult *out) {
   memset(out, 0, sizeof *out);
   P p = { .toks = toks, .pos = 0, .res = out };
@@ -1128,14 +1694,16 @@ bool ax_parse(AxTokens *toks, AxParseResult *out) {
       if (strcmp(kw, "main") == 0) { nl_push(&decls, parse_fn(&p, true)); skip_newlines(&p); continue; }
       if (strcmp(kw, "type") == 0) { nl_push(&decls, parse_type(&p)); skip_newlines(&p); continue; }
       if (strcmp(kw, "use") == 0) { nl_push(&decls, parse_use(&p)); skip_newlines(&p); continue; }
-      if (strcmp(kw, "event") == 0 || strcmp(kw, "mix") == 0 || strcmp(kw, "mat") == 0) {
-        perr(&p, "^%s belongs to the engine runtime, which the native build does not host — run this program with the JavaScript runtime (node main.js)", kw);
-      }
+      if (strcmp(kw, "event") == 0) { nl_push(&decls, parse_event(&p)); skip_newlines(&p); continue; }
+      if (strcmp(kw, "mix") == 0) { nl_push(&decls, parse_mixin(&p)); skip_newlines(&p); continue; }
+      if (strcmp(kw, "mat") == 0) { nl_push(&decls, parse_material(&p)); skip_newlines(&p); continue; }
       perr(&p, "unknown declaration '^%s'", kw);
     }
     if (at(&p, T_TILDE) && peek(&p, 1)->type == T_IDENT) { nl_push(&decls, parse_global(&p)); skip_newlines(&p); continue; }
-    if (at(&p, T_AT)) perr(&p, "@entity declarations belong to the engine runtime — run this program with the JavaScript runtime (node main.js)");
-    if (at(&p, T_HASH)) perr(&p, "#resource declarations belong to the engine runtime — run this program with the JavaScript runtime (node main.js)");
+    if (at(&p, T_AT) && at_kw_off(&p, 1, "input"))
+      perr(&p, "@input: is not supported — use input.move (Vec2), input.jump (bool), input.fire (bool), input.aim (Vec2) directly in blocks");
+    if (at(&p, T_AT)) { nl_push(&decls, parse_entity(&p)); skip_newlines(&p); continue; }
+    if (at(&p, T_HASH)) { nl_push(&decls, parse_resource(&p)); skip_newlines(&p); continue; }
     perr(&p, "unexpected %s at the top level", tok_name(peek(&p, 0)->type));
   }
   prog->list = decls.items;

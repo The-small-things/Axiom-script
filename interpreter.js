@@ -2838,8 +2838,10 @@ class World {
         } else {
           // Defensive: should never happen (checker validates at compile time), but if a
           // corrupt blob slips through, fall back to a unit box so the entity is visible.
+          // v0.9.2: without a renderer there is no procedural box to fall back to; the
+          // resource stays a plain descriptor instead of crashing the load.
           const box = proceduralMeshForPath('box.glb');
-          res.vertices = box.vertices; res.indices = box.indices;
+          if (box) { res.vertices = box.vertices; res.indices = box.indices; }
         }
         this.resources.set(r.name, res);
         continue;
@@ -2875,8 +2877,10 @@ class World {
             this.resources.set(`${r.name}_${pi}`, primRes);
           }
         } else {
+          // v0.9.2: without a renderer there is no procedural box to fall back to; the
+          // resource stays a plain descriptor instead of crashing the load.
           const box = proceduralMeshForPath('box.glb');
-          res.vertices = box.vertices; res.indices = box.indices;
+          if (box) { res.vertices = box.vertices; res.indices = box.indices; }
         }
       }
       this.resources.set(r.name, res);

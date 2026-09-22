@@ -17,6 +17,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include "jsmath.h"
 #include <time.h>
 #include <regex.h>
 #include <unistd.h>
@@ -385,13 +386,20 @@ static void check_write(AxVM *vm, const char *path) {
 #define NATIVE(name) static AxValue name(AxVM *vm, AxFn *self, AxValue *args, int argc)
 
 NATIVE(n_print) {
+  // Every argument is rendered first, then the line is written once: into the engine's log
+  // (the `log` of --json output) when a world is running, and to stdout unless --json owns it.
+  SB sb = {0};
+  sb_addz(&sb, "");
   for (int i = 0; i < argc; i++) {
-    if (i) fputc(' ', stdout);
+    if (i) sb_addz(&sb, " ");
     AxStr *s = ax_to_str(args[i]);
-    fwrite(s->data, 1, s->len, stdout);
+    sb_add(&sb, s->data, s->len);
     ax_release(ax_strv(s));
   }
-  fputc('\n', stdout);
+  AxStr *msg = ax_str_new(sb.buf, sb.len);
+  free(sb.buf);
+  if (!ax_engine_log_msg(vm, msg)) { fwrite(msg->data, 1, msg->len, stdout); fputc('\n', stdout); }
+  ax_release(ax_strv(msg));
   return ax_null();
 }
 
@@ -412,6 +420,7 @@ NATIVE(n_len) {
     case AX_STR: case AX_ATOM: return ax_num(((AxStr *)v.o)->len);
     case AX_ARR: return ax_num(((AxArr *)v.o)->len);
     case AX_DICT: return ax_num(ax_dict_count((AxDict *)v.o));
+    case AX_HOST: return ax_num(ax_host_len(v));
     case AX_RANGE: {
       AxRange *r = (AxRange *)v.o;
       double n = ceil((r->hi - r->lo) / r->step);
@@ -2314,7 +2323,7 @@ AxValue ax_method_call(AxVM *vm, AxValue obj, AxStr *name, AxValue *args, int ar
 
 static void def(AxVM *vm, const char *name, AxNativeFn fn, int min_args, int max_args) {
   AxStr *key = ax_internz(name);
-  ax_scope_declare(vm->globals, key, ax_native(name, fn, min_args, max_args));
+  ax_scope_declare(vm->builtins, key, ax_native(name, fn, min_args, max_args));
   ax_release(ax_strv(key));
 }
 
@@ -2456,4 +2465,6 @@ void ax_stdlib_install(AxVM *vm) {
   def(vm, "apply", n_apply, 2, 2);        def(vm, "partial", n_partial, 1, -1);
   def(vm, "compose", n_compose, 1, -1);   def(vm, "memo", n_memo, 1, 1);
   def(vm, "check", n_check, 1, 2);        def(vm, "check_eq", n_check_eq, 2, 3);
+  // Engine intrinsics last: where a name is in both (hypot), the engine's V8-exact version wins.
+  ax_engine_install(vm);
 }

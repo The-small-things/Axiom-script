@@ -1,0 +1,42 @@
+^event Hit:
+  amount:: number
+  source:: #Entity
+  note:: string?
+
+^event Ping: n:: number
+
+@Tower at v3(0, 0, 0)
+  ~shots: 0
+  &tick(5hz):
+    shots += 1
+    ^Hit(amount: shots * 2) within(6)
+    ?shots % 3 == 0:
+      ^Ping(n: shots) to #Far
+
+@Near at v3(2, 0, 1)
+  ~hp: 100
+  ~last_src: null
+  ~notes: 0
+  &on(Hit):
+    hp -= amount
+    last_src = source
+    ?note == null:
+      notes += 1
+
+@Far at v3(40, 0, 0)
+  ~hp: 100
+  ~pings: 0
+  &on(Hit):
+    hp -= amount
+  &on(Ping):
+    pings += n
+
+@Instant at v3(1, 0, 0)
+  ~sent: false
+  ~got: 0
+  &physics:
+    ?!sent:
+      sent = true
+      ^Ping(n: 99) to #Instant
+  &on(Ping):
+    got = n

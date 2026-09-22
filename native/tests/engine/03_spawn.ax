@@ -1,0 +1,37 @@
+@Enemy at v3(5, 0, 0)
+  ~hp: 3
+  ~kind: grunt
+  &tick(10hz):
+    hp -= 1
+    ?hp <= 0:
+      !despawn(self)
+
+@Spawner
+  ~count: 0
+  ~seen: 0
+  ~alive: true
+  ~gap: -1
+  &tick(2hz):
+    count += 1
+    ?count <= 3:
+      !spawn(#Enemy, at: v3(count, 0, 0), hp: count * 10, kind: elite)
+    target = ?nearest(#Enemy)
+    ?target != null:
+      seen += 1
+    alive = ?exists(#Enemy)
+    gap = ?dist(#Marker)
+
+@Marker at v3(0, 0, 3)
+  ~pokes: 0
+  &physics:
+    #Spawner.seen += 0
+    #Watcher.pokes += 1
+
+@Watcher
+  ~pokes: 0
+  ~enemy_hp: 0
+  &tick(1hz):
+    ?!#Enemy:
+      enemy_hp = -1
+    ?!enemy_hp:
+      enemy_hp = -2

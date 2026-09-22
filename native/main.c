@@ -9,8 +9,11 @@
 //   axiom --check                parse only; exit 1 on an error
 //   axiom --sandbox …            deny file writes and subprocesses unless explicitly allowed
 //
-// Anything belonging to the engine half (entities, frame blocks, rendering) is refused by the
-// parser with a message naming the JavaScript runtime, rather than being silently ignored.
+//   axiom world.ax --sim N       step a simulation N frames headless (60 Hz physics)
+//   axiom world.ax --sim N --json   … and print the final state as JSON (main.js's format)
+//   axiom world.ax --run         run ^main only, even when the program declares entities
+//
+// A program with a ^main and entities runs ^main first (as setup) and then the frame loop.
 
 #include "axiom.h"
 #include <stdlib.h>
@@ -18,6 +21,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <limits.h>
+#include <ctype.h>
 
 static char *read_file(const char *path) {
   FILE *f = fopen(path, "rb");
@@ -146,7 +150,7 @@ static bool resolve_imports(AxNode *program, const char *from_path, ImportSet *s
 
 static void usage(void) {
   printf(
-    "AxiomScript %s (native) — the language runtime, without the engine.\n"
+    "AxiomScript %s (native)\n"
     "\n"
     "usage: axiom <file.ax> [options] [-- program args]\n"
     "\n"
@@ -155,16 +159,18 @@ static void usage(void) {
     "  --check             parse and check only; exit 1 on an error\n"
     "  -- a b c            arguments for the program, readable with args()\n"
     "\n"
+    "  --sim N             step a simulation N frames headless, no renderer\n"
+    "  --json              with --sim (or a script), print the final state as JSON\n"
+    "  --input FILE        one line of WASD/space per frame, applied to input.move/jump\n"
+    "  --run               run ^main and exit, even when the program declares entities\n"
+    "\n"
     "  --sandbox           deny file writes, subprocesses, and unlisted reads\n"
     "  --allow-read PATH   permit reads under PATH\n"
     "  --allow-write PATH  permit writes under PATH\n"
     "  --allow-exec        permit sh()\n"
     "\n"
     "  --version           print the version\n"
-    "  --help              print this message\n"
-    "\n"
-    "Entities, frame blocks and rendering are hosted by the JavaScript runtime:\n"
-    "  node main.js world.ax\n", AX_VERSION);
+    "  --help              print this message\n", AX_VERSION);
 }
 
 int main(int argc, char **argv) {
@@ -178,6 +184,9 @@ int main(int argc, char **argv) {
   int n_allow_write = 0;
   char **prog_args = NULL;
   int n_prog_args = 0;
+  bool sim = false, json = false, run_only = false;
+  int frames = 60;
+  const char *input_path = NULL;
 
   for (int i = 1; i < argc; i++) {
     const char *a = argv[i];
@@ -190,6 +199,11 @@ int main(int argc, char **argv) {
     if (strcmp(a, "--allow-exec") == 0) { allow_exec = true; continue; }
     if (strcmp(a, "--allow-read") == 0 && i + 1 < argc) { if (n_allow_read < 64) allow_read[n_allow_read++] = argv[++i]; continue; }
     if (strcmp(a, "--allow-write") == 0 && i + 1 < argc) { if (n_allow_write < 64) allow_write[n_allow_write++] = argv[++i]; continue; }
+    if (strcmp(a, "--sim") == 0) { sim = true; if (i + 1 < argc) { frames = atoi(argv[++i]); if (frames <= 0) frames = 60; } continue; }
+    if (strcmp(a, "--json") == 0) { json = true; continue; }
+    if (strcmp(a, "--run") == 0 || strcmp(a, "-r") == 0) { run_only = true; continue; }
+    if (strcmp(a, "--input") == 0 && i + 1 < argc) { input_path = argv[++i]; continue; }
+    if (strcmp(a, "--no-restack") == 0) continue;   // accepted for command-line parity with main.js
     if (strcmp(a, "--") == 0) { prog_args = &argv[i + 1]; n_prog_args = argc - i - 1; break; }
     if (a[0] == '-' && a[1] == '-') { fprintf(stderr, "axiom: unknown flag %s (try --help)\n", a); return 2; }
     if (!path) path = a;
@@ -237,18 +251,85 @@ int main(int argc, char **argv) {
   for (int i = 0; i < n_prog_args; i++) ax_arr_push(vm->argv, ax_str_from(prog_args[i]));
   vm->source_path = path;
 
-  AxValue result = ax_null();
-  bool had_main = ax_run_program(vm, pr.program, vm->argv, &result);
-  if (!had_main) {
-    fprintf(stderr, "axiom: %s declares no ^main, so running it does nothing.\n", path ? path : "<eval>");
+  const char *label = path ? path : (use_stdin ? "<stdin>" : "<eval>");
+  ax_program_declare(vm, pr.program);
+  bool has_entities = ax_engine_load(vm, pr.program, source);
+  if (json) ax_engine_quiet(vm, true);
+  int n_entities = ax_engine_entity_count(vm);
+  bool has_main = false;
+  for (int i = 0; i < pr.program->nlist; i++) if (pr.program->list[i]->kind == N_MAIN) has_main = true;
+  (void)has_entities;
+
+  // SCRIPT MODE (main.js): ^main runs first; the frame loop follows only when there are
+  // entities to simulate and --run was not given.
+  if (has_main) {
+    bool loop_follows = !run_only && n_entities > 0;
+    if (!json && loop_follows) printf("Loaded %s: running ^main, then %d entities\n", label, n_entities);
+    AxValue result = ax_null();
+    ax_run_main(vm, pr.program, vm->argv, &result);
+    int code = vm->exit_code;
+    if (result.t == AX_NUM) code = (int)result.num;
+    if (!loop_follows) {
+      if (json) {
+        // {main_result, log, diagnostics, exit_code}
+        char *mr = NULL;
+        ax_json_write(result, 0, &mr);
+        printf("{\n  \"main_result\": %s,\n  \"log\": ", mr);
+        free(mr);
+        ax_engine_print_log_json(vm, stdout, 1);
+        printf(",\n  \"diagnostics\": [],\n  \"exit_code\": %d\n}\n", code);
+      }
+      ax_release(result);
+      fflush(stdout);
+      return code;
+    }
     ax_release(result);
+  } else if (run_only) {
+    fprintf(stderr, "--run needs a '^main:' entry point; %s has none.\n", label);
+    return 1;
+  } else if (!n_entities && !sim) {
+    fprintf(stderr, "axiom: %s declares no ^main and no entities, so running it does nothing.\n", label);
     return 0;
   }
-  int code = vm->exit_code;
-  if (result.t == AX_NUM) code = (int)result.num;
-  ax_release(result);
+  if (!json && !has_main) {
+    printf("Loaded %s: ", label);
+    ax_engine_summary(vm, stdout);
+    printf(", version %s\n", toks.version ? toks.version : "(none)");
+  }
+
+  // The frame loop. Without --sim there is no renderer in this build, so it steps headless.
+  if (!sim && !json) fprintf(stderr, "axiom: this build has no display backend; stepping %d frames headless (use --sim N)\n", frames);
+  char **input_lines = NULL;
+  int n_input = 0;
+  if (input_path) {
+    char *text = read_file(input_path);
+    if (text) {
+      for (char *line = strtok(text, "\n"); line; line = strtok(NULL, "\n")) {
+        while (*line == ' ' || *line == '\t' || *line == '\r') line++;
+        size_t L = strlen(line);
+        while (L && (line[L - 1] == ' ' || line[L - 1] == '\r' || line[L - 1] == '\t')) line[--L] = '\0';
+        if (!L || line[0] == '#') continue;
+        input_lines = realloc(input_lines, sizeof(char *) * (n_input + 1));
+        input_lines[n_input++] = line;
+      }
+    }
+  }
+  for (int f = 0; f < frames; f++) {
+    double mx = 0, my = 0;
+    bool jump = false;
+    if (f < n_input) {
+      for (const char *c = input_lines[f]; *c; c++) {
+        char u = (char)toupper((unsigned char)*c);
+        if (u == 'W') my += 1; else if (u == 'S') my -= 1;
+        else if (u == 'A') mx -= 1; else if (u == 'D') mx += 1;
+        else if (u == ' ') jump = true;
+      }
+    }
+    ax_engine_set_input(vm, mx, my, jump);
+    ax_engine_update(vm, 1.0 / 60);
+  }
+  if (!json) ax_engine_print_diags(vm, stderr);
+  else ax_engine_print_json(vm, frames, stdout);
   fflush(stdout);
-  // The VM and AST are torn down only when it is free to do so: at exit the OS reclaims
-  // everything, and walking the heap first would just make start-up-to-answer slower.
-  return code;
+  return ax_engine_diag_count(vm) ? 1 : 0;
 }

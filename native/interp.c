@@ -18,9 +18,11 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <math.h>
+#include "jsmath.h"
 
 // Names compared by pointer on the hot path.
 static AxStr *S_null, *S_true, *S_false, *S_args, *S_msg, *S_code, *S_value, *S_type, *S_underscore, *S_it;
+static AxStr *S_dt, *S_self, *S_input, *S_len, *S_size, *S_length, *S_chars, *S_name, *S_lo, *S_hi, *S_step;
 
 static void init_names(void) {
   if (S_null) return;
@@ -34,6 +36,24 @@ static void init_names(void) {
   S_type = ax_internz("__type");
   S_underscore = ax_internz("_");
   S_it = ax_internz("it");
+  S_dt = ax_internz("dt");
+  S_self = ax_internz("self");
+  S_input = ax_internz("input");
+  S_len = ax_internz("len");
+  S_size = ax_internz("size");
+  S_length = ax_internz("length");
+  S_chars = ax_internz("chars");
+  S_name = ax_internz("name");
+  S_lo = ax_internz("lo");
+  S_hi = ax_internz("hi");
+  S_step = ax_internz("step");
+}
+
+static AxValue entity_value(AxEntity *e) {
+  if (!e) return ax_null();
+  AxValue v; v.t = AX_ENTITY; v.o = (AxObj *)e;
+  ax_retain(v);
+  return v;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -116,6 +136,14 @@ static bool value_in(AxVM *vm, AxValue needle, AxValue hay) {
 }
 
 static AxValue binary_op(AxVM *vm, int op, AxValue l, AxValue r) {
+  // A timer takes part in arithmetic and comparison as its remaining time (the reference's
+  // valueOf), so `?cd <= 0:` and `cd - dt` read the way they look.
+  if (l.t == AX_TIMER && op != OP_EQ && op != OP_NE) l = ax_num(((AxTimer *)l.o)->remaining);
+  if (r.t == AX_TIMER && op != OP_EQ && op != OP_NE) r = ax_num(((AxTimer *)r.o)->remaining);
+  if (l.t >= AX_VEC2 || r.t >= AX_VEC2 || op == OP_DOT || op == OP_CROSS || op == OP_RAY) {
+    AxValue out;
+    if (ax_engine_binary(vm, op, l, r, &out)) return out;
+  }
   switch (op) {
     case OP_ADD:
       if (l.t == AX_STR || r.t == AX_STR) return concat_values(l, r);
@@ -154,11 +182,14 @@ static AxValue binary_op(AxVM *vm, int op, AxValue l, AxValue r) {
     }
     case OP_IN: return ax_bool(value_in(vm, l, r));
     case OP_RANGE: return ax_range(ax_to_num(l), ax_to_num(r), 1);
+    case OP_DOT: case OP_CROSS: return ax_num(NAN);
     default:
       ax_throw(vm, "AX-RUNTIME-OP", "unknown operator");
       return ax_null();
   }
 }
+
+AxValue ax_binary_op(AxVM *vm, int op, AxValue l, AxValue r) { return binary_op(vm, op, l, r); }
 
 // ---------------------------------------------------------------------------------------------
 // Sequences
@@ -192,6 +223,7 @@ AxArr *ax_to_seq(AxVM *vm, AxValue v) {
       return a;
     }
     case AX_NULL: return ax_arr_new(0);
+    case AX_HOST: return ax_host_seq(v);
     default: {
       AxArr *a = ax_arr_new(1);
       ax_arr_push(a, ax_copy(v));
@@ -226,6 +258,20 @@ AxValue ax_index_get(AxVM *vm, AxValue obj, AxValue idx) {
     case AX_NULL:
       ax_throw(vm, "AX-RUNTIME-INDEX", "cannot index null — check the value with is_null() or ?? first");
       return ax_null();
+    case AX_HOST: return ax_host_index(vm, obj, idx);
+    case AX_VEC2: case AX_VEC3: case AX_QUAT: case AX_XFORM: case AX_TIMER: case AX_SHAPE: {
+      // `v["x"]` reads the property; anything else has nothing to index.
+      if (idx.t == AX_STR) {
+        AxValue out;
+        if (ax_engine_member(vm, obj, (AxStr *)idx.o, &out) && out.t != AX_NULL) return out;
+      }
+      AxStr *k = ax_to_str(idx);
+      char buf[64];
+      snprintf(buf, sizeof buf, "%s", k->data);
+      ax_release(ax_strv(k));
+      ax_throw(vm, "AX-RUNTIME-INDEX", "cannot index %s with [%s] — check the value is an array, string, or dict first (is_null / type)", ax_type_name(obj), buf);
+      return ax_null();
+    }
     default:
       ax_throw(vm, "AX-RUNTIME-INDEX", "cannot index %s", ax_type_name(obj));
       return ax_null();
@@ -237,6 +283,7 @@ AxValue ax_index_get(AxVM *vm, AxValue obj, AxValue idx) {
 // ---------------------------------------------------------------------------------------------
 
 #define AX_MAX_DEPTH 2500
+#define HOT_LOOP_LIMIT 200000   // per loop inside &physics/&render/&tick/&on — a frame budget
 
 static AxValue eval_node(AxVM *vm, AxNode *n, AxScope *scope);
 static int exec_list(AxVM *vm, AxNode **stmts, int n, AxScope *scope, AxValue *out);
@@ -258,6 +305,12 @@ AxValue ax_call(AxVM *vm, AxValue fnv, AxValue *args, int argc) {
     vm->call_depth = 0;
     ax_throw(vm, "AX-DEPTH-001", "recursion depth exceeded %d — add a base case, or rewrite the recursion as a loop", AX_MAX_DEPTH);
   }
+  // A function body runs with function semantics (assignments make locals) on behalf of the
+  // entity that called it — or, for a lambda, the entity it was written in.
+  AxCtx saved_ctx = vm->ctx;
+  if (f->entity) vm->ctx.entity = f->entity;
+  vm->ctx.in_fn = true;
+  vm->ctx.hot = false;
   AxScope *s = ax_scope_new(f->scope, true);
   int off = 0;
   if (f->has_bound) {
@@ -287,6 +340,7 @@ AxValue ax_call(AxVM *vm, AxValue fnv, AxValue *args, int argc) {
   }
   ax_scope_release(s);
   vm->call_depth--;
+  vm->ctx = saved_ctx;
   return result;
 }
 
@@ -317,16 +371,61 @@ static AxScope *fn_frame(AxScope *s) {
   return s;
 }
 
+// The assignment rule, in one place (interpreter.js writeVar):
+//   1. a name already bound in an enclosing frame   → write there (params, locals, globals)
+//   2. inside an entity block, or an existing field → write the entity (fields persist)
+//   3. otherwise                                    → a local of the enclosing function
+// `~x: v` inside a function forces case 3 (after case 1), which is how a script shadows on purpose.
 static void write_var(AxVM *vm, AxScope *scope, AxStr *name, AxValue v, bool declare_local) {
-  if (declare_local) { ax_scope_declare(scope, name, v); return; }
+  if (declare_local && vm->ctx.in_fn) {
+    if (!ax_scope_set_existing(scope, name, v)) ax_scope_declare(fn_frame(scope), name, v);
+    return;
+  }
   if (ax_scope_set_existing(scope, name, v)) return;
+  AxEntity *e = vm->ctx.entity;
+  if (e) {
+    bool known = !vm->ctx.in_fn;
+    if (!known) {
+      AxValue cur;
+      if (ax_entity_get(e, name, &cur)) { known = true; ax_release(cur); }
+    }
+    if (known) { ax_entity_set(e, name, v); return; }
+  }
   ax_scope_declare(fn_frame(scope), name, v);
+}
+
+// Look a name up in the program's frames, stopping short of the library.
+static bool lookup_user(AxScope *scope, AxStr *name, AxValue *out) {
+  for (AxScope *p = scope; p && !p->builtin; p = p->parent) {
+    if (ax_scope_lookup_local(p, name, out)) return true;
+  }
+  return false;
 }
 
 static AxValue read_var(AxVM *vm, AxScope *scope, AxStr *name) {
   AxValue out;
-  if (ax_scope_lookup(scope, name, &out)) return out;
+  if (lookup_user(scope, name, &out)) return out;
+  if (vm->ctx.entity && ax_entity_get(vm->ctx.entity, name, &out)) return out;
   return ax_null();
+}
+
+// A bare name, resolved in the reference's order: dt and self, then lexical frames, then the
+// literals, then the event being handled, then the running entity's fields and locals, then the
+// input record, then declared functions and the library — and an atom if nothing claims it.
+static AxValue resolve_ident(AxVM *vm, AxScope *scope, AxStr *name) {
+  if (name == S_dt) return ax_num(vm->ctx.dt);
+  if (name == S_self) return entity_value(vm->ctx.entity);
+  AxValue out;
+  if (lookup_user(scope, name, &out)) return out;
+  if (name == S_null) return ax_null();
+  if (name == S_true) return ax_bool(true);
+  if (name == S_false) return ax_bool(false);
+  if (vm->ctx.payload && ax_dict_get(vm->ctx.payload, name, &out)) return out;
+  if (vm->ctx.entity && ax_entity_get(vm->ctx.entity, name, &out)) return out;
+  if (name == S_input && vm->world) return ax_engine_input(vm);
+  if (ax_scope_lookup(scope, name, &out)) return out;
+  ax_retain(ax_strv(name));
+  return ax_atom(name);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -487,6 +586,10 @@ static AxValue make_closure(AxVM *vm, AxNode *n, AxScope *scope, bool is_expr) {
   }
   f->scope = scope;
   if (scope) scope->hdr.rc++;
+  if (is_expr && vm->ctx.entity) {
+    f->entity = vm->ctx.entity;
+    f->entity->hdr.rc++;
+  }
   return ax_fnv(f);
 }
 
@@ -494,7 +597,10 @@ static AxValue eval_call_named(AxVM *vm, AxNode *n, AxScope *scope);
 
 static AxValue eval_node(AxVM *vm, AxNode *n, AxScope *scope) {
   switch (n->kind) {
-    case N_NUM: return ax_num(n->num);
+    case N_NUM:
+      // `3v` is the uniform vector v3(3, 3, 3); every other unit leaves the number as it is.
+      if (n->str && n->str->data[0] == 'v' && n->str->data[1] == '\0') return ax_vec3(n->num, n->num, n->num);
+      return ax_num(n->num);
     case N_STR: { ax_retain(ax_strv(n->str)); return ax_strv(n->str); }
     case N_FSTR: {
       AxStr *acc = ax_str_new("", 0);
@@ -510,16 +616,7 @@ static AxValue eval_node(AxVM *vm, AxNode *n, AxScope *scope) {
       }
       return ax_strv(acc);
     }
-    case N_IDENT: {
-      AxValue out;
-      if (ax_scope_lookup(scope, n->str, &out)) return out;
-      if (n->str == S_null) return ax_null();
-      if (n->str == S_true) return ax_bool(true);
-      if (n->str == S_false) return ax_bool(false);
-      // An unbound name is an atom — the language's symbol type (`state = idle`).
-      ax_retain(ax_strv(n->str));
-      return ax_atom(n->str);
-    }
+    case N_IDENT: return resolve_ident(vm, scope, n->str);   // unbound → an atom (`state = idle`)
     case N_ARRAY: {
       AxArr *a = ax_arr_new(n->nlist);
       for (int i = 0; i < n->nlist; i++) ax_arr_push(a, eval_node(vm, n->list[i], scope));
@@ -568,6 +665,10 @@ static AxValue eval_node(AxVM *vm, AxNode *n, AxScope *scope) {
       AxValue v = eval_node(vm, n->a, scope);
       AxValue res;
       if (n->op == OP_NOT) res = ax_bool(!ax_truthy(v));
+      else if (v.t == AX_VEC2 || v.t == AX_VEC3) {
+        AxValue m1 = ax_num(-1);
+        res = binary_op(vm, OP_MUL, v, m1);
+      }
       else res = ax_num(-ax_to_num(v));
       ax_release(v);
       return res;
@@ -580,17 +681,7 @@ static AxValue eval_node(AxVM *vm, AxNode *n, AxScope *scope) {
     }
     case N_MEMBER: {
       AxValue obj = eval_node(vm, n->a, scope);
-      AxValue out = ax_null();
-      if (obj.t == AX_DICT) {
-        if (!ax_dict_get((AxDict *)obj.o, n->str, &out)) out = ax_null();
-      } else if (obj.t == AX_STR && strcmp(n->str->data, "length") == 0) {
-        out = ax_num(((AxStr *)obj.o)->len);
-      } else if (obj.t == AX_ARR && strcmp(n->str->data, "length") == 0) {
-        out = ax_num(((AxArr *)obj.o)->len);
-      } else if (obj.t == AX_NULL) {
-        ax_release(obj);
-        ax_throw(vm, "AX-RUNTIME-MEMBER", "cannot read '.%s' of null", n->str->data);
-      }
+      AxValue out = ax_member_get(vm, obj, n->str);
       ax_release(obj);
       return out;
     }
@@ -606,7 +697,9 @@ static AxValue eval_node(AxVM *vm, AxNode *n, AxScope *scope) {
       AxValue obj = eval_node(vm, n->a, scope);
       AxValue *args = n->nlist ? calloc(n->nlist, sizeof(AxValue)) : NULL;
       for (int i = 0; i < n->nlist; i++) args[i] = eval_node(vm, n->list[i]->b, scope);
-      AxValue out = ax_method_call(vm, obj, n->str, args, n->nlist);
+      AxValue out;
+      if ((obj.t >= AX_VEC2 || obj.t == AX_NUM) && ax_engine_method(vm, obj, n->str, args, n->nlist, &out)) {}
+      else out = ax_method_call(vm, obj, n->str, args, n->nlist);
       for (int i = 0; i < n->nlist; i++) ax_release(args[i]);
       free(args);
       ax_release(obj);
@@ -657,6 +750,7 @@ static AxValue eval_node(AxVM *vm, AxNode *n, AxScope *scope) {
       ax_release(val);
       return out;
     }
+    case N_TAGREF: case N_QUERY: case N_INFER: return ax_engine_eval(vm, n, scope);
     case N_COMPREHENSION: {
       AxValue iter = eval_node(vm, n->b, scope);
       AxArr *seq = ax_to_seq(vm, iter);
@@ -759,6 +853,60 @@ static AxValue eval_call_named(AxVM *vm, AxNode *n, AxScope *scope) {
 
 AxValue ax_eval(AxVM *vm, AxNode *n, AxScope *scope) { return eval_node(vm, n, scope); }
 
+// `obj.prop` (interpreter.js memberOf). A property that does not exist reads as null on an
+// object, and is an error on a value that has no properties at all.
+AxValue ax_member_get(AxVM *vm, AxValue obj, AxStr *prop) {
+  AxValue out = ax_null();
+  switch (obj.t) {
+    case AX_DICT: {
+      AxDict *d = (AxDict *)obj.o;
+      if (prop == S_len || prop == S_size) return ax_num(ax_dict_count(d) + (d->type_tag ? 1 : 0));
+      if (!ax_dict_get(d, prop, &out)) out = ax_null();
+      return out;
+    }
+    case AX_ARR:
+      if (prop == S_length || prop == S_len) return ax_num(((AxArr *)obj.o)->len);
+      return ax_null();
+    case AX_STR: {
+      AxStr *s = (AxStr *)obj.o;
+      if (prop == S_length || prop == S_len) return ax_num(s->len);
+      if (prop == S_chars) {
+        AxArr *a = ax_arr_new(s->len);
+        for (uint32_t i = 0; i < s->len; i++) ax_arr_push(a, ax_strv(ax_str_new(s->data + i, 1)));
+        return ax_arrv(a);
+      }
+      ax_throw(vm, "AX-RUNTIME-MEMBER", "no member '%s' on string", prop->data);
+      return ax_null();
+    }
+    case AX_ATOM:
+      if (prop == S_name) { ax_retain(obj); return ax_strv((AxStr *)obj.o); }
+      return ax_null();
+    case AX_RANGE: {
+      AxRange *r = (AxRange *)obj.o;
+      if (prop == S_lo) return ax_num(r->lo);
+      if (prop == S_hi) return ax_num(r->hi);
+      if (prop == S_step) return ax_num(r->step);
+      if (prop == S_length) { double k = ceil((r->hi - r->lo) / r->step); return ax_num(k > 0 ? k : 0); }
+      return ax_null();
+    }
+    case AX_FN: return ax_null();
+    case AX_NULL:
+      ax_throw(vm, "AX-RUNTIME-MEMBER", "no member '%s' on null", prop->data);
+      return ax_null();
+    case AX_NUM: case AX_BOOL: {
+      AxStr *sv = ax_to_str(obj);
+      char buf[96];
+      snprintf(buf, sizeof buf, "%s", sv->data);
+      ax_release(ax_strv(sv));
+      ax_throw(vm, "AX-RUNTIME-MEMBER", "no member '%s' on %s", prop->data, buf);
+      return ax_null();
+    }
+    default:
+      if (ax_engine_member(vm, obj, prop, &out)) return out;
+      return ax_null();
+  }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Statements
 // ---------------------------------------------------------------------------------------------
@@ -798,30 +946,50 @@ static bool body_creates_closure(AxNode *n) {
   return found;
 }
 
-static void assign_member_path(AxVM *vm, AxNode *n, AxScope *scope, AxValue value) {
-  // names[0].names[1]… = value. Walks dicts; anything else is an error naming the real type.
-  AxValue obj = read_var(vm, scope, n->names[0]);
-  for (int i = 1; i < n->nnames - 1; i++) {
-    if (obj.t != AX_DICT) {
-      ax_release(obj);
+// The value an assignment's compound operator reads: an entity's field, a dict key, or an
+// engine object's property.
+static AxValue raw_member(AxVM *vm, AxValue obj, AxStr *prop) {
+  AxValue out = ax_null();
+  if (obj.t == AX_ENTITY) { if (!ax_entity_get((AxEntity *)obj.o, prop, &out)) out = ax_null(); return out; }
+  if (obj.t == AX_DICT) { if (!ax_dict_get((AxDict *)obj.o, prop, &out)) out = ax_null(); return out; }
+  if (obj.t >= AX_VEC2 && ax_engine_member(vm, obj, prop, &out)) return out;
+  return ax_null();
+}
+
+// `a.b.c op= v` and `#Tag.b.c op= v` (interpreter.js MemberAssign/DeepAssign). A write through
+// something that is not an object is silently dropped, as in the reference.
+static void assign_member_path(AxVM *vm, AxNode *n, AxScope *scope) {
+  bool tagged = n->str2 != NULL;
+  AxStr **path = n->names;
+  int np = n->nnames;
+  // The two-part form evaluates the value first; the deep form resolves the target first.
+  bool value_first = tagged ? np == 1 : np == 2;
+  AxValue value = ax_null();
+  if (value_first) value = eval_node(vm, n->a, scope);
+  AxValue obj;
+  int i0;
+  if (tagged) {
+    AxValue tv; tv.t = AX_NULL;
+    obj = ax_engine_resolve_tag(vm, n->str2);
+    if (obj.t == AX_NULL) {
       ax_release(value);
-      ax_throw(vm, "AX-RUNTIME-MEMBER", "cannot assign through '%s' — it is not a dict", n->names[i]->data);
+      ax_throw(vm, "AX-RUNTIME-000", "'#%s' not found for cross-entity write", n->str2->data);
     }
-    AxValue next;
-    if (!ax_dict_get((AxDict *)obj.o, n->names[i], &next)) next = ax_null();
+    (void)tv;
+    i0 = 0;
+  } else {
+    obj = resolve_ident(vm, scope, path[0]);
+    i0 = 1;
+  }
+  for (int i = i0; i < np - 1; i++) {
+    AxValue next = obj.t == AX_ENTITY ? raw_member(vm, obj, path[i]) : ax_member_get(vm, obj, path[i]);
     ax_release(obj);
     obj = next;
   }
-  if (obj.t != AX_DICT) {
-    const char *tn = ax_type_name(obj);
-    ax_release(obj);
-    ax_release(value);
-    ax_throw(vm, "AX-RUNTIME-MEMBER", "cannot assign '.%s' on %s", n->names[n->nnames - 1]->data, tn);
-  }
-  AxStr *last = n->names[n->nnames - 1];
+  if (!value_first) value = eval_node(vm, n->a, scope);
+  AxStr *last = path[np - 1];
   if (n->op != OP_NONE) {
-    AxValue cur;
-    if (!ax_dict_get((AxDict *)obj.o, last, &cur)) cur = ax_null();
+    AxValue cur = raw_member(vm, obj, last);
     if (n->op == OP_COALESCE) {
       if (cur.t != AX_NULL) { ax_release(cur); ax_release(value); ax_release(obj); return; }
       ax_release(cur);
@@ -832,7 +1000,10 @@ static void assign_member_path(AxVM *vm, AxNode *n, AxScope *scope, AxValue valu
       value = combined;
     }
   }
-  ax_dict_set((AxDict *)obj.o, last, value);
+  if (obj.t == AX_ENTITY) ax_entity_set((AxEntity *)obj.o, last, value);
+  else if (obj.t == AX_DICT) ax_dict_set((AxDict *)obj.o, last, value);
+  else if (obj.t >= AX_VEC2) { if (!ax_engine_set_member(vm, obj, last, value)) {} }
+  else ax_release(value);
   ax_release(obj);
 }
 
@@ -844,6 +1015,7 @@ static int exec_stmt(AxVM *vm, AxNode *n, AxScope *scope, AxValue *out) {
       return AX_FLOW_NORMAL;
     }
     case N_ASSIGN: {
+      if (n->op == OP_OBSERVE) return ax_engine_exec(vm, n, scope, out);
       AxValue v = eval_node(vm, n->a, scope);
       if (n->op != OP_NONE) {
         AxValue cur = read_var(vm, scope, n->str);
@@ -881,15 +1053,19 @@ static int exec_stmt(AxVM *vm, AxNode *n, AxScope *scope, AxValue *out) {
       ax_release(v);
       return AX_FLOW_NORMAL;
     }
-    case N_MEMBER_ASSIGN: {
-      AxValue v = eval_node(vm, n->a, scope);
-      assign_member_path(vm, n, scope, v);
+    case N_MEMBER_ASSIGN:
+      assign_member_path(vm, n, scope);
       return AX_FLOW_NORMAL;
-    }
     case N_INDEX_ASSIGN: {
-      AxValue target = read_var(vm, scope, n->str);
       AxValue idx = eval_node(vm, n->a, scope);
       AxValue v = eval_node(vm, n->b, scope);
+      AxValue target = resolve_ident(vm, scope, n->str);
+      if (target.t == AX_HOST) {
+        int f = ax_engine_index_assign(vm, target, idx, v, n->op);
+        ax_release(idx);
+        ax_release(target);
+        return f;
+      }
       if (n->op != OP_NONE) {
         AxValue cur = ax_index_get(vm, target, idx);
         if (n->op == OP_COALESCE) {
@@ -921,15 +1097,19 @@ static int exec_stmt(AxVM *vm, AxNode *n, AxScope *scope, AxValue *out) {
       return AX_FLOW_NORMAL;
     }
     case N_IF: {
+      // A conditional opens no scope of its own (as in the reference): a name first assigned
+      // inside one is visible after it.
       AxValue c = eval_node(vm, n->a, scope);
       bool t = ax_truthy(c);
       ax_release(c);
-      AxScope *inner = ax_scope_new(scope, false);
-      int flow = AX_FLOW_NORMAL;
-      if (t) flow = exec_list(vm, n->list, n->nlist, inner, out);
-      else if (n->c) flow = exec_list(vm, n->c->list, n->c->nlist, inner, out);
-      ax_scope_release(inner);
-      return flow;
+      if (t && n->b) {                     // `?cond: guard` + indented body
+        AxValue g = eval_node(vm, n->b, scope);
+        t = ax_truthy(g);
+        ax_release(g);
+      }
+      if (t) return exec_list(vm, n->list, n->nlist, scope, out);
+      if (n->c) return exec_list(vm, n->c->list, n->c->nlist, scope, out);
+      return AX_FLOW_NORMAL;
     }
     case N_MATCH: {
       AxValue subject = eval_node(vm, n->a, scope);
@@ -965,11 +1145,16 @@ static int exec_stmt(AxVM *vm, AxNode *n, AxScope *scope, AxValue *out) {
     case N_WHILE: {
       bool fresh = body_creates_closure(n);
       AxScope *inner = ax_scope_new(scope, false);
+      long iters = 0;
       for (;;) {
         AxValue c = eval_node(vm, n->a, scope);
         bool t = ax_truthy(c);
         ax_release(c);
         if (!t) break;
+        if (vm->ctx.hot && ++iters > HOT_LOOP_LIMIT) {
+          ax_scope_release(inner);
+          ax_throw(vm, "AX-LOOP-002", "while loop exceeded %d iterations in a hot block", HOT_LOOP_LIMIT);
+        }
         if (fresh) { ax_scope_release(inner); inner = ax_scope_new(scope, false); }
         int flow = exec_list(vm, n->list, n->nlist, inner, out);
         if (flow == AX_FLOW_BREAK) break;
@@ -1010,6 +1195,11 @@ static int exec_stmt(AxVM *vm, AxNode *n, AxScope *scope, AxValue *out) {
       AxScope *inner = ax_scope_new(scope, false);
       int flow = AX_FLOW_NORMAL;
       for (uint32_t i = 0; i < seq->len; i++) {
+        if (vm->ctx.hot && i >= HOT_LOOP_LIMIT) {
+          ax_scope_release(inner);
+          ax_release(ax_arrv(seq));
+          ax_throw(vm, "AX-LOOP-002", "for loop exceeded %d iterations in a hot block", HOT_LOOP_LIMIT);
+        }
         if (fresh) { ax_scope_release(inner); inner = ax_scope_new(scope, false); }
         if (n->nnames == 1) {
           ax_scope_declare(inner, n->names[0], ax_copy(seq->items[i]));
@@ -1067,6 +1257,7 @@ static int exec_stmt(AxVM *vm, AxNode *n, AxScope *scope, AxValue *out) {
       if (vm->nhandlers >= AX_MAX_HANDLERS) ax_throw(vm, "AX-TRY", "too many nested ^try blocks");
       int hidx = vm->nhandlers++;
       int saved_depth = vm->call_depth;
+      AxCtx saved_ctx = vm->ctx;
       if (setjmp(vm->handlers[hidx]) == 0) {
         AxScope *inner = ax_scope_new(scope, false);
         flow = exec_list(vm, n->list, n->nlist, inner, out);
@@ -1076,6 +1267,7 @@ static int exec_stmt(AxVM *vm, AxNode *n, AxScope *scope, AxValue *out) {
         // An error unwound to here: the handler is already popped by the throw path's caller.
         vm->nhandlers = hidx;
         vm->call_depth = saved_depth;
+        vm->ctx = saved_ctx;
         if (n->c) {
           AxScope *cscope = ax_scope_new(scope, false);
           if (n->str) ax_scope_declare(cscope, n->str, ax_copy(vm->error));
@@ -1104,10 +1296,15 @@ static int exec_stmt(AxVM *vm, AxNode *n, AxScope *scope, AxValue *out) {
       AxValue v = eval_node(vm, n->a, scope);
       bool ok = ax_truthy(v);
       ax_release(v);
+      // In an entity block a failed `!!` is recorded, not raised (the reference's contract:
+      // a frame keeps running); in a script it is an error.
+      if (!ok && vm->ctx.entity) return AX_FLOW_NORMAL;
       if (!ok) ax_throw(vm, "AX-ASSERT", "assertion failed on line %d", n->line);
       return AX_FLOW_NORMAL;
     }
     case N_BLOCK: return exec_list(vm, n->list, n->nlist, scope, out);
+    case N_ACTION: case N_BROADCAST: case N_EMIT: case N_TRANSITION:
+      return ax_engine_exec(vm, n, scope, out);
     default: {
       AxValue v = eval_node(vm, n, scope);
       ax_release(v);
@@ -1122,16 +1319,16 @@ int ax_exec(AxVM *vm, AxNode *stmt, AxScope *scope, AxValue *out) { return exec_
 // Program
 // ---------------------------------------------------------------------------------------------
 
-bool ax_run_program(AxVM *vm, AxNode *program, AxArr *argv, AxValue *result) {
+// Declarations first, in one pass: functions and types are visible to each other regardless
+// of the order they appear in, which is what lets a program read top-down. Then globals, in
+// declaration order, so one may build on another.
+void ax_program_declare(AxVM *vm, AxNode *program) {
   init_names();
-  AxNode *main_decl = NULL;
-  // Declarations first, in one pass: functions and types are visible to each other regardless
-  // of the order they appear in, which is what lets a program read top-down.
   for (int i = 0; i < program->nlist; i++) {
     AxNode *d = program->list[i];
     if (d->kind == N_FN) {
       AxValue fn = make_closure(vm, d, vm->globals, false);
-      ax_scope_declare(vm->globals, d->str, fn);
+      ax_scope_declare(vm->builtins, d->str, fn);
     } else if (d->kind == N_TYPE) {
       AxArr *fields = ax_arr_new(d->nnames);
       for (int f = 0; f < d->nnames; f++) {
@@ -1139,11 +1336,10 @@ bool ax_run_program(AxVM *vm, AxNode *program, AxArr *argv, AxValue *result) {
         ax_arr_push(fields, ax_strv(d->names[f]));
       }
       ax_dict_set(vm->types, d->str, ax_arrv(fields));
-    } else if (d->kind == N_MAIN) {
-      main_decl = d;
     }
   }
-  // Globals, in declaration order, so one may build on another.
+  AxCtx saved = vm->ctx;
+  vm->ctx.in_fn = true;
   for (int i = 0; i < program->nlist; i++) {
     AxNode *d = program->list[i];
     if (d->kind != N_GLOBAL) continue;
@@ -1151,6 +1347,13 @@ bool ax_run_program(AxVM *vm, AxNode *program, AxArr *argv, AxValue *result) {
     for (int k = 0; k < d->nnames; k++) ax_scope_declare(vm->globals, d->names[k], ax_copy(v));
     ax_release(v);
   }
+  vm->ctx = saved;
+}
+
+bool ax_run_main(AxVM *vm, AxNode *program, AxArr *argv, AxValue *result) {
+  init_names();
+  AxNode *main_decl = NULL;
+  for (int i = 0; i < program->nlist; i++) if (program->list[i]->kind == N_MAIN) main_decl = program->list[i];
   if (!main_decl) {
     *result = ax_null();
     return false;
@@ -1162,18 +1365,32 @@ bool ax_run_program(AxVM *vm, AxNode *program, AxArr *argv, AxValue *result) {
   }
   ax_retain(ax_arrv(argv));
   ax_scope_declare(s, S_args, ax_arrv(argv));
+  AxCtx saved = vm->ctx;
+  vm->ctx.entity = NULL;
+  vm->ctx.in_fn = true;
+  vm->ctx.hot = false;
+  vm->ctx.dt = 0;
   AxValue ret = ax_null();
   int flow = exec_list(vm, main_decl->list, main_decl->nlist, s, &ret);
   (void)flow;
+  vm->ctx = saved;
   ax_scope_release(s);
   *result = ret;
   return true;
 }
 
+bool ax_run_program(AxVM *vm, AxNode *program, AxArr *argv, AxValue *result) {
+  ax_program_declare(vm, program);
+  return ax_run_main(vm, program, argv, result);
+}
+
 AxVM *ax_vm_new(void) {
   init_names();
   AxVM *vm = calloc(1, sizeof(AxVM));
-  vm->globals = ax_scope_new(NULL, true);
+  vm->builtins = ax_scope_new(NULL, true);
+  vm->builtins->builtin = true;
+  vm->globals = ax_scope_new(vm->builtins, true);
+  vm->ctx.in_fn = true;
   vm->types = ax_dict_new();
   vm->fns = ax_dict_new();
   vm->argv = ax_arr_new(0);
@@ -1193,5 +1410,6 @@ void ax_vm_free(AxVM *vm) {
   ax_release(ax_arrv(vm->allow_read));
   ax_release(ax_arrv(vm->allow_write));
   ax_scope_release(vm->globals);
+  ax_scope_release(vm->builtins);
   free(vm);
 }

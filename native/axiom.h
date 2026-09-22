@@ -2,11 +2,14 @@
 //
 // This is the native implementation of the AxiomScript *language*: the part a program is
 // written in (values, functions, closures, control flow, patterns, the standard library).
-// The engine half — entities, frame blocks, the rasterizer, navmesh, audio — still lives in
-// the JavaScript reference implementation; see native/README.md for the split and the reason.
+// It also hosts the engine: entities, frame blocks, physics, collisions, events, tweens and
+// queries (engine.c). See native/README.md for what is ported and how it is verified.
 //
 // Design notes that the rest of the code depends on:
 //
+//   * The engine half (entities, frame blocks, physics, events) lives in engine.c and shares
+//     this value model: vectors, quaternions, transforms and entities are ordinary refcounted
+//     heap values, so a Vec3 held in two places is one object, exactly as in the reference.
 //   * Values are 16 bytes: a tag plus a union. Numbers are doubles, as in the reference
 //     implementation, so arithmetic agrees bit for bit.
 //   * Heap objects are reference counted, with an object header shared by every type. The
@@ -49,6 +52,16 @@ typedef enum {
   AX_DICT,    // heap: AxDict
   AX_FN,      // heap: AxFn   (closure or native function)
   AX_RANGE,   // heap: AxRange
+  // engine values
+  AX_VEC2,    // heap: AxVec (x, y)
+  AX_VEC3,    // heap: AxVec (x, y, z)
+  AX_QUAT,    // heap: AxVec (x, y, z, w)
+  AX_MAT4,    // heap: AxMat4
+  AX_XFORM,   // heap: AxXform — a pose: pos, rot, scl, vel
+  AX_TIMER,   // heap: AxTimer — a field declared with a duration (`~cd: 0.5s`)
+  AX_SHAPE,   // heap: AxShape — a collider (sphere/box/capsule)
+  AX_ENTITY,  // heap: AxEntity
+  AX_HOST,    // heap: AxHost — pools, bounded vectors/maps, distributions
 } AxType;
 
 typedef struct AxObj AxObj;
@@ -127,6 +140,7 @@ struct AxFn {
   AxScope *scope;
   AxValue bound;            // optional captured first argument (partial application)
   bool has_bound;
+  struct AxEntity *entity;  // a lambda remembers the entity it was created in
 };
 
 struct AxRange {
@@ -186,6 +200,8 @@ bool ax_truthy(AxValue v);
 bool ax_equals(AxValue a, AxValue b);          // structural for arrays/dicts, identity otherwise
 int ax_compare(AxValue a, AxValue b);          // natural ordering (numbers numeric, else text)
 AxStr *ax_to_str(AxValue v);                   // the f-string rendering; returns +1
+void ax_fmt_num(double d, char *buf, size_t n); // JavaScript's Number#toString
+void ax_str_append(char **buf, size_t *len, size_t *cap, const char *s, size_t n);
 const char *ax_type_name(AxValue v);
 double ax_to_num(AxValue v);
 
@@ -210,6 +226,9 @@ typedef enum {
   T_NULLCOAL, T_ANDAND, T_OROR,
   T_GT, T_LT, T_GE, T_LE, T_EQEQ, T_NE, T_ASSIGN, T_PIPE, T_PIPEGT,
   T_BACKSLASH, T_FATARROW,
+  T_MIDDOT, T_CROSS,    // · (dot product)  × (cross product)
+  T_QMARKGT,            // ?>  (raycast)
+  T_TILDEEQ,            // ~=  (observe into a distribution)
 } AxTokType;
 
 typedef struct {
@@ -249,6 +268,24 @@ typedef enum {
   N_TRY, N_THROW, N_ASSERT, N_BLOCK,
   // declarations
   N_FN, N_MAIN, N_TYPE, N_GLOBAL, N_USE, N_PROGRAM,
+  // engine: expressions
+  N_TAGREF,      // #Tag.a.b            names = path
+  N_QUERY,       // ?name(args)         str = name, a = receiver or NULL, list = args
+  N_INFER,       // dist ~> op          a = dist, str = op
+  // engine: statements
+  N_ACTION,      // !name(args)         str = name, list = args
+  N_BROADCAST,   // ^Ev(args) to/within str = event, list = args, op = mode, str2 = target, a = radius, b = origin
+  N_EMIT,        // ^emit a.b(args)     names = path, list = args
+  N_TRANSITION,  // s -> t(args) if g   str = subject, list = clauses (str = target, list = args, a = guard)
+  // engine: declarations
+  N_ENTITY,      // @Name               str = name, str2 = base, names = mixins, a = initial pose, list = members
+  N_FIELD,       // ~name: value        str = name, a = value, op = 0 '~' / 1 '$', b = pool type; $: a = shape, b = prior, c = infer
+  N_EBLOCK,      // &name(freq|Event):  str = name, num = freq, str2 = event, list = body
+  N_EVENT,       // ^event Name: f, g?  str = name, list = fields (N_IDENT, flag = optional)
+  N_MIXIN,       // ^mix Name: members  str = name, list = members
+  N_MATERIAL,    // ^mat Name: k: v     str = name, list = pairs
+  N_RESOURCE,    // #Kind Name: "path"  str = kind, str2 = name, a = path (N_STR) or NULL, b = inline base64 (N_STR)
+  N_POOLTYPE,    // &Pool(T, n)         str = Pool/Vec/Map, str2 = element (or key) type, names[0] = value type, num = capacity
 } AxNodeKind;
 
 typedef struct AxArm AxArm;
@@ -259,6 +296,7 @@ struct AxNode {
   int line, col;
   double num;
   AxStr *str;          // identifier / literal / field name (interned where it is a name)
+  AxStr *str2;         // a second name (entity base, event argument, broadcast target, …)
   AxNode *a, *b, *c;   // operands / subject / condition …
   AxNode **list;       // children (statements, elements, arguments)
   int nlist;
@@ -283,6 +321,8 @@ enum {
   OP_NONE = 0, OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_MOD, OP_POW,
   OP_GT, OP_LT, OP_GE, OP_LE, OP_EQ, OP_NE,
   OP_AND, OP_OR, OP_COALESCE, OP_IN, OP_RANGE, OP_NOT, OP_NEG,
+  OP_DOT, OP_CROSS, OP_RAY,   // ·  ×  ?>
+  OP_OBSERVE,                 // ~=  (statement-level, distributions)
 };
 
 typedef struct {
@@ -302,6 +342,7 @@ void ax_ast_free_all(void);   // frees the whole AST arena
 struct AxScope {
   AxObj hdr;
   AxScope *parent;
+  bool builtin;         // the library frame: readable, never assigned through
   // Small open-addressed map keyed by interned name pointers.
   AxStr **keys;
   AxValue *vals;
@@ -318,8 +359,24 @@ void ax_scope_declare(AxScope *s, AxStr *name, AxValue v);
 
 #define AX_MAX_HANDLERS 64
 
+struct AxEntity;
+struct AxWorld;
+
+// What the evaluator is currently running on behalf of: an entity's frame block, a function
+// called from one, or a script. It decides how a bare name resolves and where an assignment
+// lands, which is the one place the engine and the language meet.
+typedef struct {
+  struct AxEntity *entity;   // the running entity, or NULL in a script
+  double dt;                 // the block's timestep (0 outside a block)
+  AxDict *payload;           // the event being handled by an &on block, or NULL
+  AxStr *block;              // "physics", "tick", "on", "render", or NULL
+  bool in_fn;                // inside a function body (assignments default to locals)
+  bool hot;                  // inside a frame block (loops are budgeted)
+} AxCtx;
+
 struct AxVM {
-  AxScope *globals;
+  AxScope *builtins;    // the standard library and declared functions (read-only frame)
+  AxScope *globals;     // program globals (`~NAME: v`), a child of builtins
   AxDict *types;        // ^type name → array of field names
   AxDict *fns;          // ^fn/^proc name → AX_FN value
   AxArr *argv;          // program arguments
@@ -338,6 +395,9 @@ struct AxVM {
   uint32_t rng_state;
   int call_depth;
   const char *source_path;
+  // engine
+  AxCtx ctx;
+  struct AxWorld *world;   // NULL until a program with entities is loaded
 };
 
 AxVM *ax_vm_new(void);
@@ -353,6 +413,8 @@ AxValue ax_eval(AxVM *vm, AxNode *n, AxScope *scope);              // returns +1
 int ax_exec(AxVM *vm, AxNode *stmt, AxScope *scope, AxValue *out); // returns AX_FLOW_*
 AxValue ax_call(AxVM *vm, AxValue fn, AxValue *args, int argc);    // returns +1
 bool ax_run_program(AxVM *vm, AxNode *program, AxArr *argv, AxValue *result);
+void ax_program_declare(AxVM *vm, AxNode *program);   // functions, types, globals
+bool ax_run_main(AxVM *vm, AxNode *program, AxArr *argv, AxValue *result);
 
 enum { AX_FLOW_NORMAL = 0, AX_FLOW_BREAK, AX_FLOW_CONTINUE, AX_FLOW_RETURN };
 
@@ -362,5 +424,86 @@ AxValue ax_index_get(AxVM *vm, AxValue obj, AxValue idx);
 AxArr *ax_to_seq(AxVM *vm, AxValue v);   // array view of any iterable; returns +1
 AxValue ax_key_apply(AxVM *vm, AxValue sel, AxValue item, double index);
 bool ax_is_callable(AxValue v);
+AxValue ax_binary_op(AxVM *vm, int op, AxValue l, AxValue r);
+AxValue ax_member_get(AxVM *vm, AxValue obj, AxStr *prop);
+void ax_json_write(AxValue v, int indent, char **out);   // JSON.stringify-compatible; *out is malloc'd
+
+// ============================================================================================
+// Engine values
+// ============================================================================================
+
+typedef struct { AxObj hdr; double x, y, z, w; } AxVec;           // AX_VEC2 / AX_VEC3 / AX_QUAT
+typedef struct { AxObj hdr; double d[16]; } AxMat4;               // column-major, as the reference
+typedef struct AxXform {
+  AxObj hdr;
+  AxValue pos, rot, scl, vel;      // usually Vec3/Quat/Vec3/Vec3 — assignable, so any value
+  struct AxEntity *entity;         // the entity whose pose this is (weak), for parenting
+} AxXform;
+typedef struct { AxObj hdr; double remaining, total; char unit[4]; } AxTimer;
+typedef struct { AxObj hdr; AxStr *kind; AxValue params[2]; int nparams; } AxShape;
+
+// Host objects the engine owns whose behaviour lives in engine.c (pools, bounded containers,
+// distributions). `kind` selects the implementation; `free` releases the payload.
+typedef struct AxHost {
+  AxObj hdr;
+  int kind;
+  void *data;
+  void (*free)(struct AxHost *);
+} AxHost;
+
+typedef struct AxEntity {
+  AxObj hdr;
+  AxStr *name;           // decl name; a spawned copy is `Name_N`
+  AxStr *base;           // `&Base`, or NULL
+  AxNode **members;      // composed members (mixins first, then the entity's own)
+  int nmembers;
+  AxDict *fields;        // declared `~fields`, in declaration order
+  AxDict *locals;        // everything else assigned in a block (and `pose`)
+  bool nosave, pending_remove;
+  struct AxWorld *world;
+} AxEntity;
+
+AxValue ax_vec2(double x, double y);
+AxValue ax_vec3(double x, double y, double z);
+AxValue ax_quat(double x, double y, double z, double w);
+AxValue ax_mat4_new(const double *d);        // NULL → zeros
+AxValue ax_xform_new(void);                  // identity pose
+AxValue ax_timer_new(double remaining, const char *unit);
+static inline AxVec *ax_vecp(AxValue v) { return (AxVec *)v.o; }
+static inline bool ax_is_vec(AxValue v) { return v.t == AX_VEC2 || v.t == AX_VEC3; }
+
+// engine.c
+void ax_engine_install(AxVM *vm);                          // engine intrinsics (v3, sphere, …)
+bool ax_engine_load(AxVM *vm, AxNode *program, const char *source);   // true if it declares entities
+void ax_engine_update(AxVM *vm, double dt);
+int  ax_engine_entity_count(AxVM *vm);
+void ax_engine_summary(AxVM *vm, FILE *out);               // "N entities (A, B)"
+void ax_engine_print_json(AxVM *vm, int frames, FILE *out);
+int  ax_engine_diag_count(AxVM *vm);
+void ax_engine_print_diags(AxVM *vm, FILE *out);
+void ax_engine_log(AxVM *vm, const char *msg);             // print()/!log land here as well
+bool ax_engine_log_msg(AxVM *vm, AxStr *msg);              // true → the console copy is suppressed
+void ax_engine_quiet(AxVM *vm, bool quiet);                // --json: keep stdout for the JSON
+void ax_engine_print_log_json(AxVM *vm, FILE *out, int depth);
+AxArr *ax_host_seq(AxValue v);                             // iteration order of a container
+double ax_host_len(AxValue v);
+bool ax_host_contains(AxVM *vm, AxValue hay, AxValue needle);
+AxValue ax_host_index(AxVM *vm, AxValue obj, AxValue idx);
+void ax_engine_set_input(AxVM *vm, double mx, double my, bool jump);
+
+// Hooks the interpreter calls when it meets an engine construct.
+AxValue ax_engine_eval(AxVM *vm, AxNode *n, AxScope *scope);            // N_TAGREF, N_QUERY, N_INFER
+int  ax_engine_exec(AxVM *vm, AxNode *n, AxScope *scope, AxValue *out); // N_ACTION, N_BROADCAST, …
+bool ax_engine_binary(AxVM *vm, int op, AxValue l, AxValue r, AxValue *out);  // vector arithmetic
+bool ax_engine_member(AxVM *vm, AxValue obj, AxStr *prop, AxValue *out);
+bool ax_engine_method(AxVM *vm, AxValue obj, AxStr *name, AxValue *args, int argc, AxValue *out);
+bool ax_engine_set_member(AxVM *vm, AxValue obj, AxStr *prop, AxValue v);   // takes v
+bool ax_entity_get(AxEntity *e, AxStr *name, AxValue *out);                 // out is +1
+void ax_entity_set(AxEntity *e, AxStr *name, AxValue v);                    // takes v
+void ax_render_engine(AxValue v, char **buf, size_t *len, size_t *cap);     // f-string form
+AxValue ax_engine_input(AxVM *vm);                                          // the `input` record
+AxValue ax_engine_resolve_tag(AxVM *vm, AxStr *tag);                        // live entity or null
+int ax_engine_index_assign(AxVM *vm, AxValue target, AxValue idx, AxValue v, int op);  // takes v
+void ax_host_free(AxHost *h);
 
 #endif // AXIOM_H

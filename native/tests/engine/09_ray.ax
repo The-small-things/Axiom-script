@@ -1,0 +1,14 @@
+@Target at v3(0, 0, 5)
+  ~hit: sphere(1)
+
+@Block at v3(4, 0, 0)
+  ~hit: box(v3(2, 2, 2))
+
+@Eye
+  ~a: null
+  ~b: null
+  ~c: null
+  &tick(1hz):
+    a = v3(0, 0, 0) ?> v3(0, 0, 1) * 20
+    b = v3(0, 0, 0) ?> v3(1, 0, 0) * 20
+    c = v3(0, 0, 0) ?> v3(0, 1, 0) * 20

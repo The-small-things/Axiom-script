@@ -1,0 +1,31 @@
+// Bodies under gravity, drag, the ground plane, and pairwise collision response.
+@Ball &Body3D at v3(0, 5, 0)
+  ~mass: 2
+  ~drag: 0.1
+  ~hit: sphere(0.5)
+  ~bounces: 0
+  &on(Collide):
+    bounces += 1
+    !log(f"ball hit {other} depth>0: {depth > 0}")
+
+@Crate &Body3D at v3(0.6, 9, 0)
+  ~mass: 1
+  ~hit: box(v3(1, 1, 1))
+  ~touched: false
+  &on(Collide):
+    touched = true
+
+@Wall at v3(3, 0.5, 0)
+  ~hit: box(v3(1, 2, 4))
+
+@Pill &Body3D at v3(2.2, 3, 0.2)
+  ~hit: capsule(0.3, 1.2)
+  &physics:
+    ?pose.pos.y < 0.5:
+      !impulse(v3(0.5, 2, 0))
+
+@Pusher &Body3D at v3(-3, 0, 0)
+  ~hit: sphere(0.4)
+  ~mass: 3
+  &physics:
+    !force(v3(4, 0, 0))

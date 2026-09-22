@@ -1,0 +1,22 @@
+^type Bullet: pos, vel
+
+@Gun
+  ~bullets: &Pool(Bullet, 4)
+  ~hist: &Vec(num, 3)
+  ~counts: &Map(str, num, 2)
+  ~fired: 0
+  ~live: 0
+  ~sum: 0
+  ~keys: []
+  &tick(5hz):
+    !spawn(bullets, Bullet(v3(fired, 0, 0), v3(1, 0, 0)))
+    fired += 1
+    hist.push(fired)
+    counts.inc("a")
+    counts.set("b", fired)
+    counts.set("c", 1)
+    live = len(bullets)
+    sum = 0
+    *b in bullets:
+      sum += b.pos.x
+    keys = [k for k in counts]
