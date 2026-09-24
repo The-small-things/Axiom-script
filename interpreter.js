@@ -1126,103 +1126,234 @@ function refreshCapsuleAxis(cap, pose) {
   cap.axisB = new Vec3(pose.pos.x - axisY.x * half, pose.pos.y - axisY.y * half, pose.pos.z - axisY.z * half);
 }
 
+// v0.9.3: the collision pass, with a broadphase that changes nothing but the speed.
+//
+// The pass tests every pair (i < j) in order, and a hit moves bodies before the next pair is
+// tested, so later pairs see earlier pushes. With GRID_MIN or more bodies, only pairs whose
+// bounding boxes touch are tested — and the result is identical, pair for pair:
+//
+//   * every narrowphase test (sphere, box, capsule, all combinations) reports no hit when the
+//     two boxes (centre ± |extent|, a capsule as its segment ± |r|) are apart, so skipping such a
+//     pair changes nothing. Boxes are widened by a relative 1e-9 against rounding;
+//   * NaN compares false, so a body with a non-finite coordinate or extent "hits" everything —
+//     such bodies (and very large ones) are tested against every other body;
+//   * row i's candidates come from the grid as it stands; a hit that moves body i re-gathers
+//     the rest of the row from its new box, and every body a hit moves is re-filed. Nothing
+//     else moves during the pass (no program code runs in it).
+//
+// native/engine.c implements the same pass; difftest.sh runs a 120-body crowd on both.
+const GRID_MIN = 24;
+const GRID_SPAN = 16;        // a box wider than this many cells on an axis is tested against all
+const GRID_LIMIT = 30000;    // cell coordinates stay inside the packed numeric key
+
+// Test and resolve one pair (the body of the reference's double loop). Returns which bodies
+// moved: 1 = A, 2 = B.
+function collidePair(A, B, collisionEvents) {
+  // v0.8.8: collision layer/mask filtering. Each entity has an optional `collision_layer`
+  // (a bitfield identifying which layer(s) it belongs to) and `collision_mask` (a bitfield
+  // identifying which layers it COLLIDES with). Default: layer=0 (unset), mask=0xFFFFFFFF
+  // (collide with everything). A pair collides iff:
+  //   (A.mask & B.layer) !== 0  AND  (B.mask & A.layer) !== 0
+  // An entity with NO collision_layer (layer=0) is "unfiltered" — it collides with everything
+  // regardless of the other entity's mask.
+  if (A.layer !== 0 && B.layer !== 0) {
+    if ((A.mask & B.layer) === 0 || (B.mask & A.layer) === 0) return 0;
+  }
+  const poseA = A.pose, poseB = B.pose;
+  // Update collider centers from current pose (cheap, avoids rebuild).
+  A.collider.center = poseA.pos;
+  B.collider.center = poseB.pos;
+  // v0.8.1: capsules also need their axis segment refreshed (rot may have changed).
+  if (A.collider.kind === 'capsule') refreshCapsuleAxis(A.collider, poseA);
+  if (B.collider.kind === 'capsule') refreshCapsuleAxis(B.collider, poseB);
+  const mtv = testColliders(A.collider, B.collider);
+  if (!mtv) return 0;
+  // Push apart: each entity moves by half the MTV along the collision normal.
+  const push = mtv.normal.mulScalar(mtv.depth / 2);
+  // Only push bodies that are dynamic (have a mass field — Body3D).
+  const dynA = A.dyn, dynB = B.dyn;
+  if (dynA && dynB) {
+    poseA.pos = poseA.pos.add(push);
+    poseB.pos = poseB.pos.sub(push);
+  } else if (dynA) {
+    poseA.pos = poseA.pos.add(push.mulScalar(2));
+  } else if (dynB) {
+    poseB.pos = poseB.pos.sub(push.mulScalar(2));
+  }
+  // Simple impulse: cancel relative velocity along collision normal.
+  if (dynA && dynB) {
+    const relV = poseA.vel.sub(poseB.vel);
+    const vn = relV.x * mtv.normal.x + relV.y * mtv.normal.y + relV.z * mtv.normal.z;
+    if (vn < 0) {
+      const mA = A.entity.fields.get('mass') || 1;
+      const mB = B.entity.fields.get('mass') || 1;
+      const impulse = (2 * vn) / (1/mA + 1/mB);
+      poseA.vel = poseA.vel.sub(mtv.normal.mulScalar(impulse / mA));
+      poseB.vel = poseB.vel.add(mtv.normal.mulScalar(impulse / mB));
+    }
+  } else if (dynA) {
+    const vn = poseA.vel.x * mtv.normal.x + poseA.vel.y * mtv.normal.y + poseA.vel.z * mtv.normal.z;
+    if (vn < 0) poseA.vel = poseA.vel.sub(mtv.normal.mulScalar(2 * vn));
+  } else if (dynB) {
+    const vn = poseB.vel.x * (-mtv.normal.x) + poseB.vel.y * (-mtv.normal.y) + poseB.vel.z * (-mtv.normal.z);
+    if (vn < 0) poseB.vel = poseB.vel.sub(mtv.normal.mulScalar(-2 * vn));
+  }
+  // v0.8.2: queue a Collide event for BOTH entities. The payload carries `other` (the
+  // other entity's tag name, accessible as `other` in the event handler), `normal` (the
+  // MTV normal pointing from B → A), and `depth` (overlap distance in world units).
+  // Each entity sees the event with `other` set to its counterpart, so a single
+  // `&on(Collide):` block on either entity fires once per contact per physics step.
+  const nameA = A.entity._tagName || A.entity.decl.name;
+  const nameB = B.entity._tagName || B.entity.decl.name;
+  collisionEvents.push({
+    toEntity: A.entity, payload: { other: nameB, other_entity: B.entity, normal: mtv.normal, depth: mtv.depth },
+  });
+  collisionEvents.push({
+    toEntity: B.entity, payload: { other: nameA, other_entity: A.entity, normal: new Vec3(-mtv.normal.x, -mtv.normal.y, -mtv.normal.z), depth: mtv.depth },
+  });
+  return (dynA ? 1 : 0) | (dynB ? 2 : 0);
+}
+
+// A body's current bounding box, widened: [loX, loY, loZ, hiX, hiY, hiZ], or null when any
+// bound is not finite.
+function bodyBox(b) {
+  const pose = b.pose, p = pose.pos, c = b.collider;
+  let box;
+  if (c.kind === 'capsule') {
+    const axisY = pose.rot ? pose.rot.rotateVec(new Vec3(0, 1, 0)) : new Vec3(0, 1, 0);
+    const half = c.h / 2, r = Math.abs(c.r);
+    const ax = p.x + axisY.x * half, ay = p.y + axisY.y * half, az = p.z + axisY.z * half;
+    const bx = p.x - axisY.x * half, by = p.y - axisY.y * half, bz = p.z - axisY.z * half;
+    box = [Math.min(ax, bx) - r, Math.min(ay, by) - r, Math.min(az, bz) - r, Math.max(ax, bx) + r, Math.max(ay, by) + r, Math.max(az, bz) + r];
+  } else {
+    const ex = c.kind === 'sphere' ? Math.abs(c.r) : Math.abs(c.half.x);
+    const ey = c.kind === 'sphere' ? Math.abs(c.r) : Math.abs(c.half.y);
+    const ez = c.kind === 'sphere' ? Math.abs(c.r) : Math.abs(c.half.z);
+    box = [p.x - ex, p.y - ey, p.z - ez, p.x + ex, p.y + ey, p.z + ez];
+  }
+  for (let k = 0; k < 3; k++) {
+    if (!Number.isFinite(box[k]) || !Number.isFinite(box[k + 3])) return null;
+    const m = (Math.abs(box[k]) + Math.abs(box[k + 3])) * 1e-9 + 1e-9;
+    box[k] -= m;
+    box[k + 3] += m;
+  }
+  return box;
+}
+
+class CollisionGrid {
+  constructor(bodies, cell) {
+    this.bodies = bodies;
+    this.inv = 1 / cell;
+    this.cells = new Map();                       // packed cell coordinate → body ids
+    this.range = new Array(bodies.length);        // the cells each body is filed under
+    this.state = new Uint8Array(bodies.length);   // 0 not filed, 1 in cells, 2 in `all`
+    this.all = new Set();                         // tested against everyone
+    this.stamp = new Int32Array(bodies.length);
+    this.qid = 0;
+  }
+  cellsOf(box) {
+    if (!box) return null;
+    const r = new Array(6);
+    for (let k = 0; k < 3; k++) {
+      const a = Math.floor(box[k] * this.inv), b = Math.floor(box[k + 3] * this.inv);
+      if (a < -GRID_LIMIT || b > GRID_LIMIT || b - a >= GRID_SPAN) return null;
+      r[k] = a; r[k + 3] = b;
+    }
+    return r;
+  }
+  static key(x, y, z) { return ((x + 32768) * 65536 + (y + 32768)) * 65536 + (z + 32768); }
+  file(id) {
+    const r = this.cellsOf(bodyBox(this.bodies[id]));
+    if (!r) { this.all.add(id); this.state[id] = 2; return; }
+    this.range[id] = r;
+    for (let x = r[0]; x <= r[3]; x++) for (let y = r[1]; y <= r[4]; y++) for (let z = r[2]; z <= r[5]; z++) {
+      const k = CollisionGrid.key(x, y, z);
+      const list = this.cells.get(k);
+      if (list) list.push(id); else this.cells.set(k, [id]);
+    }
+    this.state[id] = 1;
+  }
+  remove(id) {
+    if (this.state[id] === 1) {
+      const r = this.range[id];
+      for (let x = r[0]; x <= r[3]; x++) for (let y = r[1]; y <= r[4]; y++) for (let z = r[2]; z <= r[5]; z++) {
+        const list = this.cells.get(CollisionGrid.key(x, y, z));
+        if (!list) continue;
+        const at = list.indexOf(id);
+        if (at >= 0) { list[at] = list[list.length - 1]; list.pop(); }
+      }
+    } else if (this.state[id] === 2) this.all.delete(id);
+    this.state[id] = 0;
+  }
+  // The bodies j > after that row i must test, ascending.
+  gather(i, after) {
+    const r = this.cellsOf(bodyBox(this.bodies[i]));
+    const out = [];
+    if (!r) { for (let j = after + 1; j < this.bodies.length; j++) out.push(j); return out; }
+    const q = ++this.qid;
+    for (let x = r[0]; x <= r[3]; x++) for (let y = r[1]; y <= r[4]; y++) for (let z = r[2]; z <= r[5]; z++) {
+      const list = this.cells.get(CollisionGrid.key(x, y, z));
+      if (!list) continue;
+      for (const j of list) if (j > after && this.stamp[j] !== q) { this.stamp[j] = q; out.push(j); }
+    }
+    for (const j of this.all) if (j > after && this.stamp[j] !== q) { this.stamp[j] = q; out.push(j); }
+    return out.sort((a, b) => a - b);
+  }
+}
+
+function collideWithGrid(bodies, collisionEvents) {
+  // Cell size: 1.5 × the median box size, so a typical body is filed under a few cells.
+  const sizes = [];
+  for (const b of bodies) {
+    const box = bodyBox(b);
+    if (box) sizes.push(Math.max(box[3] - box[0], box[4] - box[1], box[5] - box[2]));
+  }
+  sizes.sort((a, b) => a - b);
+  let cell = sizes.length ? sizes[sizes.length >> 1] * 1.5 : 1;
+  if (!(cell > 1e-6) || !Number.isFinite(cell)) cell = 1;
+  const grid = new CollisionGrid(bodies, cell);
+  for (let i = 0; i < bodies.length; i++) grid.file(i);
+  for (let i = 0; i < bodies.length; i++) {
+    grid.remove(i);                        // later rows only look at bodies after them
+    let after = i;
+    for (;;) {
+      const cand = grid.gather(i, after);
+      let again = false;
+      for (let m = 0; m < cand.length; m++) {
+        const j = cand[m];
+        const moved = collidePair(bodies[i], bodies[j], collisionEvents);
+        if (moved & 2) { grid.remove(j); grid.file(j); }
+        if (moved & 1) { after = j; again = true; break; }
+      }
+      if (!again) break;
+    }
+  }
+}
+
 function stepCollisions(world) {
-  // Collect all entities with colliders.
+  // Collect all entities with colliders. Layer, mask and kind cannot change during the pass
+  // (no program code runs in it), so they are read once per body rather than once per pair.
   const bodies = [];
   for (const e of world.entities) {
     if (e._pendingRemove) continue; // v0.8.12: skip despawned entities in collision
     const c = colliderWorld(e);
-    if (c) bodies.push({ entity: e, collider: c });
+    if (!c) continue;
+    const maskRaw = e.fields.get('collision_mask');
+    bodies.push({
+      entity: e, collider: c, pose: e.locals.get('pose'),
+      layer: e.fields.get('collision_layer') || 0,
+      mask: maskRaw !== undefined ? maskRaw : 0xFFFFFFFF,
+      dyn: e.decl.base === 'Body3D',
+    });
   }
-  // v0.8.2: collect collision events for delivery AFTER the pairwise pass. Each pair that
-  // produces a nonzero MTV queues a `Collide` event to BOTH entities (so each can react via
-  // `&on(Collide):`). The payload includes `other` (the other entity's tag name), `normal`,
-  // and `depth`. Delivery happens via world.deliverBroadcast so it flows through the same
-  // `&on(Event)` mechanism as `^Hit`. We defer delivery until after the full pairwise pass so
-  // user code in `&on(Collide)` sees the post-push-apart positions (not mid-resolution state).
+  // v0.8.2: collect collision events for delivery AFTER the pairwise pass, so user code in
+  // `&on(Collide):` sees the post-push-apart positions (not mid-resolution state).
   const collisionEvents = [];
-  // Pairwise test (O(n²); fine for the reference's small entity counts).
-  for (let i = 0; i < bodies.length; i++) {
-    for (let j = i + 1; j < bodies.length; j++) {
-      const A = bodies[i], B = bodies[j];
-      // v0.8.8: collision layer/mask filtering. Each entity has an optional `collision_layer`
-      // (a bitfield identifying which layer(s) it belongs to) and `collision_mask` (a bitfield
-      // identifying which layers it COLLIDES with). Default: layer=0 (unset), mask=0xFFFFFFFF
-      // (collide with everything). A pair collides iff:
-      //   (A.mask & B.layer) !== 0  AND  (B.mask & A.layer) !== 0
-      // (both directions must accept the other). This is the standard Unity/Unreal model.
-      //
-      // IMPORTANT: when an entity has NO collision_layer set (layer=0), it's treated as
-      // "unfiltered" — it collides with everything regardless of the other entity's mask. This
-      // preserves backward compat: existing entities without layer/mask fields collide exactly
-      // as before. Only entities that EXPLICITLY set a non-zero collision_layer participate in
-      // the bitfield filtering.
-      // v0.8.9: cache field reads to avoid double Map lookups per entity per pair.
-      const aLayer = A.entity.fields.get('collision_layer') || 0;
-      const aMaskRaw = A.entity.fields.get('collision_mask');
-      const aMask = aMaskRaw !== undefined ? aMaskRaw : 0xFFFFFFFF;
-      const bLayer = B.entity.fields.get('collision_layer') || 0;
-      const bMaskRaw = B.entity.fields.get('collision_mask');
-      const bMask = bMaskRaw !== undefined ? bMaskRaw : 0xFFFFFFFF;
-      // If EITHER entity has no layer (unfiltered), skip the bitfield check entirely.
-      if (aLayer !== 0 && bLayer !== 0) {
-        if ((aMask & bLayer) === 0 || (bMask & aLayer) === 0) continue;
-      }
-      // Update collider centers from current pose (cheap, avoids rebuild).
-      A.collider.center = A.entity.locals.get('pose').pos;
-      B.collider.center = B.entity.locals.get('pose').pos;
-      // v0.8.1: capsules also need their axis segment refreshed (rot may have changed).
-      if (A.collider.kind === 'capsule') refreshCapsuleAxis(A.collider, A.entity.locals.get('pose'));
-      if (B.collider.kind === 'capsule') refreshCapsuleAxis(B.collider, B.entity.locals.get('pose'));
-      const mtv = testColliders(A.collider, B.collider);
-      if (!mtv) continue;
-      // Push apart: each entity moves by half the MTV along the collision normal.
-      const push = mtv.normal.mulScalar(mtv.depth / 2);
-      const poseA = A.entity.locals.get('pose');
-      const poseB = B.entity.locals.get('pose');
-      // Only push bodies that are dynamic (have a mass field — Body3D).
-      const dynA = A.entity.decl.base === 'Body3D';
-      const dynB = B.entity.decl.base === 'Body3D';
-      if (dynA && dynB) {
-        poseA.pos = poseA.pos.add(push);
-        poseB.pos = poseB.pos.sub(push);
-      } else if (dynA) {
-        poseA.pos = poseA.pos.add(push.mulScalar(2));
-      } else if (dynB) {
-        poseB.pos = poseB.pos.sub(push.mulScalar(2));
-      }
-      // Simple impulse: cancel relative velocity along collision normal.
-      if (dynA && dynB) {
-        const relV = poseA.vel.sub(poseB.vel);
-        const vn = relV.x * mtv.normal.x + relV.y * mtv.normal.y + relV.z * mtv.normal.z;
-        if (vn < 0) {
-          const mA = A.entity.fields.get('mass') || 1;
-          const mB = B.entity.fields.get('mass') || 1;
-          const impulse = (2 * vn) / (1/mA + 1/mB);
-          poseA.vel = poseA.vel.sub(mtv.normal.mulScalar(impulse / mA));
-          poseB.vel = poseB.vel.add(mtv.normal.mulScalar(impulse / mB));
-        }
-      } else if (dynA) {
-        const vn = poseA.vel.x * mtv.normal.x + poseA.vel.y * mtv.normal.y + poseA.vel.z * mtv.normal.z;
-        if (vn < 0) poseA.vel = poseA.vel.sub(mtv.normal.mulScalar(2 * vn));
-      } else if (dynB) {
-        const vn = poseB.vel.x * (-mtv.normal.x) + poseB.vel.y * (-mtv.normal.y) + poseB.vel.z * (-mtv.normal.z);
-        if (vn < 0) poseB.vel = poseB.vel.sub(mtv.normal.mulScalar(-2 * vn));
-      }
-      // v0.8.2: queue a Collide event for BOTH entities. The payload carries `other` (the
-      // other entity's tag name, accessible as `other` in the event handler), `normal` (the
-      // MTV normal pointing from B → A), and `depth` (overlap distance in world units).
-      // Each entity sees the event with `other` set to its counterpart, so a single
-      // `&on(Collide):` block on either entity fires once per contact per physics step.
-      const nameA = A.entity._tagName || A.entity.decl.name;
-      const nameB = B.entity._tagName || B.entity.decl.name;
-      collisionEvents.push({
-        toEntity: A.entity, payload: { other: nameB, other_entity: B.entity, normal: mtv.normal, depth: mtv.depth },
-      });
-      collisionEvents.push({
-        toEntity: B.entity, payload: { other: nameA, other_entity: A.entity, normal: new Vec3(-mtv.normal.x, -mtv.normal.y, -mtv.normal.z), depth: mtv.depth },
-      });
-    }
+  const mode = process.env.AXIOM_BROADPHASE;
+  if (mode === 'grid' || (mode !== 'pairs' && bodies.length >= GRID_MIN)) collideWithGrid(bodies, collisionEvents);
+  else {
+    for (let i = 0; i < bodies.length; i++)
+      for (let j = i + 1; j < bodies.length; j++) collidePair(bodies[i], bodies[j], collisionEvents);
   }
   // v0.8.2: deliver collision events. We dispatch directly to the specific entity's &on(Collide)
   // blocks (not a global broadcast) so only the two touching entities react. This matches the

@@ -30,6 +30,24 @@ its last press — auto-repeat keeps it held — and jump and fire are taps. Bef
 terminal showed 60 frames of a simulation nobody could steer. `--input` scripts gain `F` for
 fire.
 
+### Collisions: a broadphase that changes nothing but the speed
+
+The collision pass tested every pair of bodies. With 24 or more bodies, both runtimes now keep
+a uniform grid and test only pairs whose bounding boxes touch — and the result is identical,
+pair for pair, push for push, to the all-pairs pass, because: every narrowphase test reports
+no hit for boxes that are apart; a body whose box is not finite (NaN compares false, so it
+"hits" everything) or very large is tested against all; and a hit that moves the body of the
+current row re-gathers the rest of the row, while every moved body is re-filed. Layer and mask
+fields are read once per body instead of once per pair.
+
+| 400 bodies, 600 frames | before | after |
+|---|---|---|
+| `node main.js` | 7.2 s | 1.1 s |
+| `native/axiom` | 3.8 s | 0.43 s |
+
+The new JavaScript pass is byte-identical to the old one on the 120- and 400-body crowds, and
+`AXIOM_BROADPHASE=pairs|grid` forces either path for testing.
+
 ### Faults and `exit()` in machine-readable output
 
 - `--json` for a script now always prints its object — also when `^main` faults (with the

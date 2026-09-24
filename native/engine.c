@@ -1858,77 +1858,311 @@ static AxDict *collide_payload(AxEntity *other, V3 normal, double depth) {
   return p;
 }
 
+// ---- collisions ------------------------------------------------------------------------------
+//
+// The reference tests every pair (i < j) in order, and a hit moves bodies before the next pair is
+// tested, so later pairs see earlier pushes. The broadphase below reproduces that pass exactly
+// — the same pairs hit, in the same order, with the same arithmetic — while testing only pairs
+// whose bounding boxes touch:
+//
+//   * every narrowphase test (sphere, box, capsule, all combinations) reports "no hit" when the
+//     two bounding boxes (centre ± |extent|, capsules as their segment ± |r|) are apart, so
+//     skipping such a pair changes nothing. Boxes are widened by a relative 1e-9 so rounding in
+//     the narrowphase cannot hit a pair the box test skipped;
+//   * NaN compares false, so a body with a non-finite coordinate or extent "hits" everything —
+//     those bodies (and very large ones) are tested against every other body;
+//   * row i's candidates are gathered from the grid as it stands; a hit that moves body i
+//     re-gathers the rest of the row from i's new box, and every body a hit moves is re-filed.
+//     Nothing else moves during the pass (no program code runs in it).
+//
+// Below GRID_MIN bodies the plain double loop is used. AXIOM_BROADPHASE=grid|pairs forces one.
+
+typedef struct {
+  AxEntity *e;
+  AxXform *pose;
+  Collider c;
+  double layer, mask;
+  bool dyn;
+} Body;
+
+typedef struct { AxEntity *to; AxDict *payload; } Contact;
+typedef struct { Contact *items; int n, cap; } Contacts;
+
+static void contact_push(Contacts *cs, AxEntity *to, AxDict *payload) {
+  if (cs->n == cs->cap) { cs->cap = cs->cap ? cs->cap * 2 : 16; cs->items = realloc(cs->items, sizeof(Contact) * cs->cap); }
+  cs->items[cs->n].to = to;
+  cs->items[cs->n].payload = payload;
+  cs->n++;
+}
+
+// Test and resolve one pair (interpreter.js stepCollisions, loop body). Returns which bodies
+// moved: 1 = A, 2 = B.
+static int collide_pair(Body *A, Body *B, Contacts *cs) {
+  if (A->layer != 0 && B->layer != 0) {
+    if ((to_int32(A->mask) & to_int32(B->layer)) == 0 || (to_int32(B->mask) & to_int32(A->layer)) == 0) return 0;
+  }
+  AxXform *poseA = A->pose, *poseB = B->pose;
+  A->c.center = v3of(poseA->pos);
+  B->c.center = v3of(poseB->pos);
+  if (A->c.kind == 3) refresh_capsule(&A->c, poseA);
+  if (B->c.kind == 3) refresh_capsule(&B->c, poseB);
+  MTV m = test_colliders(&A->c, &B->c);
+  if (!m.hit) return 0;
+  V3 push = v3mul(m.normal, m.depth / 2);
+  bool dynA = A->dyn, dynB = B->dyn;
+  if (dynA && dynB) {
+    xform_set(poseA, K_pos, mk3(v3add(v3of(poseA->pos), push)));
+    xform_set(poseB, K_pos, mk3(v3sub(v3of(poseB->pos), push)));
+  } else if (dynA) {
+    xform_set(poseA, K_pos, mk3(v3add(v3of(poseA->pos), v3mul(push, 2))));
+  } else if (dynB) {
+    xform_set(poseB, K_pos, mk3(v3sub(v3of(poseB->pos), v3mul(push, 2))));
+  }
+  if (dynA && dynB) {
+    V3 rel = v3sub(v3of(poseA->vel), v3of(poseB->vel));
+    double vn = rel.x * m.normal.x + rel.y * m.normal.y + rel.z * m.normal.z;
+    if (vn < 0) {
+      double mA = field_num_or(A->e, K_mass, 1), mB = field_num_or(B->e, K_mass, 1);
+      double impulse = (2 * vn) / (1 / mA + 1 / mB);
+      xform_set(poseA, K_vel, mk3(v3sub(v3of(poseA->vel), v3mul(m.normal, impulse / mA))));
+      xform_set(poseB, K_vel, mk3(v3add(v3of(poseB->vel), v3mul(m.normal, impulse / mB))));
+    }
+  } else if (dynA) {
+    V3 va = v3of(poseA->vel);
+    double vn = va.x * m.normal.x + va.y * m.normal.y + va.z * m.normal.z;
+    if (vn < 0) xform_set(poseA, K_vel, mk3(v3sub(va, v3mul(m.normal, 2 * vn))));
+  } else if (dynB) {
+    V3 vb = v3of(poseB->vel);
+    double vn = vb.x * (-m.normal.x) + vb.y * (-m.normal.y) + vb.z * (-m.normal.z);
+    if (vn < 0) xform_set(poseB, K_vel, mk3(v3sub(vb, v3mul(m.normal, -2 * vn))));
+  }
+  contact_push(cs, A->e, collide_payload(B->e, m.normal, m.depth));
+  contact_push(cs, B->e, collide_payload(A->e, v3(-m.normal.x, -m.normal.y, -m.normal.z), m.depth));
+  return (dynA ? 1 : 0) | (dynB ? 2 : 0);
+}
+
+// The body's current bounding box, widened; false when any bound is not finite.
+static bool body_box(Body *b, double lo[3], double hi[3]) {
+  V3 p = v3of(b->pose->pos);
+  double ext[3];
+  if (b->c.kind == 3) {
+    Collider c = b->c;
+    refresh_capsule(&c, b->pose);
+    double r = fabs(c.r);
+    lo[0] = fmin(c.a.x, c.b.x) - r; hi[0] = fmax(c.a.x, c.b.x) + r;
+    lo[1] = fmin(c.a.y, c.b.y) - r; hi[1] = fmax(c.a.y, c.b.y) + r;
+    lo[2] = fmin(c.a.z, c.b.z) - r; hi[2] = fmax(c.a.z, c.b.z) + r;
+    if (isnan(c.a.x) || isnan(c.a.y) || isnan(c.a.z) || isnan(c.b.x) || isnan(c.b.y) || isnan(c.b.z) || isnan(r)) return false;
+  } else {
+    if (b->c.kind == 1) ext[0] = ext[1] = ext[2] = fabs(b->c.r);
+    else { ext[0] = fabs(b->c.half.x); ext[1] = fabs(b->c.half.y); ext[2] = fabs(b->c.half.z); }
+    double pc[3] = { p.x, p.y, p.z };
+    for (int k = 0; k < 3; k++) { lo[k] = pc[k] - ext[k]; hi[k] = pc[k] + ext[k]; }
+  }
+  for (int k = 0; k < 3; k++) {
+    if (!isfinite(lo[k]) || !isfinite(hi[k])) return false;
+    double m = (fabs(lo[k]) + fabs(hi[k])) * 1e-9 + 1e-9;
+    lo[k] -= m;
+    hi[k] += m;
+  }
+  return true;
+}
+
+#define GRID_MIN 24
+#define GRID_SPAN 16          // a box wider than this many cells on an axis is tested against all
+#define GRID_LIMIT 1000000.0  // cell coordinates are kept well inside the packed key
+
+typedef struct { int64_t key; int *ids; int n, cap; bool used; } Cell;
+
+typedef struct {
+  double inv;                 // 1 / cell size
+  Cell *cells;
+  uint32_t mask;              // table size - 1 (a power of two)
+  int (*range)[6];            // per body: the cells it is filed under (lo xyz, hi xyz)
+  uint8_t *state;             // 0 not filed, 1 in cells, 2 in the everyone list
+  int *all, nall;             // bodies tested against everyone (non-finite or huge)
+  int *stamp, qid;
+} Grid;
+
+static int64_t cell_key(int x, int y, int z) {
+  return ((int64_t)(x + (1 << 20)) << 42) | ((int64_t)(y + (1 << 20)) << 21) | (int64_t)(z + (1 << 20));
+}
+
+static Cell *grid_cell(Grid *g, int64_t key, bool create) {
+  uint64_t h = (uint64_t)key * 0x9E3779B97F4A7C15ull;
+  for (uint32_t i = (uint32_t)(h >> 32) & g->mask;; i = (i + 1) & g->mask) {
+    Cell *c = &g->cells[i];
+    if (!c->used) {
+      if (!create) return NULL;
+      c->used = true;
+      c->key = key;
+      return c;
+    }
+    if (c->key == key) return c;
+  }
+}
+
+static void grid_remove(Grid *g, int id) {
+  if (g->state[id] == 1) {
+    int *r = g->range[id];
+    for (int x = r[0]; x <= r[3]; x++) for (int y = r[1]; y <= r[4]; y++) for (int z = r[2]; z <= r[5]; z++) {
+      Cell *c = grid_cell(g, cell_key(x, y, z), false);
+      if (!c) continue;
+      for (int k = 0; k < c->n; k++) if (c->ids[k] == id) { c->ids[k] = c->ids[--c->n]; break; }
+    }
+  } else if (g->state[id] == 2) {
+    for (int k = 0; k < g->nall; k++) if (g->all[k] == id) { g->all[k] = g->all[--g->nall]; break; }
+  }
+  g->state[id] = 0;
+}
+
+static void grid_file(Grid *g, Body *bodies, int id) {
+  double lo[3], hi[3];
+  int r[6];
+  bool everyone = !body_box(&bodies[id], lo, hi);
+  if (!everyone) {
+    for (int k = 0; k < 3; k++) {
+      double a = floor(lo[k] * g->inv), b = floor(hi[k] * g->inv);
+      if (a < -GRID_LIMIT || b > GRID_LIMIT || b - a >= GRID_SPAN) { everyone = true; break; }
+      r[k] = (int)a;
+      r[k + 3] = (int)b;
+    }
+  }
+  if (everyone) {
+    g->all[g->nall++] = id;
+    g->state[id] = 2;
+    return;
+  }
+  memcpy(g->range[id], r, sizeof r);
+  for (int x = r[0]; x <= r[3]; x++) for (int y = r[1]; y <= r[4]; y++) for (int z = r[2]; z <= r[5]; z++) {
+    Cell *c = grid_cell(g, cell_key(x, y, z), true);
+    if (c->n == c->cap) { c->cap = c->cap ? c->cap * 2 : 4; c->ids = realloc(c->ids, sizeof(int) * c->cap); }
+    c->ids[c->n++] = id;
+  }
+  g->state[id] = 1;
+}
+
+static int cmp_int(const void *a, const void *b) { int x = *(const int *)a, y = *(const int *)b; return (x > y) - (x < y); }
+
+// The bodies j > after that row i must test, ascending.
+static int grid_gather(Grid *g, Body *bodies, int n, int i, int after, int *out) {
+  int k = 0;
+  g->qid++;
+  double lo[3], hi[3];
+  bool everyone = !body_box(&bodies[i], lo, hi);
+  int r[6];
+  if (!everyone) {
+    for (int a = 0; a < 3; a++) {
+      double p = floor(lo[a] * g->inv), q = floor(hi[a] * g->inv);
+      if (p < -GRID_LIMIT || q > GRID_LIMIT || q - p >= GRID_SPAN) { everyone = true; break; }
+      r[a] = (int)p;
+      r[a + 3] = (int)q;
+    }
+  }
+  if (everyone) {
+    for (int j = after + 1; j < n; j++) out[k++] = j;
+    return k;
+  }
+  for (int x = r[0]; x <= r[3]; x++) for (int y = r[1]; y <= r[4]; y++) for (int z = r[2]; z <= r[5]; z++) {
+    Cell *c = grid_cell(g, cell_key(x, y, z), false);
+    if (!c) continue;
+    for (int m = 0; m < c->n; m++) {
+      int j = c->ids[m];
+      if (j > after && g->stamp[j] != g->qid) { g->stamp[j] = g->qid; out[k++] = j; }
+    }
+  }
+  for (int m = 0; m < g->nall; m++) {
+    int j = g->all[m];
+    if (j > after && g->stamp[j] != g->qid) { g->stamp[j] = g->qid; out[k++] = j; }
+  }
+  qsort(out, (size_t)k, sizeof(int), cmp_int);
+  return k;
+}
+
+static int cmp_dbl(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
+
+static void collide_grid(Body *bodies, int n, Contacts *cs) {
+  Grid g = { 0 };
+  // Cell size: 1.5 × the median box size, so a typical body is filed under a few cells.
+  double *sizes = malloc(sizeof(double) * n);
+  int ns = 0;
+  for (int i = 0; i < n; i++) {
+    double lo[3], hi[3];
+    if (!body_box(&bodies[i], lo, hi)) continue;
+    sizes[ns++] = fmax(hi[0] - lo[0], fmax(hi[1] - lo[1], hi[2] - lo[2]));
+  }
+  double cell = 1;
+  if (ns) { qsort(sizes, (size_t)ns, sizeof(double), cmp_dbl); cell = sizes[ns / 2] * 1.5; }
+  free(sizes);
+  if (!(cell > 1e-6) || !isfinite(cell)) cell = 1;
+  g.inv = 1 / cell;
+  uint32_t cap = 64;
+  while (cap < (uint32_t)n * 32) cap <<= 1;
+  g.cells = calloc(cap, sizeof(Cell));
+  g.mask = cap - 1;
+  g.range = malloc(sizeof(*g.range) * n);
+  g.state = calloc((size_t)n, 1);
+  g.all = malloc(sizeof(int) * n);
+  g.stamp = calloc((size_t)n, sizeof(int));
+  int *cand = malloc(sizeof(int) * n);
+  for (int i = 0; i < n; i++) grid_file(&g, bodies, i);
+  for (int i = 0; i < n; i++) {
+    grid_remove(&g, i);                        // later rows only look at bodies after them
+    int after = i;
+    for (;;) {
+      int k = grid_gather(&g, bodies, n, i, after, cand);
+      bool again = false;
+      for (int m = 0; m < k; m++) {
+        int j = cand[m];
+        int moved = collide_pair(&bodies[i], &bodies[j], cs);
+        if (moved & 2) { grid_remove(&g, j); grid_file(&g, bodies, j); }
+        if (moved & 1) { after = j; again = m + 1 < k || j + 1 < n; break; }
+      }
+      if (!again) break;
+    }
+  }
+  for (uint32_t c = 0; c < cap; c++) free(g.cells[c].ids);
+  free(g.cells); free(g.range); free(g.state); free(g.all); free(g.stamp); free(cand);
+}
+
+static int broadphase_mode = -1;   // 0 pairs, 1 grid, 2 by count
+
 static void step_collisions(AxVM *vm) {
   AxWorld *w = W(vm);
+  if (broadphase_mode < 0) {
+    const char *m = getenv("AXIOM_BROADPHASE");
+    broadphase_mode = m && !strcmp(m, "pairs") ? 0 : m && !strcmp(m, "grid") ? 1 : 2;
+  }
   int n = 0;
-  AxEntity **bodies = malloc(sizeof(AxEntity *) * (w->nents + 1));
-  Collider *cols = malloc(sizeof(Collider) * (w->nents + 1));
+  Body *bodies = malloc(sizeof(Body) * (w->nents + 1));
   for (int i = 0; i < w->nents; i++) {
     AxEntity *e = w->ents[i];
     if (e->pending_remove) continue;
-    if (collider_of(e, &cols[n])) bodies[n++] = e;
+    Body *b = &bodies[n];
+    if (!collider_of(e, &b->c)) continue;
+    // Layer, mask and kind cannot change during the pass: read them once per body, not per pair.
+    bool pm;
+    b->e = e;
+    b->pose = ent_pose(e);
+    b->layer = field_num_or(e, K_collision_layer, 0);
+    b->mask = field_raw_num(e, K_collision_mask, &pm);
+    if (!pm) b->mask = 4294967295.0;
+    b->dyn = e->base == K_Body3D;
+    n++;
   }
-  struct { AxEntity *to; AxDict *payload; } *events = NULL;
-  int nev = 0;
-  for (int i = 0; i < n; i++) {
-    for (int j = i + 1; j < n; j++) {
-      AxEntity *A_ = bodies[i], *B_ = bodies[j];
-      bool pa, pb;
-      double aLayer = field_num_or(A_, K_collision_layer, 0);
-      double aMask = field_raw_num(A_, K_collision_mask, &pa); if (!pa) aMask = 4294967295.0;
-      double bLayer = field_num_or(B_, K_collision_layer, 0);
-      double bMask = field_raw_num(B_, K_collision_mask, &pb); if (!pb) bMask = 4294967295.0;
-      if (aLayer != 0 && bLayer != 0) {
-        if ((to_int32(aMask) & to_int32(bLayer)) == 0 || (to_int32(bMask) & to_int32(aLayer)) == 0) continue;
-      }
-      AxXform *poseA = ent_pose(A_), *poseB = ent_pose(B_);
-      cols[i].center = v3of(poseA->pos);
-      cols[j].center = v3of(poseB->pos);
-      if (cols[i].kind == 3) refresh_capsule(&cols[i], poseA);
-      if (cols[j].kind == 3) refresh_capsule(&cols[j], poseB);
-      MTV m = test_colliders(&cols[i], &cols[j]);
-      if (!m.hit) continue;
-      V3 push = v3mul(m.normal, m.depth / 2);
-      bool dynA = A_->base == K_Body3D, dynB = B_->base == K_Body3D;
-      if (dynA && dynB) {
-        xform_set(poseA, K_pos, mk3(v3add(v3of(poseA->pos), push)));
-        xform_set(poseB, K_pos, mk3(v3sub(v3of(poseB->pos), push)));
-      } else if (dynA) {
-        xform_set(poseA, K_pos, mk3(v3add(v3of(poseA->pos), v3mul(push, 2))));
-      } else if (dynB) {
-        xform_set(poseB, K_pos, mk3(v3sub(v3of(poseB->pos), v3mul(push, 2))));
-      }
-      if (dynA && dynB) {
-        V3 rel = v3sub(v3of(poseA->vel), v3of(poseB->vel));
-        double vn = rel.x * m.normal.x + rel.y * m.normal.y + rel.z * m.normal.z;
-        if (vn < 0) {
-          double mA = field_num_or(A_, K_mass, 1), mB = field_num_or(B_, K_mass, 1);
-          double impulse = (2 * vn) / (1 / mA + 1 / mB);
-          xform_set(poseA, K_vel, mk3(v3sub(v3of(poseA->vel), v3mul(m.normal, impulse / mA))));
-          xform_set(poseB, K_vel, mk3(v3add(v3of(poseB->vel), v3mul(m.normal, impulse / mB))));
-        }
-      } else if (dynA) {
-        V3 va = v3of(poseA->vel);
-        double vn = va.x * m.normal.x + va.y * m.normal.y + va.z * m.normal.z;
-        if (vn < 0) xform_set(poseA, K_vel, mk3(v3sub(va, v3mul(m.normal, 2 * vn))));
-      } else if (dynB) {
-        V3 vb = v3of(poseB->vel);
-        double vn = vb.x * (-m.normal.x) + vb.y * (-m.normal.y) + vb.z * (-m.normal.z);
-        if (vn < 0) xform_set(poseB, K_vel, mk3(v3sub(vb, v3mul(m.normal, -2 * vn))));
-      }
-      events = realloc(events, sizeof(*events) * (nev + 2));
-      events[nev].to = A_; events[nev].payload = collide_payload(B_, m.normal, m.depth); nev++;
-      events[nev].to = B_; events[nev].payload = collide_payload(A_, v3(-m.normal.x, -m.normal.y, -m.normal.z), m.depth); nev++;
-    }
+  Contacts cs = { 0 };
+  if (broadphase_mode == 1 || (broadphase_mode == 2 && n >= GRID_MIN)) collide_grid(bodies, n, &cs);
+  else {
+    for (int i = 0; i < n; i++)
+      for (int j = i + 1; j < n; j++) collide_pair(&bodies[i], &bodies[j], &cs);
   }
   // Contacts are delivered after the whole pass, so a handler sees resolved positions.
-  for (int i = 0; i < nev; i++) {
-    if (!events[i].to->pending_remove) run_blocks_named(vm, events[i].to, K_on, 1.0 / 60, events[i].payload, K_Collide);
-    ax_release(ax_dictv(events[i].payload));
+  for (int i = 0; i < cs.n; i++) {
+    if (!cs.items[i].to->pending_remove) run_blocks_named(vm, cs.items[i].to, K_on, 1.0 / 60, cs.items[i].payload, K_Collide);
+    ax_release(ax_dictv(cs.items[i].payload));
   }
-  free(events);
+  free(cs.items);
   free(bodies);
-  free(cols);
 }
 
 static void step_ground_plane(AxWorld *w) {
