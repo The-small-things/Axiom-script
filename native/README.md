@@ -101,12 +101,15 @@ Measured on this machine against `node main.js` (which includes Node's start-up)
 | hello world | **1.6 ms** | 45 ms | 27× |
 | `examples/sim.ax`, 20 000 frames | **25 ms** | 182 ms | 7× |
 | 40 falling bodies with collisions, 3 000 frames | **11 ms** | 164 ms | 14× |
-| 60 bouncing bodies, all-pairs collisions, 2 000 frames | **0.31 s** | 0.53 s | 1.7× |
-| `fib(27)` | **0.11 s** | 0.23 s | 2.1× |
-| 3M-iteration loop | **0.18 s** | 0.49 s | 2.7× |
+| 400 bodies (spheres, boxes, capsules), 600 frames | **0.43 s** | 1.1 s | 2.6× |
+| `fib(27)` | **0.05 s** | 0.27 s | 5× |
+| 3M-iteration `while` loop | **0.21 s** | 0.59 s | 2.8× |
+| 200k dictionary updates | **0.06 s** | 0.21 s | 3.4× |
 
-Collision detection is all-pairs, as in the reference; with many bodies that — not the
-interpreter — is the cost, which is why the last simulation row gains least.
+Both runtimes find collision pairs through a uniform grid when there are 24 or more bodies,
+and produce exactly what the reference's all-pairs pass produced (see `step_collisions` in
+`engine.c` for why that holds); before it, the 400-body row took 3.8 s native and 7.2 s in
+Node.
 
 ## Design notes
 

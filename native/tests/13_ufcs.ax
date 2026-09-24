@@ -1,0 +1,16 @@
+^fn double(x) = x * 2
+^type P: x, y
+^fn norm1(p) = abs(p.x) + abs(p.y)
+^main:
+  xs = [3, 1, 2, 3]
+  print(sort(xs), xs, xs.sorted(), xs.uniq().sorted(), xs.sum(), 5.double(), P(-1, 2).norm1())
+  print("a\nbb\nccc".lines().map(\l: len(l)), "hello world".split(" ").len(), (0..4).map(double))
+  print(xs.sorted(\a, b: b - a), xs.count_by(\v: v), {a: 1}.keys())
+  ^try:
+    xs.nope()
+  ^catch e:
+    print(e.code)
+  // ranges take the array methods
+  print((0..5).map(\v: v * v), range(0, 10, 3).filter(\v: v > 0), (1..4).sum(), range(5, 0, -1).reverse())
+  // numbers print as JavaScript prints them
+  print(0.00001234, 0.0000123, 2 ** 60, 2 ** 53 + 1, 1e21, 123e18, 5e-324, 2 / 3 * 1e-5, -0.000001, 1e-7)

@@ -112,7 +112,7 @@ function stdlibIntrinsics(world, rt) {
     return (v, i) => truthy(k(v, i));
   };
 
-  return {
+  const lib = {
     // =====================================================================================
     // NUMBERS & MATH
     // =====================================================================================
@@ -328,6 +328,9 @@ function stdlibIntrinsics(world, rt) {
     check: withCtx((cond, msg, ctx) => { if (!truthy(cond)) fail(msg === undefined ? 'check failed' : rt.stringify(msg), 'AX-CHECK'); return true; }),
     check_eq: withCtx((a, b, msg, ctx) => { if (!rt.equalsVal(a, b) && rt.stringify(a) !== rt.stringify(b)) fail(`${msg === undefined ? 'check_eq failed' : rt.stringify(msg)}: ${rt.stringify(a)} != ${rt.stringify(b)}`, 'AX-CHECK'); return true; }),
   };
+  // v0.9.3: `sort` is the name a program reaches for first; it is `sorted` (a copy, never in place).
+  lib.sort = lib.sorted;
+  return lib;
 }
 
 module.exports = { stdlibIntrinsics, withCtx, makeRng, toArray };

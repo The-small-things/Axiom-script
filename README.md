@@ -154,6 +154,7 @@ adults = people.filter(\p: p.age >= 18).sort_by("age")
 total  = orders |> map(\o: o.price) |> sum
 q, r   = divmod(17, 5)          // destructuring assignment
 apply_twice = \f, v: f(f(v))    // functions are values: pass, store, return
+top3 = scores.sorted().reverse().take(3)   // any function is a method on its first argument
 ```
 
 ### Errors

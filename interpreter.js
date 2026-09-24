@@ -4067,6 +4067,8 @@ function arityOf(fn) {
 }
 
 function callMethod(obj, method, argNodes, ctx) {
+  // v0.9.3: a range takes the array methods, as the array it stands for: range(0, n).map(f).
+  if (obj instanceof Range) obj = Array.from(obj);
   // v0.8.11: string methods — split, replace, trim, upper, lower, startsWith, etc.
   if (typeof obj === 'string') {
     const args = argNodes.map(a => a.value ? evalExpr(a.value, ctx) : undefined);
@@ -4388,6 +4390,12 @@ function callMethod(obj, method, argNodes, ctx) {
     if (member !== undefined && isCallable(member, ctx.world)) {
       return callValue(member, argNodes.map(a => evalExpr(a.value, ctx)), ctx, method);
     }
+  }
+  // v0.9.3: uniform call syntax — with no method of that name, `x.f(a, b)` is `f(x, a, b)` for
+  // any declared ^fn/^proc or library function: `xs.sorted().uniq()`, `text.lines().len()`.
+  const w = ctx.world;
+  if (w && (w.fns.has(method) || w.procs.has(method) || typeof w.intrinsics[method] === 'function')) {
+    return callValue(method, [obj, ...argNodes.map(a => evalExpr(a.value, ctx))], ctx, method);
   }
   throw new AxiomError(`no method '.${method}(...)' on ${typeNameOf(obj)}`, 'AX-RUNTIME-METHOD');
 }

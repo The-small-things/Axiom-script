@@ -12,6 +12,9 @@ Conventions:
 * anywhere a callback is taken, a **field-name string** works too: `sort_by(xs, "age")`
 * predicates are `is_*`, conversions are `to_*` / `from_*`, two words are `snake_case`
 * `xs` accepts an array, a string (characters), a range, or a dict (values)
+* **any function is also a method** on its first argument (v0.9.3): where a value has no method
+  of that name, `x.f(a)` is `f(x, a)` — `xs.sorted().uniq()`, `text.lines().len()`,
+  `p.norm1()` for a `^fn norm1(p)`. Ranges take every array method: `(0..n).map(f)`
 
 ---
 
@@ -66,6 +69,7 @@ Seeded, so a run is reproducible: call `seed(n)` and the whole sequence repeats.
 | `sum(xs, key?)` `prod(xs, key?)` | reductions, optionally over a key |
 | `mean(xs, key?)` `median(xs)` `mode(xs)` `variance(xs)` `stdev(xs)` | descriptive statistics |
 | `sorted(xs, key_or_cmp?)` | sorted copy; a 1-argument callback is a key, a 2-argument one a comparator |
+| `sort(xs, key_or_cmp?)` | the same as `sorted` (a copy; the input is not changed) |
 | `sort_by(xs, key)` | sorted copy by key |
 | `min_by(xs, key)` `max_by(xs, key)` | the element with the smallest/largest key |
 | `group_by(xs, key)` | dict of key → array of members |

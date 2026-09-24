@@ -138,6 +138,18 @@ else
 fi
 rm -rf "$MDIR"
 
+# Number formatting: String(x) for boundary values, every power of two, integers around 2^53
+# and 2^63, and 100 000 random doubles, against ax_fmt_num.
+NDIR=$(mktemp -d)
+if node "$ROOT/native/tests/numfmt/gen.js" "$NDIR/in.txt" 100000 \
+   && cc -std=c11 -O1 -D_GNU_SOURCE -o "$NDIR/numcheck" "$ROOT/native/tests/numfmt/numcheck.c" $(ls "$ROOT"/native/*.c | grep -v -e '/main.c' -e '/repl.c') -lm \
+   && "$NDIR/numcheck" "$NDIR/in.txt" > "$NDIR/out.txt"; then
+  pass=$((pass + 1)); printf 'OK   number formatting identical to String(x) (%s)\n' "$(tail -1 "$NDIR/out.txt" | cut -d, -f1)"
+else
+  fail=$((fail + 1)); printf 'FAIL number formatting\n'; head -5 "$NDIR/out.txt" 2>/dev/null
+fi
+rm -rf "$NDIR"
+
 # Terminal output: the same pixel buffers through terminal.js and term.c must give the same bytes.
 TDIR=$(mktemp -d)
 if cc -O2 -o "$TDIR/termcheck" "$ROOT/native/tests/term/termcheck.c" "$ROOT/native/term.c" -lm \

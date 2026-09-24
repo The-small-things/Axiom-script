@@ -1984,6 +1984,13 @@ NATIVE(n_check_eq) {
 static bool name_is(AxStr *n, const char *s) { return strcmp(n->data, s) == 0; }
 
 AxValue ax_method_call(AxVM *vm, AxValue obj, AxStr *name, AxValue *args, int argc) {
+  // A range takes the array methods, as the array it stands for: range(0, n).map(f).
+  if (obj.t == AX_RANGE) {
+    AxArr *seq = ax_to_seq(vm, obj);
+    AxValue r = ax_method_call(vm, ax_arrv(seq), name, args, argc);
+    ax_release(ax_arrv(seq));
+    return r;
+  }
   // A field holding a function is a method — how objects are written without a class construct.
   if (obj.t == AX_DICT) {
     AxValue member;
@@ -2340,6 +2347,22 @@ AxValue ax_method_call(AxVM *vm, AxValue obj, AxStr *name, AxValue *args, int ar
     }
   }
 
+  // Uniform call syntax: with no method of that name, `x.f(a, b)` is `f(x, a, b)` for any
+  // declared ^fn/^proc or library function (both live in the builtins frame).
+  AxValue fn;
+  if (ax_scope_lookup_local(vm->builtins, name, &fn)) {
+    if (fn.t == AX_FN) {
+      AxValue stack[9];
+      AxValue *argv = argc + 1 <= 9 ? stack : malloc(sizeof(AxValue) * (size_t)(argc + 1));
+      argv[0] = obj;
+      for (int i = 0; i < argc; i++) argv[i + 1] = args[i];
+      AxValue r = ax_call(vm, fn, argv, argc + 1);
+      if (argv != stack) free(argv);
+      ax_release(fn);
+      return r;
+    }
+    ax_release(fn);
+  }
   ax_throw(vm, "AX-RUNTIME-METHOD", "no method '.%s(...)' on %s", name->data, ax_type_name(obj));
   return ax_null();
 }
@@ -2425,6 +2448,7 @@ void ax_stdlib_install(AxVM *vm) {
   def(vm, "stdev", n_stdev, 1, 1);  def(vm, "mode", n_mode, 1, 1);
 
   def(vm, "sorted", n_sorted, 1, 2);      def(vm, "sort_by", n_sort_by, 2, 2);
+  def(vm, "sort", n_sorted, 1, 2);        // the name a program reaches for first; a copy, as sorted
   def(vm, "reversed", n_reversed, 1, 1);  def(vm, "take", n_take, 2, 2);
   def(vm, "drop", n_drop, 2, 2);          def(vm, "first", n_first, 1, 2);
   def(vm, "last", n_last, 1, 2);          def(vm, "map", n_map, 2, 2);

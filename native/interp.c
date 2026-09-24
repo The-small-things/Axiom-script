@@ -339,10 +339,13 @@ AxValue ax_call(AxVM *vm, AxValue fnv, AxValue *args, int argc) {
     else if (f->defaults && f->defaults[i]) v = eval_node(vm, f->defaults[i], s);
     ax_scope_declare(s, f->params[i], v);
   }
-  // `args` is always available, which is the language's variadic escape hatch.
-  AxArr *all = ax_arr_new(argc);
-  for (int i = 0; i < argc; i++) ax_arr_push(all, ax_copy(args[i]));
-  ax_scope_declare(s, S_args, ax_arrv(all));
+  // `args` is always available, which is the language's variadic escape hatch (bound only
+  // when the body can see it — nothing else can observe the binding).
+  if (f->uses_args) {
+    AxArr *all = ax_arr_new(argc);
+    for (int i = 0; i < argc; i++) ax_arr_push(all, ax_copy(args[i]));
+    ax_scope_declare(s, S_args, ax_arrv(all));
+  }
 
   AxValue result = ax_null();
   if (f->is_expr) {
@@ -585,6 +588,23 @@ static bool match_top(AxVM *vm, AxValue subject, AxNode *pat, AxScope *scope, Bi
 // Expression evaluation
 // ---------------------------------------------------------------------------------------------
 
+// Whether any name in the subtree is `args` — read, assigned, bound or declared. Only then
+// does a call need the variadic `args` binding; building it costs an array per call.
+static bool mentions_args(AxNode *n, int depth) {
+  if (!n || depth > 200) return n != NULL;   // pathological nesting: assume it does
+  if (n->str == S_args || n->str2 == S_args) return true;
+  for (int i = 0; i < n->nnames; i++) if (n->names[i] == S_args) return true;
+  if (mentions_args(n->a, depth + 1) || mentions_args(n->b, depth + 1) || mentions_args(n->c, depth + 1)) return true;
+  for (int i = 0; i < n->nlist; i++) if (mentions_args(n->list[i], depth + 1)) return true;
+  for (int i = 0; i < n->nnames; i++) if (n->defaults && mentions_args(n->defaults[i], depth + 1)) return true;
+  for (int i = 0; i < n->narms; i++) {
+    for (int k = 0; k < n->arms[i].npatterns; k++) if (mentions_args(n->arms[i].patterns[k], depth + 1)) return true;
+    if (mentions_args(n->arms[i].guard, depth + 1)) return true;
+    for (int k = 0; k < n->arms[i].nbody; k++) if (mentions_args(n->arms[i].body[k], depth + 1)) return true;
+  }
+  return false;
+}
+
 static AxValue make_closure(AxVM *vm, AxNode *n, AxScope *scope, bool is_expr) {
   AxFn *f = calloc(1, sizeof(AxFn));
   f->hdr.rc = 1;
@@ -614,6 +634,8 @@ static AxValue make_closure(AxVM *vm, AxNode *n, AxScope *scope, bool is_expr) {
   }
   f->scope = scope;
   if (scope) scope->hdr.rc++;
+  f->uses_args = mentions_args(f->body, 0);
+  for (int i = 0; i < n->nnames && !f->uses_args; i++) if (n->defaults && mentions_args(n->defaults[i], 0)) f->uses_args = true;
   if (is_expr && vm->ctx.entity) {
     f->entity = vm->ctx.entity;
     f->entity->hdr.rc++;
@@ -684,6 +706,25 @@ static AxValue eval_node(AxVM *vm, AxNode *n, AxScope *scope) {
       }
       AxValue l = eval_node(vm, n->a, scope);
       AxValue r = eval_node(vm, n->b, scope);
+      if (l.t == AX_NUM && r.t == AX_NUM) {
+        // Two numbers: the common case, without the general dispatch. Same results as
+        // binary_op (NaN compares false; == is IEEE equality).
+        double a = l.num, b = r.num;
+        switch (n->op) {
+          case OP_ADD: return ax_num(a + b);
+          case OP_SUB: return ax_num(a - b);
+          case OP_MUL: return ax_num(a * b);
+          case OP_DIV: return ax_num(a / b);
+          case OP_MOD: return ax_num(fmod(a, b));
+          case OP_LT: return ax_bool(a < b);
+          case OP_GT: return ax_bool(a > b);
+          case OP_LE: return ax_bool(a <= b);
+          case OP_GE: return ax_bool(a >= b);
+          case OP_EQ: return ax_bool(a == b);
+          case OP_NE: return ax_bool(a != b);
+          default: break;
+        }
+      }
       AxValue res = binary_op(vm, n->op, l, r);
       ax_release(l);
       ax_release(r);
@@ -742,11 +783,12 @@ static AxValue eval_node(AxVM *vm, AxNode *n, AxScope *scope) {
     case N_CALL: return eval_call_named(vm, n, scope);
     case N_CALLV: {
       AxValue fn = eval_node(vm, n->a, scope);
-      AxValue *args = n->nlist ? calloc(n->nlist, sizeof(AxValue)) : NULL;
+      AxValue stack[8];
+      AxValue *args = n->nlist <= 8 ? stack : calloc(n->nlist, sizeof(AxValue));
       for (int i = 0; i < n->nlist; i++) args[i] = eval_node(vm, n->list[i]->b, scope);
       AxValue out = ax_call(vm, fn, args, n->nlist);
       for (int i = 0; i < n->nlist; i++) ax_release(args[i]);
-      free(args);
+      if (args != stack) free(args);
       ax_release(fn);
       return out;
     }
@@ -846,11 +888,12 @@ static AxValue eval_call_named(AxVM *vm, AxNode *n, AxScope *scope) {
   bool found_any = false;
   if (lookup_callable(scope, n->str, &fn, &found_any)) {
     if (fn.t == AX_FN) {
-      AxValue *args = n->nlist ? calloc(n->nlist, sizeof(AxValue)) : NULL;
+      AxValue stack[8];
+      AxValue *args = n->nlist <= 8 ? stack : calloc(n->nlist, sizeof(AxValue));
       for (int i = 0; i < n->nlist; i++) args[i] = eval_node(vm, n->list[i]->b, scope);
       AxValue out = ax_call(vm, fn, args, n->nlist);
       for (int i = 0; i < n->nlist; i++) ax_release(args[i]);
-      free(args);
+      if (args != stack) free(args);
       ax_release(fn);
       return out;
     }
@@ -1068,6 +1111,49 @@ static void assign_member_path(AxVM *vm, AxNode *n, AxScope *scope) {
   ax_release(obj);
 }
 
+// ^try/^catch/^fin. Kept out of exec_stmt: a function that calls setjmp is compiled
+// pessimistically as a whole (every local may be clobbered), and exec_stmt runs every statement.
+static __attribute__((noinline)) int exec_try(AxVM *vm, AxNode *n, AxScope *scope, AxValue *out) {
+  volatile int flow = AX_FLOW_NORMAL;
+  if (vm->nhandlers >= AX_MAX_HANDLERS) ax_throw(vm, "AX-TRY", "too many nested ^try blocks");
+  int hidx = vm->nhandlers++;
+  int saved_depth = vm->call_depth;
+  AxCtx saved_ctx = vm->ctx;
+  if (setjmp(vm->handlers[hidx]) == 0) {
+    AxScope *inner = ax_scope_new(scope, false);
+    flow = exec_list(vm, n->list, n->nlist, inner, out);
+    ax_scope_release(inner);
+    vm->nhandlers--;
+  } else {
+    // An error unwound to here: the handler is already popped by the throw path's caller.
+    vm->nhandlers = hidx;
+    vm->call_depth = saved_depth;
+    vm->ctx = saved_ctx;
+    if (n->c) {
+      AxScope *cscope = ax_scope_new(scope, false);
+      if (n->str) ax_scope_declare(cscope, n->str, ax_copy(vm->error));
+      flow = exec_list(vm, n->c->list, n->c->nlist, cscope, out);
+      ax_scope_release(cscope);
+    } else {
+      if (n->b) {
+        AxScope *fscope = ax_scope_new(scope, false);
+        exec_list(vm, n->b->list, n->b->nlist, fscope, out);
+        ax_scope_release(fscope);
+      }
+      ax_throw_value(vm, ax_copy(vm->error));   // no catch clause: keep unwinding
+    }
+  }
+  if (n->b) {
+    AxScope *fscope = ax_scope_new(scope, false);
+    AxValue ignored = ax_null();
+    int fflow = exec_list(vm, n->b->list, n->b->nlist, fscope, &ignored);
+    ax_release(ignored);
+    ax_scope_release(fscope);
+    if (fflow != AX_FLOW_NORMAL) return fflow;
+  }
+  return flow;
+}
+
 static int exec_stmt(AxVM *vm, AxNode *n, AxScope *scope, AxValue *out) {
   switch (n->kind) {
     case N_EXPRSTMT: {
@@ -1083,6 +1169,9 @@ static int exec_stmt(AxVM *vm, AxNode *n, AxScope *scope, AxValue *out) {
         if (n->op == OP_COALESCE) {
           if (cur.t != AX_NULL) { ax_release(cur); ax_release(v); return AX_FLOW_NORMAL; }
           ax_release(cur);
+        } else if (cur.t == AX_NUM && v.t == AX_NUM && n->op >= OP_ADD && n->op <= OP_MOD) {
+          double a = cur.num, b = v.num;
+          v = ax_num(n->op == OP_ADD ? a + b : n->op == OP_SUB ? a - b : n->op == OP_MUL ? a * b : n->op == OP_DIV ? a / b : fmod(a, b));
         } else {
           AxValue combined = binary_op(vm, n->op, cur, v);
           ax_release(cur);
@@ -1132,6 +1221,9 @@ static int exec_stmt(AxVM *vm, AxNode *n, AxScope *scope, AxValue *out) {
         if (n->op == OP_COALESCE) {
           if (cur.t != AX_NULL) { ax_release(cur); ax_release(v); ax_release(idx); ax_release(target); return AX_FLOW_NORMAL; }
           ax_release(cur);
+        } else if (cur.t == AX_NUM && v.t == AX_NUM && n->op >= OP_ADD && n->op <= OP_MOD) {
+          double a = cur.num, b = v.num;
+          v = ax_num(n->op == OP_ADD ? a + b : n->op == OP_SUB ? a - b : n->op == OP_MUL ? a * b : n->op == OP_DIV ? a / b : fmod(a, b));
         } else {
           AxValue combined = binary_op(vm, n->op, cur, v);
           ax_release(cur);
@@ -1204,8 +1296,9 @@ static int exec_stmt(AxVM *vm, AxNode *n, AxScope *scope, AxValue *out) {
       return AX_FLOW_NORMAL;
     }
     case N_WHILE: {
-      bool fresh = body_creates_closure(n);
-      AxScope *inner = ax_scope_new(scope, false);
+      // The body runs in the enclosing frame: a while loop binds nothing of its own, and an
+      // assignment inside it lands in the function's frame either way (write_var), so a
+      // per-loop frame would only add a miss to every name lookup.
       long iters = 0;
       for (;;) {
         AxValue c = eval_node(vm, n->a, scope);
@@ -1213,15 +1306,12 @@ static int exec_stmt(AxVM *vm, AxNode *n, AxScope *scope, AxValue *out) {
         ax_release(c);
         if (!t) break;
         if (vm->ctx.hot && ++iters > HOT_LOOP_LIMIT) {
-          ax_scope_release(inner);
           ax_throw(vm, "AX-LOOP-002", "while loop exceeded %d iterations in a hot block", HOT_LOOP_LIMIT);
         }
-        if (fresh) { ax_scope_release(inner); inner = ax_scope_new(scope, false); }
-        int flow = exec_list(vm, n->list, n->nlist, inner, out);
+        int flow = exec_list(vm, n->list, n->nlist, scope, out);
         if (flow == AX_FLOW_BREAK) break;
-        if (flow == AX_FLOW_RETURN) { ax_scope_release(inner); return flow; }
+        if (flow == AX_FLOW_RETURN) return flow;
       }
-      ax_scope_release(inner);
       return AX_FLOW_NORMAL;
     }
     case N_FOR: {
@@ -1314,46 +1404,7 @@ static int exec_stmt(AxVM *vm, AxNode *n, AxScope *scope, AxValue *out) {
       ax_throw_value(vm, ax_dictv(d));
       return AX_FLOW_NORMAL;
     }
-    case N_TRY: {
-      volatile int flow = AX_FLOW_NORMAL;
-      if (vm->nhandlers >= AX_MAX_HANDLERS) ax_throw(vm, "AX-TRY", "too many nested ^try blocks");
-      int hidx = vm->nhandlers++;
-      int saved_depth = vm->call_depth;
-      AxCtx saved_ctx = vm->ctx;
-      if (setjmp(vm->handlers[hidx]) == 0) {
-        AxScope *inner = ax_scope_new(scope, false);
-        flow = exec_list(vm, n->list, n->nlist, inner, out);
-        ax_scope_release(inner);
-        vm->nhandlers--;
-      } else {
-        // An error unwound to here: the handler is already popped by the throw path's caller.
-        vm->nhandlers = hidx;
-        vm->call_depth = saved_depth;
-        vm->ctx = saved_ctx;
-        if (n->c) {
-          AxScope *cscope = ax_scope_new(scope, false);
-          if (n->str) ax_scope_declare(cscope, n->str, ax_copy(vm->error));
-          flow = exec_list(vm, n->c->list, n->c->nlist, cscope, out);
-          ax_scope_release(cscope);
-        } else {
-          if (n->b) {
-            AxScope *fscope = ax_scope_new(scope, false);
-            exec_list(vm, n->b->list, n->b->nlist, fscope, out);
-            ax_scope_release(fscope);
-          }
-          ax_throw_value(vm, ax_copy(vm->error));   // no catch clause: keep unwinding
-        }
-      }
-      if (n->b) {
-        AxScope *fscope = ax_scope_new(scope, false);
-        AxValue ignored = ax_null();
-        int fflow = exec_list(vm, n->b->list, n->b->nlist, fscope, &ignored);
-        ax_release(ignored);
-        ax_scope_release(fscope);
-        if (fflow != AX_FLOW_NORMAL) return fflow;
-      }
-      return flow;
-    }
+    case N_TRY: return exec_try(vm, n, scope, out);
     case N_ASSERT: {
       AxValue v = eval_node(vm, n->a, scope);
       bool ok = ax_truthy(v);

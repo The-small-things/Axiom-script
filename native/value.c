@@ -513,40 +513,85 @@ int ax_compare(AxValue a, AxValue b) {
 // Number formatting has to match JavaScript's, or the two runtimes print different output for
 // the same program: shortest round-tripping decimal, no trailing ".0", exponent form only at
 // the same thresholds.
+// Number#toString (ECMAScript Number::toString): the shortest digits that read back as the
+// same double, placed by the spec's rules — plain notation for exponents in [-6, 21), exponent
+// notation outside. For a normal double the shortest digits come from printf at 15, 16 or 17
+// significant digits:
+// if the shortest form has at most 15 digits, the correctly rounded 15-digit form IS it (the
+// double lies within half an ulp of it, far inside half a unit of the 15th digit); if not, the
+// correctly rounded 16- or 17-digit form is the closest candidate of that length, which is the
+// one the spec picks.
 static void fmt_num(double d, char *buf, size_t n) {
   if (isnan(d)) { snprintf(buf, n, "NaN"); return; }
   if (isinf(d)) { snprintf(buf, n, d > 0 ? "Infinity" : "-Infinity"); return; }
-  if (d == 0) { snprintf(buf, n, "%s", (1 / d < 0) ? "0" : "0"); return; }
+  if (d == 0) { snprintf(buf, n, "0"); return; }
   double a = fabs(d);
-  if (a >= 1e21 || (a < 1e-6 && a > 0)) {
-    // JavaScript switches to exponent notation outside [1e-6, 1e21).
-    for (int prec = 1; prec <= 17; prec++) {
-      snprintf(buf, n, "%.*e", prec - 1, d);
-      if (strtod(buf, NULL) == d) break;
-    }
-    // Normalise "1.5e+21" → "1.5e+21" (JS prints e+21 as well), strip zero padding.
-    char *e = strchr(buf, 'e');
-    if (e) {
-      char mant[48], expo[16];
-      int mant_len = (int)(e - buf);
-      if (mant_len > (int)sizeof mant - 1) mant_len = (int)sizeof mant - 1;
-      memcpy(mant, buf, (size_t)mant_len);
-      mant[mant_len] = '\0';
-      int ev = atoi(e + 1);
-      snprintf(expo, sizeof expo, "e%c%d", ev < 0 ? '-' : '+', ev < 0 ? -ev : ev);
-      snprintf(buf, n, "%s%s", mant, expo);
-    }
+  char out[64];
+  size_t o = 0;
+  if (d < 0) out[o++] = '-';
+  if (a < 9007199254740992.0 && a == floor(a)) {
+    // An integer below 2^53 prints as itself.
+    char rev[24];
+    int k = 0;
+    unsigned long long u = (unsigned long long)a;
+    while (u) { rev[k++] = (char)('0' + u % 10); u /= 10; }
+    while (k) out[o++] = rev[--k];
+    out[o] = '\0';
+    snprintf(buf, n, "%s", out);
     return;
   }
-  // Integers print without a decimal point or an exponent, which is what JavaScript does for
-  // everything below 1e21 — and what a program's output is compared against.
-  if (d == floor(d) && fabs(d) < 1e21) { snprintf(buf, n, "%.0f", d); return; }
-  for (int prec = 1; prec <= 17; prec++) {
-    snprintf(buf, n, "%.*g", prec, d);
-    if (strchr(buf, 'e')) continue;      // %g reaches for exponent form far too eagerly
-    if (strtod(buf, NULL) == d) return;
+  char tmp[48];
+  // (A subnormal's ulp is far coarser than 1e-16 of its value, so the 15-digit shortcut does
+  // not hold there: search every length.)
+  for (int prec = a < 2.2250738585072014e-308 ? 1 : 15; prec <= 17; prec++) {
+    snprintf(tmp, sizeof tmp, "%.*e", prec - 1, a);
+    if (prec == 17 || strtod(tmp, NULL) == a) break;
+    if (prec == 16) {
+      // At a power of two the interval below is half the one above, so the closest 16-digit
+      // form can miss while its neighbour on the wide side reads back: try that neighbour.
+      char *ep = strchr(tmp, 'e');
+      long long m = 0;
+      for (char *q = tmp; q < ep; q++) if (*q >= '0' && *q <= '9') m = m * 10 + (*q - '0');
+      int ex = atoi(ep + 1);
+      long long alt = strtod(tmp, NULL) < a ? m + 1 : m - 1;
+      char cand[48];
+      snprintf(cand, sizeof cand, "%lld", alt);
+      if (strlen(cand) == 16) {
+        char sci[64];
+        snprintf(sci, sizeof sci, "%c.%se%+d", cand[0], cand + 1, ex);
+        if (strtod(sci, NULL) == a) { memcpy(tmp, sci, strlen(sci) + 1 < sizeof tmp ? strlen(sci) + 1 : sizeof tmp); break; }
+      }
+    }
   }
-  snprintf(buf, n, "%.17g", d);
+  char digits[24];
+  int k = 0;
+  const char *p = tmp;
+  for (; *p && *p != 'e'; p++) if (*p >= '0' && *p <= '9') digits[k++] = *p;
+  int e10 = atoi(p + 1);
+  while (k > 1 && digits[k - 1] == '0') k--;
+  int ne = e10 + 1;   // the spec's n: the decimal point sits after n digits
+  if (k <= ne && ne <= 21) {
+    for (int i = 0; i < k; i++) out[o++] = digits[i];
+    for (int i = k; i < ne; i++) out[o++] = '0';
+  } else if (0 < ne && ne <= 21) {
+    for (int i = 0; i < ne; i++) out[o++] = digits[i];
+    out[o++] = '.';
+    for (int i = ne; i < k; i++) out[o++] = digits[i];
+  } else if (-6 < ne && ne <= 0) {
+    out[o++] = '0';
+    out[o++] = '.';
+    for (int i = 0; i < -ne; i++) out[o++] = '0';
+    for (int i = 0; i < k; i++) out[o++] = digits[i];
+  } else {
+    out[o++] = digits[0];
+    if (k > 1) {
+      out[o++] = '.';
+      for (int i = 1; i < k; i++) out[o++] = digits[i];
+    }
+    o += (size_t)snprintf(out + o, sizeof out - o, "e%c%d", ne - 1 < 0 ? '-' : '+', ne - 1 < 0 ? 1 - ne : ne - 1);
+  }
+  out[o] = '\0';
+  snprintf(buf, n, "%s", out);
 }
 
 void ax_fmt_num(double d, char *buf, size_t n) { fmt_num(d, buf, n); }
@@ -680,29 +725,47 @@ double ax_to_num(AxValue v) {
 // of a pointer and a pointer comparison. Frames are usually tiny (a couple of parameters and
 // locals), which is why the table starts at 8 slots and never shrinks.
 
+// Frames are made and dropped on every call and block, so released ones are kept for reuse.
+#define SCOPE_POOL 256
+static AxScope *scope_pool[SCOPE_POOL];
+static int scope_pooled;
+
 AxScope *ax_scope_new(AxScope *parent, bool fn_root) {
-  AxScope *s = xalloc(sizeof(AxScope));
+  AxScope *s;
+  if (scope_pooled) {
+    s = scope_pool[--scope_pooled];
+    memset(s->ikeys, 0, sizeof s->ikeys);
+    s->len = 0;
+  } else {
+    s = xalloc(sizeof(AxScope));
+  }
   s->hdr.rc = 1;
   s->hdr.type = 200;   // not a user-visible value type
   s->parent = parent;
   if (parent) parent->hdr.rc++;
   s->fn_root = fn_root;
+  s->builtin = false;
+  s->keys = s->ikeys;
+  s->vals = s->ivals;
+  s->cap = AX_SCOPE_INLINE;
   return s;
 }
 
 void ax_scope_release(AxScope *s) {
-  if (!s) return;
-  if (--s->hdr.rc > 0) return;
-  for (uint32_t i = 0; i < s->cap; i++) {
-    if (!s->keys[i]) continue;
-    AxValue kv; kv.t = AX_STR; kv.o = (AxObj *)s->keys[i];
-    ax_release(kv);
-    ax_release(s->vals[i]);
+  while (s) {
+    if (--s->hdr.rc > 0) return;
+    for (uint32_t i = 0; i < s->cap; i++) {
+      if (!s->keys[i]) continue;
+      AxValue kv; kv.t = AX_STR; kv.o = (AxObj *)s->keys[i];
+      ax_release(kv);
+      ax_release(s->vals[i]);
+    }
+    if (s->keys != s->ikeys) { free(s->keys); free(s->vals); }
+    AxScope *parent = s->parent;
+    if (scope_pooled < SCOPE_POOL) scope_pool[scope_pooled++] = s;
+    else free(s);
+    s = parent;   // iteratively, so a long chain of frames cannot overflow the C stack
   }
-  free(s->keys);
-  free(s->vals);
-  if (s->parent) ax_scope_release(s->parent);
-  free(s);
 }
 
 static void scope_grow(AxScope *s) {
@@ -716,19 +779,20 @@ static void scope_grow(AxScope *s) {
     nk[j] = s->keys[i];
     nv[j] = s->vals[i];
   }
-  free(s->keys);
-  free(s->vals);
+  if (s->keys != s->ikeys) { free(s->keys); free(s->vals); }
   s->keys = nk;
   s->vals = nv;
   s->cap = ncap;
 }
 
+// Every key is interned (ax_scope_declare sees to it), so an interned name is found by pointer
+// alone; only a name built at run time needs the string comparison.
 static int32_t scope_slot(AxScope *s, AxStr *name) {
-  if (!s->cap) return -1;
   uint32_t i = (uint32_t)(((uintptr_t)name >> 4) & (s->cap - 1));
   uint32_t probes = 0;
+  bool by_value = !name->interned;
   while (s->keys[i]) {
-    if (s->keys[i] == name || ax_str_eq(s->keys[i], name)) return (int32_t)i;
+    if (s->keys[i] == name || (by_value && ax_str_eq(s->keys[i], name))) return (int32_t)i;
     i = (i + 1) & (s->cap - 1);
     if (++probes > s->cap) break;
   }
@@ -762,6 +826,11 @@ bool ax_scope_set_existing(AxScope *s, AxStr *name, AxValue v) {
 }
 
 void ax_scope_declare(AxScope *s, AxStr *name, AxValue v) {
+  if (!name->interned) {                    // keys are always interned
+    AxStr *in = ax_intern(name->data, name->len);
+    in->hdr.rc--;                            // the intern table keeps it; the retain below is ours
+    name = in;
+  }
   int32_t i = scope_slot(s, name);
   if (i >= 0) { ax_release(s->vals[i]); s->vals[i] = v; return; }
   if (s->len * 4 >= s->cap * 3) scope_grow(s);

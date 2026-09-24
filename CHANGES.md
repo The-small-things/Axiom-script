@@ -48,6 +48,42 @@ fields are read once per body instead of once per pair.
 The new JavaScript pass is byte-identical to the old one on the 120- and 400-body crowds, and
 `AXIOM_BROADPHASE=pairs|grid` forces either path for testing.
 
+### Any function is a method
+
+Where a value has no method of that name, `x.f(a, b)` now calls `f(x, a, b)` for any declared
+`^fn`/`^proc` or library function — `xs.sorted().uniq()`, `text.lines().len()`, `p.norm1()`.
+Chains read left to right without `|>` or nesting. Ranges take every array method
+(`(0..n).map(f)` used to fail in both runtimes), and `sort` is an alias of `sorted` (still a
+copy): it is the name a program reaches for first.
+
+### A faster native interpreter
+
+Measured against the previous commit on the same machine (best of 5):
+
+| | before | after | |
+|---|---|---|---|
+| `fib(27)` | 0.146 s | 0.051 s | 2.9× |
+| 3M-iteration `while` loop | 0.360 s | 0.214 s | 1.7× |
+| 200k dictionary updates | 0.098 s | 0.061 s | 1.6× |
+| 100k-word split and count | 0.044 s | 0.029 s | 1.5× |
+| 300k record constructions | 0.119 s | 0.065 s | 1.8× |
+
+A call used to make five heap allocations: the frame, its two tables, the argument array and
+the `args` array. Frames now hold their first eight bindings inline and are recycled; arguments
+go on the C stack; `args` is bound only when the body mentions it. Two numbers skip the general
+operator dispatch; a `while` body no longer gets a frame of its own (nothing is ever bound in
+it); scope lookups compare interned names by pointer. The remaining cost is name lookup along
+the scope chain — the next step would be resolving locals to slots at parse time.
+
+### Numbers print as JavaScript prints them — found while profiling
+
+Number-to-text went through up to 17 printf calls; it now takes at most three, and follows the
+ECMAScript algorithm exactly — which fixed two real divergences: `0.00001234` printed as
+`1.234e-05` in the native build (JavaScript: `0.00001234`), and integers above 2^53 printed
+all their digits (`2 ** 60` → `1152921504606846976`; JavaScript: `1152921504606847000`).
+`difftest.sh` now checks number formatting against `String(x)` on 100 000 random doubles plus
+every power of two and the notation boundaries (2 million passed while developing it).
+
 ### Faults and `exit()` in machine-readable output
 
 - `--json` for a script now always prints its object — also when `^main` faults (with the

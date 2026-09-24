@@ -141,6 +141,7 @@ struct AxFn {
   AxValue bound;            // optional captured first argument (partial application)
   bool has_bound;
   struct AxEntity *entity;  // a lambda remembers the entity it was created in
+  bool uses_args;           // the body mentions `args`, so a call must bind it
 };
 
 struct AxRange {
@@ -344,12 +345,16 @@ struct AxScope {
   AxObj hdr;
   AxScope *parent;
   bool builtin;         // the library frame: readable, never assigned through
-  // Small open-addressed map keyed by interned name pointers.
+  // Small open-addressed map keyed by interned name pointers. The first AX_SCOPE_INLINE
+  // bindings live in the frame itself — a call's parameters need no further allocation.
   AxStr **keys;
   AxValue *vals;
   uint32_t cap, len;
   bool fn_root;
+  AxStr *ikeys[8];
+  AxValue ivals[8];
 };
+#define AX_SCOPE_INLINE 8
 
 AxScope *ax_scope_new(AxScope *parent, bool fn_root);
 void ax_scope_release(AxScope *s);
