@@ -14,3 +14,5 @@
   print((0..5).map(\v: v * v), range(0, 10, 3).filter(\v: v > 0), (1..4).sum(), range(5, 0, -1).reverse())
   // numbers print as JavaScript prints them
   print(0.00001234, 0.0000123, 2 ** 60, 2 ** 53 + 1, 1e21, 123e18, 5e-324, 2 / 3 * 1e-5, -0.000001, 1e-7)
+  // from_json is JSON.parse: one value and nothing after it
+  print(from_json("1 2"), from_json(" [1] "), from_json("{\"a\": 1} x"), from_json("tru"), from_json("\"s\"\n"), from_json(""))

@@ -499,7 +499,9 @@ if (flags.sim) {
       diagnostics: w.runtimeDiagnostics,
     }, null, 2));
   }
-  process.exit(exitCode !== null ? exitCode : w.runtimeDiagnostics.length ? 1 : 0);
+  // v0.9.3: only a fault fails the run; an advisory (the renderer being absent, a save loaded
+  // across an added field) is reported but does not.
+  process.exit(exitCode !== null ? exitCode : w.runtimeDiagnostics.some(d => d.severity === 'fatal') ? 1 : 0);
 }
 
 // --- Mode detection ---

@@ -197,10 +197,13 @@ static AxValue json_read(JP *j) {
   if (c == 't' && strncmp(j->p, "true", 4) == 0) { j->p += 4; return ax_bool(true); }
   if (c == 'f' && strncmp(j->p, "false", 5) == 0) { j->p += 5; return ax_bool(false); }
   if (c == '"') {
+    // JSON.parse's strings: no raw control characters, only the defined escapes, \u with four
+    // hex digits (a surrogate pair becomes one code point).
     j->p++;
     SB sb = {0};
     sb_add(&sb, "", 0);
     while (*j->p && *j->p != '"') {
+      if ((unsigned char)*j->p < 0x20) { j->ok = false; free(sb.buf); return ax_null(); }
       if (*j->p == '\\') {
         j->p++;
         char e = *j->p++;
@@ -210,18 +213,37 @@ static AxValue json_read(JP *j) {
           case 'r': sb_addz(&sb, "\r"); break;
           case 'b': sb_addz(&sb, "\b"); break;
           case 'f': sb_addz(&sb, "\f"); break;
+          case '"': case '\\': case '/': sb_add(&sb, &e, 1); break;
           case 'u': {
-            char hex[5] = {0};
-            memcpy(hex, j->p, 4);
+            unsigned cp = 0;
+            for (int k = 0; k < 4; k++) {
+              char h = j->p[k];
+              int v = h >= '0' && h <= '9' ? h - '0' : h >= 'a' && h <= 'f' ? h - 'a' + 10 : h >= 'A' && h <= 'F' ? h - 'A' + 10 : -1;
+              if (v < 0) { j->ok = false; free(sb.buf); return ax_null(); }
+              cp = cp * 16 + (unsigned)v;
+            }
             j->p += 4;
-            unsigned cp = (unsigned)strtoul(hex, NULL, 16);
-            // UTF-8 encode (surrogate pairs are left as-is; the corpus does not use them).
-            if (cp < 0x80) { char b = (char)cp; sb_add(&sb, &b, 1); }
-            else if (cp < 0x800) { char b[2] = { (char)(0xC0 | (cp >> 6)), (char)(0x80 | (cp & 0x3F)) }; sb_add(&sb, b, 2); }
-            else { char b[3] = { (char)(0xE0 | (cp >> 12)), (char)(0x80 | ((cp >> 6) & 0x3F)), (char)(0x80 | (cp & 0x3F)) }; sb_add(&sb, b, 3); }
+            if (cp >= 0xD800 && cp < 0xDC00 && j->p[0] == '\\' && j->p[1] == 'u') {
+              unsigned lo = 0;
+              bool hex = true;
+              for (int k = 0; k < 4; k++) {
+                char h = j->p[2 + k];
+                int v = h >= '0' && h <= '9' ? h - '0' : h >= 'a' && h <= 'f' ? h - 'a' + 10 : h >= 'A' && h <= 'F' ? h - 'A' + 10 : -1;
+                if (v < 0) { hex = false; break; }
+                lo = lo * 16 + (unsigned)v;
+              }
+              if (hex && lo >= 0xDC00 && lo < 0xE000) { cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00); j->p += 6; }
+            }
+            char b[4];
+            int nb;
+            if (cp < 0x80) { b[0] = (char)cp; nb = 1; }
+            else if (cp < 0x800) { b[0] = (char)(0xC0 | (cp >> 6)); b[1] = (char)(0x80 | (cp & 0x3F)); nb = 2; }
+            else if (cp < 0x10000) { b[0] = (char)(0xE0 | (cp >> 12)); b[1] = (char)(0x80 | ((cp >> 6) & 0x3F)); b[2] = (char)(0x80 | (cp & 0x3F)); nb = 3; }
+            else { b[0] = (char)(0xF0 | (cp >> 18)); b[1] = (char)(0x80 | ((cp >> 12) & 0x3F)); b[2] = (char)(0x80 | ((cp >> 6) & 0x3F)); b[3] = (char)(0x80 | (cp & 0x3F)); nb = 4; }
+            sb_add(&sb, b, (size_t)nb);
             break;
           }
-          default: sb_add(&sb, &e, 1);
+          default: j->ok = false; free(sb.buf); return ax_null();
         }
         continue;
       }
@@ -282,10 +304,25 @@ static AxValue json_read(JP *j) {
     }
     return ax_dictv(d);
   }
-  char *end = NULL;
-  double d = strtod(j->p, &end);
-  if (end == j->p) { j->ok = false; return ax_null(); }
-  j->p = end;
+  // A JSON number: -?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)? — no Infinity, hex, '+' or '.5'.
+  const char *q = j->p;
+  if (*q == '-') q++;
+  if (*q == '0') q++;
+  else if (*q >= '1' && *q <= '9') { while (*q >= '0' && *q <= '9') q++; }
+  else { j->ok = false; return ax_null(); }
+  if (*q == '.') {
+    q++;
+    if (!(*q >= '0' && *q <= '9')) { j->ok = false; return ax_null(); }
+    while (*q >= '0' && *q <= '9') q++;
+  }
+  if (*q == 'e' || *q == 'E') {
+    q++;
+    if (*q == '+' || *q == '-') q++;
+    if (!(*q >= '0' && *q <= '9')) { j->ok = false; return ax_null(); }
+    while (*q >= '0' && *q <= '9') q++;
+  }
+  double d = strtod(j->p, NULL);
+  j->p = q;
   return ax_num(d);
 }
 
@@ -1463,20 +1500,24 @@ NATIVE(n_to_json) {
   return r;
 }
 // Parse JSON text into a value (dicts for objects); false when it is not valid JSON.
+// JSON.parse: one value, then nothing but whitespace.
 bool ax_json_parse(const char *text, AxValue *out) {
   JP j = { text, true };
   *out = json_read(&j);
+  if (j.ok) {
+    while (*j.p == ' ' || *j.p == '\t' || *j.p == '\n' || *j.p == '\r') j.p++;
+    if (*j.p) j.ok = false;
+  }
   if (!j.ok) { ax_release(*out); *out = ax_null(); }
   return j.ok;
 }
 
 NATIVE(n_from_json) {
   AxStr *s = arg_str(ARG(0));
-  JP j = { s->data, true };
-  AxValue v = json_read(&j);
+  AxValue v;
+  bool ok = ax_json_parse(s->data, &v);
   ax_release(ax_strv(s));
-  if (!j.ok) { ax_release(v); return ax_null(); }
-  return v;
+  return ok ? v : ax_null();
 }
 
 // --- regex ------------------------------------------------------------------------------------

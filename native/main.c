@@ -504,5 +504,5 @@ int main(int argc, char **argv) {
   if (!json) ax_engine_print_diags(vm, stderr);
   else ax_engine_print_json(vm, frames, stdout);
   fflush(stdout);
-  return ax_engine_diag_count(vm) ? 1 : 0;
+  return ax_engine_fatal_count(vm) ? 1 : 0;   // an advisory is reported, but only a fault fails the run
 }

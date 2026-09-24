@@ -8,7 +8,7 @@ CFLAGS  ?= -std=c11 -O2 -D_GNU_SOURCE -Wall -Wextra -Wno-unused-parameter -Wno-u
 LDFLAGS ?=
 LDLIBS  ?= -lm
 
-SRCS = value.c lexer.c parser.c interp.c stdlib.c engine.c host.c infer.c jsmath.c term.c kbd.c render.c fmt.c repl.c main.c
+SRCS = value.c lexer.c parser.c interp.c stdlib.c engine.c host.c infer.c jsmath.c term.c kbd.c render.c fmt.c glb.c repl.c main.c
 OBJS = $(SRCS:.c=.o)
 BIN  = axiom
 

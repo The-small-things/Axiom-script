@@ -28,9 +28,16 @@ Everything the JavaScript runtime runs, with the same results:
   of this code base, so there was nothing to port. `render.c` is a small software rasterizer
   written to the same contract — `!mesh(#Res, color: …)` commands from `&render` blocks, seen
   through the first `&Camera` (`~target`, `~fov`) and lit by the first `&Light` (`~dir`,
-  `~intensity`, `~ambient`). Meshes are procedural (a `#Mesh3D` path naming a sphere, a plane,
-  or anything else → a box); `.glb` geometry, textures, skinning and animation clips are not
-  drawn. The terminal encoder *is* a port: `term.c` produces the same bytes as terminal.js.
+  `~intensity`, `~ambient`). A `#Mesh3D` loaded from a `.glb` (a file, `base64("…")` or a
+  `glb:` heredoc) is drawn from its own triangles; any other is procedural (a path naming a
+  sphere, a plane, or anything else → a box). Textures, skinning, morph targets and animation
+  clips are not drawn — models appear in their rest pose. The `.glb` *loader* is a port
+  (`glb.c`): the same primitives, vertices, indices, materials and `#X_0, #X_1, …` resources,
+  and the same files fail to load. The terminal encoder is a port too: `term.c` produces the
+  same bytes as terminal.js.
+* A loaded mesh's `vertices` and `indices` are arrays here and typed arrays in the reference:
+  the same length, elements and keys, but printing the whole array shows `[…]` rather than
+  JavaScript's `{"0": …}`.
 * **Audio is not played.** `!play`/`!music` are recorded as in the reference, but the native
   build does not spawn a player process.
 * **Particle-filter distributions** draw from the program's seeded generator (`seed(n)`) rather
@@ -44,7 +51,8 @@ The JavaScript implementation is the specification, so verification is different
 program on **both** runtimes and require the same result.
 
 ```
-./difftest.sh        # 39 checks: language, imports, examples, 17 engine programs, math, terminal
+./difftest.sh        # 74 checks: language, --json, the REPL, imports, examples, 24 engine
+                     # programs, math, number formatting, .glb loading, terminal, rendering
 make debug           # ASan + UBSan build; the corpus runs clean under both
 ```
 
@@ -56,6 +64,12 @@ make debug           # ASan + UBSan build; the corpus runs clean under both
   host languages, may differ). Files written by `!save` are compared too. `examples/sim.ax` runs
   1000 frames, and one program replays a `--input` script of key presses.
 * **Math** — 18 `Math` functions × 100 000 inputs, bit-identical to V8 (below).
+* **Number formatting** — `String(x)` for 100 000 random doubles plus every power of two and
+  the notation boundaries.
+* **`.glb` loading** — 29 hand-made files (index types, missing attributes, skins, animations,
+  out-of-bounds reads, broken containers) and 400 mutants of them: the same geometry, or the
+  same failure, from both loaders. Then a model is rendered and must not look like the box
+  fallback.
 * **Terminal output** — 60 pixel buffers × option combinations through terminal.js and
   `term.c`, byte-identical.
 
@@ -152,6 +166,10 @@ rasterizer's span loop), and nothing is there yet.
 | `host.c` | `&Pool`, `&Vec`, `&Map` fields |
 | `infer.c` | `$` distributions, NavMesh3D, `!save`/`!load` |
 | `jsmath.c` | V8's fdlibm, so `Math.*` agrees to the bit |
+| `glb.c` | binary glTF meshes (interpreter.js parseGLBMulti) |
+| `fmt.c` | f-string format specs |
+| `repl.c` | `--repl` |
+| `kbd.c` | live keyboard input for terminal mode |
 | `render.c` | software rasterizer and PNG writer (new code) |
 | `term.c` | terminal output, ported from terminal.js |
 | `main.c` | the `axiom` command |

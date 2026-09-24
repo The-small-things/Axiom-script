@@ -491,11 +491,20 @@ int  ax_engine_last_fault(AxVM *vm, char *code, size_t coden, char *msg, size_t 
 void ax_engine_print_script_json(AxVM *vm, AxValue result, int code, FILE *out);
 bool ax_engine_diag_at(AxVM *vm, int i, const char **code, const char **msg);   // raw message
 int  ax_repl(AxVM *vm);                                                          // repl.c
+
+// glb.c — binary glTF meshes. Vertices are interleaved float32 (pos xyz, normal xyz, uv xy).
+typedef struct { float *verts; int nverts; uint16_t *idx; int nidx; AxValue material; } AxGlbPrim;
+AxGlbPrim *ax_glb_parse(const uint8_t *buf, size_t n, int *nprims);   // NULL when the load fails
+void ax_glb_free(AxGlbPrim *prims, int n);
+bool ax_base64_decode(const char *s, size_t n, uint8_t **out, size_t *outn);
+// The geometry registered for a #Mesh3D resource (engine.c), or NULL.
+const AxGlbPrim *ax_world_mesh(AxVM *vm, AxStr *resource_name);
 void ax_engine_update(AxVM *vm, double dt);
 int  ax_engine_entity_count(AxVM *vm);
 void ax_engine_summary(AxVM *vm, FILE *out);               // "N entities (A, B)"
 void ax_engine_print_json(AxVM *vm, int frames, FILE *out);
 int  ax_engine_diag_count(AxVM *vm);
+int  ax_engine_fatal_count(AxVM *vm);                      // faults only, not advisories
 void ax_engine_print_diags(AxVM *vm, FILE *out);
 void ax_engine_log(AxVM *vm, const char *msg);             // print()/!log land here as well
 bool ax_engine_log_msg(AxVM *vm, AxStr *msg);              // true → the console copy is suppressed

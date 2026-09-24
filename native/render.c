@@ -7,8 +7,9 @@
 // (`~dir`, `~intensity`, `~ambient`). The output is an RGBA buffer, which term.c turns into
 // terminal frames and write_png() into files.
 //
-// Meshes are procedural: a #Mesh3D whose path names a sphere/ball, a plane/ground/floor, or
-// anything else (a box). Loading .glb geometry is not part of the native build.
+// Meshes: a #Mesh3D loaded from a .glb (glb.c) is drawn from its own triangles, in its rest
+// pose; any other is procedural — a path naming a sphere/ball, a plane/ground/floor, or anything
+// else (a box).
 
 #include "axiom.h"
 #include "render.h"
@@ -94,10 +95,42 @@ static bool path_has(const char *path, const char *w) {
   return strstr(low, w) != NULL;
 }
 
-static Mesh *mesh_for(AxValue res) {
+// A .glb primitive as a Mesh (converted once, then reused every frame). Triangles whose indices
+// fall outside the vertex list are dropped rather than read out of bounds.
+static struct { const AxGlbPrim *prim; Mesh m; } *glb_cache;
+static int nglb_cache;
+
+static Mesh *glb_mesh(const AxGlbPrim *prim) {
+  for (int i = 0; i < nglb_cache; i++) if (glb_cache[i].prim == prim) return &glb_cache[i].m;
+  glb_cache = realloc(glb_cache, sizeof(*glb_cache) * (nglb_cache + 1));
+  Mesh *m = &glb_cache[nglb_cache].m;
+  glb_cache[nglb_cache++].prim = prim;
+  m->nv = prim->nverts;
+  m->v = malloc(sizeof(P) * (m->nv ? m->nv : 1));
+  for (int i = 0; i < m->nv; i++) m->v[i] = p3(prim->verts[i * 8], prim->verts[i * 8 + 1], prim->verts[i * 8 + 2]);
+  m->tri = malloc(sizeof(int) * (prim->nidx ? prim->nidx : 1));
+  m->nt = 0;
+  for (int t = 0; t + 2 < prim->nidx; t += 3) {
+    int a = prim->idx[t], b = prim->idx[t + 1], c = prim->idx[t + 2];
+    if (a >= m->nv || b >= m->nv || c >= m->nv) continue;
+    m->tri[m->nt * 3] = a; m->tri[m->nt * 3 + 1] = b; m->tri[m->nt * 3 + 2] = c;
+    m->nt++;
+  }
+  return m;
+}
+
+static Mesh *mesh_for(AxVM *vm, AxValue res) {
   build_meshes();
-  AxValue path = ax_null();
-  if (res.t == AX_DICT) ax_dict_get((AxDict *)res.o, ax_internz("path"), &path);
+  AxValue path = ax_null(), name = ax_null();
+  if (res.t == AX_DICT) {
+    ax_dict_get((AxDict *)res.o, ax_internz("name"), &name);
+    if (name.t == AX_STR) {
+      const AxGlbPrim *prim = ax_world_mesh(vm, (AxStr *)name.o);
+      ax_release(name);
+      if (prim) return glb_mesh(prim);
+    } else ax_release(name);
+    ax_dict_get((AxDict *)res.o, ax_internz("path"), &path);
+  }
   Mesh *m = &box_mesh;
   if (path.t == AX_STR) {
     const char *p = ((AxStr *)path.o)->data;
@@ -255,7 +288,7 @@ uint8_t *ax_render_frame(AxVM *vm, int w, int h) {
       rot = x->rot;
     }
     if (ax_dict_get(cmd, ax_internz("scl"), &scl)) { s = pof(scl, s); ax_release(scl); }
-    Mesh *m = mesh_for(mesh);
+    Mesh *m = mesh_for(vm, mesh);
     P *world = malloc(sizeof(P) * m->nv);
     SP *screen = malloc(sizeof(SP) * m->nv);
     for (int k = 0; k < m->nv; k++) {

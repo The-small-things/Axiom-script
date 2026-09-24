@@ -150,6 +150,29 @@ else
 fi
 rm -rf "$NDIR"
 
+# .glb meshes: a corpus of 29 files (index types, missing attributes, padding, skins, animations,
+# out-of-bounds reads, broken containers) and 400 mutants of them, parsed by interpreter.js and by
+# glb.c — every vertex, index, material and failure must agree. Then the model is drawn, and must
+# not look like a box.
+GDIR=$(mktemp -d)
+if node "$ROOT/native/tests/glb/make.js" "$GDIR" 400 \
+   && cc -std=c11 -O1 -D_GNU_SOURCE -o "$GDIR/glbcheck" "$ROOT/native/tests/glb/glbcheck.c" $(ls "$ROOT"/native/*.c | grep -v -e '/main.c' -e '/repl.c') -lm \
+   && "$GDIR/glbcheck" $(ls "$GDIR"/*.glb | sort) > "$GDIR/c.txt" && diff "$GDIR/js.txt" "$GDIR/c.txt" > "$GDIR/diff.txt"; then
+  pass=$((pass + 1)); printf 'OK   .glb parsing identical to parseGLBMulti (%s files)\n' "$(grep -c '^==' "$GDIR/js.txt")"
+else
+  fail=$((fail + 1)); printf 'FAIL .glb parsing\n'; head -8 "$GDIR/diff.txt" 2>/dev/null
+fi
+sed 's/!mesh(#Model_0/!mesh(#Box/' "$ROOT/native/tests/glb/scene.ax" > "$GDIR/box.ax"
+if "$NATIVE" "$ROOT/native/tests/glb/scene.ax" --headless 1 --width 120 --height 90 > /dev/null && mv screenshots/frame_00001.png "$GDIR/glb.png" \
+   && "$NATIVE" "$GDIR/box.ax" --headless 1 --width 120 --height 90 > /dev/null && mv screenshots/frame_00001.png "$GDIR/box.png" \
+   && [ "$(node "$ROOT/native/tests/glb/pngdiff.js" "$GDIR/glb.png" "$GDIR/box.png" | cut -d' ' -f1)" -gt 100 ]; then
+  pass=$((pass + 1)); printf 'OK   render a .glb model (its own triangles, not the fallback box)\n'
+else
+  fail=$((fail + 1)); printf 'FAIL render a .glb model\n'
+fi
+rmdir screenshots 2>/dev/null
+rm -rf "$GDIR"
+
 # Terminal output: the same pixel buffers through terminal.js and term.c must give the same bytes.
 TDIR=$(mktemp -d)
 if cc -O2 -o "$TDIR/termcheck" "$ROOT/native/tests/term/termcheck.c" "$ROOT/native/term.c" -lm \

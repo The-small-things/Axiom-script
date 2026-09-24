@@ -1,0 +1,5 @@
+// from_json is JSON.parse: strict numbers, strings, escapes and trailing content.
+^main:
+  xs = ["1", "-0", "0.5", ".5", "1.", "01", "+1", "1e5", "1E+2", "1e", "Infinity", "NaN", "0x10", "-", "2.5e-3", "[1,]", "{\"a\":1,}", "\"a\\u0041\"", "\"\\ud83d\\ude00\"", "\"\\x\"", "\"a\tb\"", "\"\\/\"", "[1, 2 ]", " {} ", "nul", "truex", "\"\\u12\""]
+  *s in xs:
+    print(s, "->", to_json(from_json(s)))

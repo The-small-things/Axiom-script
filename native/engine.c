@@ -348,6 +348,8 @@ typedef struct AxWorld {
   const char *source;
   const char *version;
   bool suppress_console;
+  struct { AxStr *name; const AxGlbPrim *prim; } *meshes;   // #Mesh3D resources loaded from .glb
+  int nmeshes;
 } AxWorld;
 
 static AxWorld *W(AxVM *vm) { return vm->world; }
@@ -1532,6 +1534,94 @@ static AxWorld *world_new(void) {
 
 #define PUSH(arr, n, item) do { arr = realloc(arr, sizeof(*(arr)) * ((n) + 1)); (arr)[(n)++] = (item); } while (0)
 
+// ---- .glb meshes (World.loadProgram) ---------------------------------------------------------
+//
+// A #Mesh3D whose data loads as a .glb — inline (`base64("…")` or a `glb:` heredoc) or a file
+// path, read relative to the working directory — is registered as X (the first primitive) and
+// as X_0, X_1, … (every primitive), with `glb: true`, `inline: true` for embedded data, and the
+// primitive's material index, and its `vertices` / `indices`. A mesh that does not load stays a
+// plain descriptor, which the renderer draws by the shape its path names.
+
+static void mesh_register(AxWorld *w, AxStr *name, const AxGlbPrim *prim) {
+  w->meshes = realloc(w->meshes, sizeof(*w->meshes) * (w->nmeshes + 1));
+  ax_retain(ax_strv(name));
+  w->meshes[w->nmeshes].name = name;
+  w->meshes[w->nmeshes].prim = prim;
+  w->nmeshes++;
+}
+
+const AxGlbPrim *ax_world_mesh(AxVM *vm, AxStr *name) {
+  AxWorld *w = W(vm);
+  if (!w || !name) return NULL;
+  for (int i = w->nmeshes - 1; i >= 0; i--) if (ax_str_eq(w->meshes[i].name, name)) return w->meshes[i].prim;
+  return NULL;
+}
+
+// The descriptor's `vertices` (8 float32 per vertex) and `indices`, as the reference exposes
+// them — plain arrays here, typed arrays there.
+static AxValue prim_vertices(const AxGlbPrim *p) {
+  AxArr *a = ax_arr_new((uint32_t)p->nverts * 8);
+  for (int i = 0; i < p->nverts * 8; i++) ax_arr_push(a, ax_num(p->verts[i]));
+  return ax_arrv(a);
+}
+static AxValue prim_indices(const AxGlbPrim *p) {
+  AxArr *a = ax_arr_new((uint32_t)p->nidx);
+  for (int i = 0; i < p->nidx; i++) ax_arr_push(a, ax_num(p->idx[i]));
+  return ax_arrv(a);
+}
+
+static void load_glb_resource(AxWorld *w, AxNode *d, AxDict *res) {
+  uint8_t *bytes = NULL;
+  size_t nbytes = 0;
+  bool inl = d->b != NULL;
+  if (inl) ax_base64_decode(d->b->str->data, d->b->str->len, &bytes, &nbytes);
+  else if (d->a) {
+    FILE *f = fopen(d->a->str->data, "rb");
+    if (f) {
+      size_t cap = 1 << 16;
+      bytes = malloc(cap);
+      size_t got;
+      while ((got = fread(bytes + nbytes, 1, cap - nbytes, f)) > 0) {
+        nbytes += got;
+        if (nbytes == cap) { cap *= 2; bytes = realloc(bytes, cap); }
+      }
+      fclose(f);
+    }
+  }
+  int np = 0;
+  AxGlbPrim *prims = bytes ? ax_glb_parse(bytes, nbytes, &np) : NULL;
+  free(bytes);
+  if (!prims) return;
+  AxStr *kglb = ax_internz("glb"), *kinl = ax_internz("inline"), *kmat = ax_internz("material");
+  AxStr *kv = ax_internz("vertices"), *ki = ax_internz("indices");
+  ax_dict_set(res, kv, prim_vertices(&prims[0]));
+  ax_dict_set(res, ki, prim_indices(&prims[0]));
+  ax_dict_set(res, kglb, ax_bool(true));
+  if (inl) ax_dict_set(res, kinl, ax_bool(true));
+  if (prims[0].material.t != AX_NULL) ax_dict_set(res, kmat, ax_copy(prims[0].material));
+  mesh_register(w, d->str2, &prims[0]);
+  for (int i = 0; i < np; i++) {
+    char nm[512];
+    snprintf(nm, sizeof nm, "%s_%d", d->str2->data, i);
+    AxStr *pname = ax_internz(nm);
+    AxDict *pr = ax_dict_new();
+    ax_dict_set(pr, K_kind, str_val(d->str));
+    ax_dict_set(pr, K_path, (!inl && d->a) ? str_val(d->a->str) : ax_null());
+    ax_dict_set(pr, K_name, str_val(pname));
+    ax_dict_set(pr, kv, prim_vertices(&prims[i]));
+    ax_dict_set(pr, ki, prim_indices(&prims[i]));
+    ax_dict_set(pr, kglb, ax_bool(true));
+    if (inl) ax_dict_set(pr, kinl, ax_bool(true));
+    if (prims[i].material.t != AX_NULL) ax_dict_set(pr, kmat, ax_copy(prims[i].material));
+    ax_dict_set(w->resources, pname, ax_dictv(pr));
+    mesh_register(w, pname, &prims[i]);
+    ax_release(ax_strv(pname));
+  }
+  ax_release(ax_strv(kglb)); ax_release(ax_strv(kinl)); ax_release(ax_strv(kmat));
+  ax_release(ax_strv(kv)); ax_release(ax_strv(ki));
+  // The primitives are kept for the life of the world (render.c draws from them).
+}
+
 void ax_engine_init(AxVM *vm, const char *source) {
   init_keys();
   if (!vm->world) vm->world = world_new();
@@ -1549,6 +1639,7 @@ bool ax_engine_load(AxVM *vm, AxNode *program, const char *source) {
       ax_dict_set(res, K_kind, str_val(d->str));
       ax_dict_set(res, K_path, d->a ? str_val(d->a->str) : ax_null());
       ax_dict_set(res, K_name, str_val(d->str2));
+      if (!strcmp(d->str->data, "Mesh3D")) load_glb_resource(w, d, res);
       ax_dict_set(w->resources, d->str2, ax_dictv(res));
     } else if (d->kind == N_EVENT) PUSH(w->events, w->nevents, d);
     else if (d->kind == N_MIXIN) PUSH(w->mixins, w->nmixins, d);
@@ -2941,6 +3032,12 @@ int ax_engine_exec(AxVM *vm, AxNode *n, AxScope *scope, AxValue *out) {
 // ---------------------------------------------------------------------------------------------
 
 int ax_engine_diag_count(AxVM *vm) { return W(vm) ? W(vm)->ndiags : 0; }
+
+int ax_engine_fatal_count(AxVM *vm) {
+  int n = 0;
+  if (W(vm)) for (int i = 0; i < W(vm)->ndiags; i++) if (!strcmp(W(vm)->diags[i].severity, "fatal")) n++;
+  return n;
+}
 
 static const char *classify_human(const char *code, const char *msg) {
   if (!strcmp(code, "AX-RUNTIME-000")) return "An unclassified runtime fault occurred.";

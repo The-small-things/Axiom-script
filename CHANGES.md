@@ -84,6 +84,22 @@ all their digits (`2 ** 60` → `1152921504606846976`; JavaScript: `115292150460
 `difftest.sh` now checks number formatting against `String(x)` on 100 000 random doubles plus
 every power of two and the notation boundaries (2 million passed while developing it).
 
+### `.glb` models in the native build
+
+The native runtime loads `#Mesh3D` models from `.glb` files and from inline `base64("…")` /
+`glb:` data, registers `#X` and `#X_0, #X_1, …` exactly as the reference does, and draws them
+from their own triangles (rest pose; no textures, skinning or animation). `glb.c` is a port of
+the JavaScript loader, down to which malformed files fail: 29 hand-made files and 400 mutants
+load, or fail, identically in both.
+
+Testing it turned up two more places where native JSON reading was laxer than `JSON.parse` —
+raw control characters in strings, and trailing text after the value (`from_json("1 2")` was
+`1`, now `null` as in JavaScript) — and the native reader now follows the JSON grammar exactly
+(numbers, escapes, `\u` surrogate pairs).
+
+A `--sim` run now exits 1 only for a fault, not for an advisory such as the reference's
+"renderer unavailable" note.
+
 ### Faults and `exit()` in machine-readable output
 
 - `--json` for a script now always prints its object — also when `^main` faults (with the

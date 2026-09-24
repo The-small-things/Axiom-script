@@ -1,0 +1,11 @@
+// The .glb corpus's multi-primitive model, drawn: difftest.sh renders this and the same scene
+// with a procedural box (MESH=box), and requires the two images to differ.
+#Mesh3D Model: "tests/engine/model.glb"
+#Mesh3D Box: "box.glb"
+@Cam &Camera at v3(0, 2, 5)
+  ~target: v3(0, 0.3, 0)
+  ~fov: 50
+@Sun &Light
+  ~dir: v3(-0.4, -1, -0.6)
+@Thing
+  &render: !mesh(#Model_0, color: 0xe0a040)
