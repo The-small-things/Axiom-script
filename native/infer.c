@@ -89,13 +89,13 @@ AxValue ax_dist_new(AxVM *vm, AxNode *field) {
   AxNode *shape = field->a, *prior = field->b, *infer = field->c;
   if (!shape || strcmp(shape->str->data, "Grid") != 0)
     ax_throw(vm, "AX-RUNTIME-000", "this reference interpreter only implements Grid(w,h) distributions; got '%s(...)'", shape ? shape->str->data : "?");
-  AxScope *scope = ax_scope_new(vm->globals, false);
+  AxScope *scope = ax_scope_enter(vm, vm->globals, false);
   double args[2] = { 0, 0 };
   for (int i = 0; i < 2 && i < shape->nlist; i++) { AxValue v = ax_eval(vm, shape->list[i]->b, scope); args[i] = ax_to_num(v); ax_release(v); }
   double np = 64;
   if (infer && infer->nlist) { AxValue v = ax_eval(vm, infer->list[0]->b, scope); np = ax_to_num(v); ax_release(v); }
   if (prior) for (int i = 0; i < prior->nlist; i++) { AxValue v = ax_eval(vm, prior->list[i]->b, scope); ax_release(v); }
-  ax_scope_release(scope);
+  ax_scope_exit(vm, scope);
   Dist *d = calloc(1, sizeof(Dist));
   d->vm = vm;
   d->w = (int)round(args[0]);

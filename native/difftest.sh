@@ -174,7 +174,7 @@ rm -rf "$MDIR"
 # and 2^63, and 100 000 random doubles, against ax_fmt_num.
 NDIR=$(mktemp -d)
 if node "$ROOT/native/tests/numfmt/gen.js" "$NDIR/in.txt" 100000 \
-   && cc -std=c11 -O1 -D_GNU_SOURCE -o "$NDIR/numcheck" "$ROOT/native/tests/numfmt/numcheck.c" $(ls "$ROOT"/native/*.c | grep -v -e '/main.c' -e '/repl.c') -lm \
+   && cc -std=c11 -O1 -D_GNU_SOURCE -o "$NDIR/numcheck" "$ROOT/native/tests/numfmt/numcheck.c" $(ls "$ROOT"/native/*.c | grep -v -e '/main.c') -lm \
    && "$NDIR/numcheck" "$NDIR/in.txt" > "$NDIR/out.txt"; then
   pass=$((pass + 1)); printf 'OK   number formatting identical to String(x) (%s)\n' "$(tail -1 "$NDIR/out.txt" | cut -d, -f1)"
 else
@@ -188,7 +188,7 @@ rm -rf "$NDIR"
 # not look like a box.
 GDIR=$(mktemp -d)
 if node "$ROOT/native/tests/glb/make.js" "$GDIR" 400 \
-   && cc -std=c11 -O1 -D_GNU_SOURCE -o "$GDIR/glbcheck" "$ROOT/native/tests/glb/glbcheck.c" $(ls "$ROOT"/native/*.c | grep -v -e '/main.c' -e '/repl.c') -lm \
+   && cc -std=c11 -O1 -D_GNU_SOURCE -o "$GDIR/glbcheck" "$ROOT/native/tests/glb/glbcheck.c" $(ls "$ROOT"/native/*.c | grep -v -e '/main.c') -lm \
    && "$GDIR/glbcheck" $(ls "$GDIR"/*.glb | sort) > "$GDIR/c.txt" && diff "$GDIR/js.txt" "$GDIR/c.txt" > "$GDIR/diff.txt"; then
   pass=$((pass + 1)); printf 'OK   .glb parsing identical to parseGLBMulti (%s files)\n' "$(grep -c '^==' "$GDIR/js.txt")"
 else

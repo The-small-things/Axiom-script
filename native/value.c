@@ -162,6 +162,7 @@ static void obj_free(AxObj *o) {
         }
         free(f->params);
         free(f->defaults);
+        if (!f->is_expr) free(f->body);   // make_closure's BODY node
         if (f->scope) ax_scope_release(f->scope);
         if (f->has_bound) ax_release(f->bound);
       }
@@ -765,6 +766,22 @@ void ax_scope_release(AxScope *s) {
     if (scope_pooled < SCOPE_POOL) scope_pool[scope_pooled++] = s;
     else free(s);
     s = parent;   // iteratively, so a long chain of frames cannot overflow the C stack
+  }
+}
+
+// Drops every binding while the scope itself lives on. Freeing a VM clears its globals and
+// builtins first: a declared function refers back to the scope that holds it, a cycle that
+// reference counting alone would never free.
+void ax_scope_clear(AxScope *s) {
+  for (uint32_t i = 0; i < s->cap; i++) {
+    if (!s->keys[i]) continue;
+    AxValue kv; kv.t = AX_STR; kv.o = (AxObj *)s->keys[i];
+    AxValue v = s->vals[i];
+    s->keys[i] = NULL;
+    s->vals[i] = ax_null();
+    s->len--;
+    ax_release(kv);
+    ax_release(v);
   }
 }
 

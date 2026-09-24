@@ -16,13 +16,11 @@
 #include <unistd.h>
 #include <setjmp.h>
 
-bool ax_imports_resolve(AxNode *program, const char *from_path, char *err, size_t errn);
-
 static AxVM *VM;
 static AxScope *SCOPE;
-static int seen_diags;
 static bool interactive;
 static jmp_buf exit_target;
+static int errors;              // errors reported by the current ax_repl_eval call
 
 typedef struct { char *buf; size_t len, cap; } Buf;
 static void buf_add(Buf *b, const char *s, size_t n) {
@@ -36,10 +34,31 @@ static void buf_add(Buf *b, const char *s, size_t n) {
 }
 static void buf_str(Buf *b, const char *s) { buf_add(b, s, strlen(s)); }
 
+static Buf *capture;            // ax_repl_eval: echoed values collect here instead of printing
+static Buf captured;
+static char last_error[600];    // "CODE: message" of the latest error reported
+
 static void fail(const char *code, const char *msg) {
   fflush(stdout);
-  fprintf(stderr, "error [%s]: %s\n", code, msg);
+  Buf b = { 0 };
+  buf_str(&b, "error [");
+  buf_str(&b, code);
+  buf_str(&b, "]: ");
+  buf_str(&b, msg);
+  ax_write_line(VM, 2, b.buf, b.len);
+  free(b.buf);
   fflush(stderr);
+  snprintf(last_error, sizeof last_error, "%s: %s", code, msg);
+  errors++;
+}
+
+static void out_line(const char *s) {
+  if (capture) {
+    if (capture->len) buf_str(capture, "\n");
+    buf_str(capture, s);
+    return;
+  }
+  ax_write_line(VM, 1, s, strlen(s));
 }
 
 // Bracket depth > 0 or an open """ → `open`; `colon` when the last significant character
@@ -109,9 +128,9 @@ static bool is_cont(const char *s) {
 // Faults recorded rather than thrown: a global initializer, a frame block during :step.
 static void flush_diags(void) {
   int n = ax_engine_diag_count(VM);
-  for (; seen_diags < n; seen_diags++) {
+  for (; VM->repl_seen < n; VM->repl_seen++) {
     const char *code, *msg;
-    if (ax_engine_diag_at(VM, seen_diags, &code, &msg)) fail(code, msg);
+    if (ax_engine_diag_at(VM, VM->repl_seen, &code, &msg)) fail(code, msg);
   }
 }
 
@@ -134,11 +153,11 @@ static void show(AxValue v) {
   if (v.t == AX_STR) {
     char *j = NULL;
     ax_json_write(v, 0, &j);
-    printf("%s\n", j);
+    out_line(j);
     free(j);
   } else {
     AxStr *s = ax_to_str(v);
-    printf("%s\n", s->data);
+    out_line(s->data);
     ax_release(ax_strv(s));
   }
   fflush(stdout);
@@ -146,11 +165,15 @@ static void show(AxValue v) {
 
 // Parse `src`; NULL (after reporting, when `report`) on an error.
 static AxNode *parse_src(const char *src, bool report) {
-  AxTokens *toks = calloc(1, sizeof *toks);       // kept: the AST points into them
-  AxParseResult *pr = calloc(1, sizeof *pr);
-  if (!ax_tokenize(src, toks)) { if (report) fail("AX-PARSE-000", toks->err); return NULL; }
-  if (!ax_parse(toks, pr)) { if (report) fail("AX-PARSE-000", pr->err); return NULL; }
-  return pr->program;
+  AxTokens toks;
+  AxParseResult pr;
+  memset(&pr, 0, sizeof pr);
+  AxNode *program = NULL;
+  if (!ax_tokenize(src, &toks)) { if (report) fail("AX-PARSE-000", toks.err); }
+  else if (!ax_parse(&toks, &pr)) { if (report) fail("AX-PARSE-000", pr.err); }
+  else program = pr.program;   // the AST copies what it needs from the tokens
+  ax_tokens_free(&toks);
+  return program;
 }
 
 static AxNode *find_main(AxNode *program) {
@@ -163,9 +186,10 @@ static void declare(const char *src) {
   buf_str(&b, src);
   buf_str(&b, "\n");
   AxNode *program = parse_src(b.buf, true);
+  free(b.buf);
   if (!program) return;
   char err[512] = { 0 };
-  if (!ax_imports_resolve(program, "./<repl>.ax", err, sizeof err)) { fail("AX-USE-001", err); return; }
+  if (!ax_imports_resolve(VM, program, "./<repl>.ax", false, err, sizeof err)) { fail("AX-USE-001", err); return; }
   ax_program_declare(VM, program);   // functions, types; a faulting global is recorded
   ax_engine_load(VM, program, NULL);
   flush_diags();
@@ -178,7 +202,7 @@ static void exec_main(AxNode *m, bool expr) {
   VM->ctx.in_fn = true;
   VM->ctx.hot = false;
   VM->ctx.dt = 0;
-  int hidx = VM->nhandlers++;
+  int hidx = ax_handler_push(VM);
   int saved_depth = VM->call_depth;
   if (setjmp(VM->handlers[hidx]) == 0) {
     if (expr && m->nlist == 1 && m->list[0]->kind == N_EXPRSTMT) {
@@ -281,10 +305,10 @@ static bool command(const char *line) {
   long arg = 0;
   sscanf(line, "%31s %ld", cmd, &arg);
   if (!strcmp(cmd, ":q") || !strcmp(cmd, ":quit") || !strcmp(cmd, ":exit")) return false;
-  if (!strcmp(cmd, ":help") || !strcmp(cmd, ":h")) { fputs(HELP, stdout); fflush(stdout); return true; }
+  if (!strcmp(cmd, ":help") || !strcmp(cmd, ":h")) { ax_write(VM, 1, HELP, strlen(HELP)); fflush(stdout); return true; }
   if (!strcmp(cmd, ":step")) {
     if (arg < 1) arg = 1;
-    int hidx = VM->nhandlers++;
+    int hidx = ax_handler_push(VM);
     if (setjmp(VM->handlers[hidx]) == 0) {
       for (long i = 0; i < arg; i++) ax_engine_update(VM, 1.0 / 60);
       VM->nhandlers = hidx;
@@ -322,6 +346,43 @@ static bool feed(char *line) {
   settle();
   return true;
 }
+
+// The embedding API's axiom_eval: `code` runs as a sequence of REPL entries (a trailing open
+// block is closed). Echoed values are returned joined by newlines (NULL when none); errors are
+// reported on stream 2 and counted. exit() inside lands on the caller's vm->exit_jmp.
+int ax_repl_eval(AxVM *vm, const char *code, char **echo) {
+  VM = vm;
+  SCOPE = vm->globals;
+  if (!vm->world) ax_engine_init(vm, NULL);
+  errors = 0;
+  last_error[0] = '\0';
+  // Static rather than on this frame: exit() can leave the call by longjmp.
+  captured.len = 0;
+  if (captured.buf) captured.buf[0] = '\0';
+  capture = echo ? &captured : NULL;
+  chunk.len = 0;
+  if (chunk.buf) chunk.buf[0] = '\0';
+  block = false;
+  const char *p = code;
+  bool more = true;
+  while (more && *p) {
+    const char *nl = strchr(p, '\n');
+    size_t n = nl ? (size_t)(nl - p) : strlen(p);
+    char *line = malloc(n + 1);
+    memcpy(line, p, n);
+    line[n] = '\0';
+    more = feed(line);
+    free(line);
+    p += n + (nl ? 1 : 0);
+  }
+  flush_chunk();
+  flush_diags();
+  capture = NULL;
+  if (echo) *echo = captured.len ? strdup(captured.buf) : NULL;
+  return errors;
+}
+
+const char *ax_repl_error(void) { return last_error[0] ? last_error : NULL; }
 
 int ax_repl(AxVM *vm) {
   VM = vm;

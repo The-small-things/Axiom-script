@@ -32,25 +32,61 @@ typedef struct ArenaBlock {
   char data[];
 } ArenaBlock;
 
-static ArenaBlock *g_arena = NULL;
+// An arena is its blocks plus the strings its nodes own (literals), released with it.
+typedef struct Arena {
+  ArenaBlock *blocks;
+  AxStr **owned;
+  int nowned, capowned;
+} Arena;
+
+static Arena g_default;
+static Arena *g_arena = &g_default;
 
 static void *arena_alloc(size_t n) {
   n = (n + 15) & ~(size_t)15;
-  if (!g_arena || g_arena->used + n > g_arena->cap) {
+  ArenaBlock *head = g_arena->blocks;
+  if (!head || head->used + n > head->cap) {
     size_t cap = n > (size_t)64 * 1024 ? n : (size_t)64 * 1024;
     ArenaBlock *b = calloc(1, sizeof(ArenaBlock) + cap);
     if (!b) { fprintf(stderr, "axiom: out of memory\n"); exit(70); }
     b->cap = cap;
-    b->next = g_arena;
-    g_arena = b;
+    b->next = head;
+    g_arena->blocks = head = b;
   }
-  void *p = g_arena->data + g_arena->used;
-  g_arena->used += n;
+  void *p = head->data + head->used;
+  head->used += n;
   return p;
 }
 
-void ax_ast_free_all(void) {
-  while (g_arena) { ArenaBlock *n = g_arena->next; free(g_arena); g_arena = n; }
+// A string the AST holds: a literal's text, an f-string's format spec.
+static AxStr *ast_str(const char *data, size_t len) {
+  AxStr *s = ax_str_new(data, len);
+  Arena *a = g_arena;
+  if (a->nowned == a->capowned) {
+    a->capowned = a->capowned ? a->capowned * 2 : 64;
+    a->owned = realloc(a->owned, sizeof(AxStr *) * (size_t)a->capowned);
+  }
+  a->owned[a->nowned++] = s;
+  return s;
+}
+
+static void arena_clear(Arena *a) {
+  while (a->blocks) { ArenaBlock *n = a->blocks->next; free(a->blocks); a->blocks = n; }
+  for (int i = 0; i < a->nowned; i++) ax_release(ax_strv(a->owned[i]));
+  free(a->owned);
+  a->owned = NULL;
+  a->nowned = a->capowned = 0;
+}
+
+void ax_ast_free_all(void) { arena_clear(&g_default); }
+
+// The embedding API gives each instance its own arena, so freeing an instance frees its AST.
+void *ax_arena_new(void) { return calloc(1, sizeof(Arena)); }
+void *ax_arena_swap(void *arena) { Arena *old = g_arena; g_arena = arena ? arena : &g_default; return old; }
+void ax_arena_free(void *arena) {
+  if (!arena || arena == &g_default) return;
+  arena_clear(arena);
+  free(arena);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -297,7 +333,7 @@ static AxNode *parse_fstring(P *p, AxTok *tok) {
     if (s[i] == '{') {
       if (bl) {
         AxNode *lit = node(p, N_STR);
-        lit->str = ax_str_new(buf, bl);
+        lit->str = ast_str(buf, bl);
         lit->flag = true;
         nl_push(&parts, lit);
         bl = 0;
@@ -342,10 +378,11 @@ static AxNode *parse_fstring(P *p, AxTok *tok) {
         if (colon >= 0 && spec[0]) {
           AxNode *f = node(p, N_FMT);
           f->a = e;
-          f->str = ax_str_new(spec, strlen(spec));
+          f->str = ast_str(spec, strlen(spec));
           e = f;
         }
         nl_push(&parts, e);
+        ax_tokens_free(sub);   // the expression holds its own copies
       } else {
         perr(p, "invalid expression inside an f-string");
       }
@@ -356,7 +393,7 @@ static AxNode *parse_fstring(P *p, AxTok *tok) {
   }
   if (bl) {
     AxNode *lit = node(p, N_STR);
-    lit->str = ax_str_new(buf, bl);
+    lit->str = ast_str(buf, bl);
     lit->flag = true;
     nl_push(&parts, lit);
   }
@@ -400,7 +437,7 @@ static AxNode *parse_primary(P *p) {
     case T_STR: {
       advance(p);
       AxNode *n = node(p, N_STR);
-      n->str = ax_str_new(t->payload, t->len);
+      n->str = ast_str(t->payload, t->len);
       return n;
     }
     case T_FSTR: advance(p); return parse_fstring(p, t);
@@ -1375,6 +1412,9 @@ static AxNode *parse_fn(P *p, bool is_main) {
     return n;
   }
   expect(p, T_COLON, "after the function header");
+  // Only ^main takes a one-line body; a function's body is an indented block (its one-line
+  // form is `^fn f(x) = expr`), as in parser.js.
+  if (!is_main && !at(p, T_NEWLINE)) perr(p, "expected a new line after '%s:' (a one-line body is `^fn %s(...) = expr`)", kw->payload, n->str->data);
   NodeList body = {0};
   parse_body(p, &body);
   n->list = body.items;
@@ -1446,7 +1486,7 @@ static AxNode *parse_use(P *p) {
   for (;;) {
     AxTok *s = expect(p, T_STR, "as an import path");
     AxNode *lit = node(p, N_STR);
-    lit->str = ax_str_new(s->payload, s->len);
+    lit->str = ast_str(s->payload, s->len);
     nl_push(&paths, lit);
     if (at(p, T_COMMA)) { advance(p); continue; }
     break;
@@ -1758,7 +1798,7 @@ static AxNode *parse_resource(P *p) {
     advance(p); advance(p);
     AxTok *t = expect(p, T_STR, "as the base64 payload");
     n->b = node(p, N_STR);
-    n->b->str = ax_str_new(t->payload, t->len);
+    n->b->str = ast_str(t->payload, t->len);
     expect(p, T_RPAREN, NULL);
     end_stmt(p);
     return n;
@@ -1779,13 +1819,13 @@ static AxNode *parse_resource(P *p) {
     expect(p, T_DEDENT, NULL);
     if (!chunks) perr(p, "#%s %s: glb: heredoc requires at least one quoted base64 chunk", n->str->data, n->str2->data);
     n->b = node(p, N_STR);
-    n->b->str = ax_str_new(buf, len);
+    n->b->str = ast_str(buf, len);
     free(buf);
     return n;
   }
   AxTok *t = expect(p, T_STR, "as the resource path");
   n->a = node(p, N_STR);
-  n->a->str = ax_str_new(t->payload, t->len);
+  n->a->str = ast_str(t->payload, t->len);
   end_stmt(p);
   return n;
 }

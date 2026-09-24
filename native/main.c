@@ -24,7 +24,9 @@
 #include <ctype.h>
 #include <time.h>
 #include <sys/stat.h>
+#ifndef __wasi__
 #include <sys/ioctl.h>
+#endif
 #include <setjmp.h>
 #include "term.h"
 #include "render.h"
@@ -58,123 +60,6 @@ static char *read_stdin_all(void) {
   }
   buf[len] = '\0';
   return buf;
-}
-
-// ---------------------------------------------------------------------------------------------
-// `^use "lib.ax"` — include-once module resolution.
-//
-// The same rule as the reference implementation: paths resolve relative to the importing file,
-// `.ax` is appended when the literal path is absent, each resolved path is visited at most once
-// (so diamonds and cycles terminate), and a declaration the importing file already makes wins.
-// Imported declarations are spliced into the program before it runs, which is why a function in
-// a library is visible to the whole program regardless of where the ^use appears.
-// ---------------------------------------------------------------------------------------------
-
-#define MAX_IMPORTS 128
-
-typedef struct {
-  char *paths[MAX_IMPORTS];
-  int count;
-} ImportSet;
-
-static bool import_seen(ImportSet *set, const char *path) {
-  for (int i = 0; i < set->count; i++) if (strcmp(set->paths[i], path) == 0) return true;
-  return false;
-}
-
-static void dirname_of(const char *path, char *out, size_t n) {
-  const char *slash = strrchr(path, '/');
-  if (!slash) { snprintf(out, n, "."); return; }
-  size_t len = (size_t)(slash - path);
-  if (len >= n) len = n - 1;
-  memcpy(out, path, len);
-  out[len] = '\0';
-}
-
-// What a declaration is called: a resource by its name (not its kind), a global by its first
-// name, everything else by its own name.
-static const AxStr *decl_name(const AxNode *d) {
-  if (d->kind == N_RESOURCE) return d->str2;
-  if (d->kind == N_GLOBAL) return d->nnames ? d->names[0] : NULL;
-  return d->str;
-}
-
-// Appends every declaration of `src` that `dst` does not already declare.
-static void splice_program(AxNode *dst, AxNode *src) {
-  int extra = src->nlist;
-  if (!extra) return;
-  AxNode **merged = malloc(sizeof(AxNode *) * (size_t)(dst->nlist + extra));
-  int n = 0;
-  for (int i = 0; i < dst->nlist; i++) merged[n++] = dst->list[i];
-  for (int i = 0; i < extra; i++) {
-    AxNode *d = src->list[i];
-    if (d->kind == N_MAIN) continue;          // only the entry file's ^main runs
-    if (d->kind == N_USE) continue;           // already resolved
-    bool clash = false;
-    const AxStr *dn = decl_name(d);
-    if (dn) {
-      for (int j = 0; j < dst->nlist && !clash; j++) {
-        AxNode *e = dst->list[j];
-        const AxStr *en = decl_name(e);
-        clash = en && e->kind == d->kind && (e->kind != N_FN || e->op == d->op) && ax_str_eq(en, dn);
-      }
-    }
-    if (clash) continue;                      // the importing file wins
-    merged[n++] = d;
-  }
-  dst->list = merged;
-  dst->nlist = n;
-}
-
-static bool resolve_imports(AxNode *program, const char *from_path, ImportSet *seen, char *err, size_t errn) {
-  char dir[4096];
-  dirname_of(from_path ? from_path : "./x", dir, sizeof dir);
-  // The list grows as imports are spliced in, so take the count up front.
-  int original = program->nlist;
-  for (int i = 0; i < original; i++) {
-    AxNode *d = program->list[i];
-    if (d->kind != N_USE) continue;
-    for (int p = 0; p < d->nlist; p++) {
-      const char *rel = d->list[p]->str->data;
-      // Paths are bounded well below the buffer: a longer one is a mistake worth reporting
-      // rather than silently truncating into a different file.
-      size_t dlen = strlen(dir), rlen = strlen(rel);
-      if (dlen + rlen + 8 >= 2048) { snprintf(err, errn, "^use path is too long"); return false; }
-      char resolved[2048];
-      memcpy(resolved, dir, dlen);
-      resolved[dlen] = '/';
-      memcpy(resolved + dlen + 1, rel, rlen);
-      resolved[dlen + 1 + rlen] = '\0';
-      if (access(resolved, R_OK) != 0) {
-        // Try the same path with '.ax' appended — the bound above leaves room for it.
-        memcpy(resolved + dlen + 1 + rlen, ".ax", 4);
-        if (access(resolved, R_OK) != 0) resolved[dlen + 1 + rlen] = '\0';
-      }
-      char real[PATH_MAX];
-      if (!realpath(resolved, real)) snprintf(real, sizeof real, "%s", resolved);
-      if (import_seen(seen, real)) continue;
-      if (seen->count >= MAX_IMPORTS) { snprintf(err, errn, "too many imports"); return false; }
-      seen->paths[seen->count++] = strdup(real);
-
-      char *src = read_file(real);
-      if (!src) { snprintf(err, errn, "^use \"%.200s\": no such file (looked in %.200s)", rel, dir); return false; }
-      AxTokens *toks = calloc(1, sizeof(AxTokens));
-      if (!ax_tokenize(src, toks)) { snprintf(err, errn, "^use \"%.120s\" (line %d): %.240s", rel, toks->err_line, toks->err); return false; }
-      AxParseResult *pr = calloc(1, sizeof(AxParseResult));
-      if (!ax_parse(toks, pr)) { snprintf(err, errn, "^use \"%.120s\" (line %d): %.240s", rel, pr->err_line, pr->err); return false; }
-      // Depth first, so a library's own imports are available to it.
-      if (!resolve_imports(pr->program, real, seen, err, errn)) return false;
-      splice_program(program, pr->program);
-    }
-  }
-  return true;
-}
-
-// For the REPL: each declaration chunk resolves its imports against one shared set, so a
-// library is loaded once per session.
-bool ax_imports_resolve(AxNode *program, const char *from_path, char *err, size_t errn) {
-  static ImportSet session;
-  return resolve_imports(program, from_path, &session, err, errn);
 }
 
 static void usage(void) {
@@ -312,18 +197,14 @@ int main(int argc, char **argv) {
     return 1;
   }
   ax_check_free(chk);
-  ImportSet imports = {0};
-  if (path) {
-    char real[4096];
-    if (realpath(path, real)) imports.paths[imports.count++] = strdup(real);
-  }
+  AxVM *vm = ax_vm_new();
+  if (path) ax_imports_seed(vm, path);
   char imp_err[512] = {0};
-  if (!resolve_imports(pr.program, path, &imports, imp_err, sizeof imp_err)) {
+  if (!ax_imports_resolve(vm, pr.program, path, false, imp_err, sizeof imp_err)) {
     fprintf(stderr, "%s: %s\n", path ? path : "<eval>", imp_err);
     return 1;
   }
 
-  AxVM *vm = ax_vm_new();
   ax_stdlib_install(vm);
   vm->sandbox = sandbox;
   vm->allow_exec = allow_exec;
@@ -425,9 +306,11 @@ int main(int argc, char **argv) {
     topt.unicode = ascii ? false : uni;
     topt.color = no_color ? false : col;
     topt.subpixel = subpixel && !ascii;
-    struct winsize ws;
     int cols = 80, lines = 24;
+#ifndef __wasi__
+    struct winsize ws;
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col) { cols = ws.ws_col; lines = ws.ws_row; }
+#endif
     topt.term_width = cols < 80 ? cols : 80;
     topt.term_height = lines - 2 < 40 ? lines - 2 : 40;
     topt.is_tty = isatty(STDOUT_FILENO);

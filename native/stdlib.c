@@ -406,16 +406,18 @@ static AxValue re_match_record(const char *subject, regmatch_t *m, int ngroups) 
 
 static bool path_allowed(AxArr *list, const char *path) {
   char real[4096];
-  if (!realpath(path, real)) snprintf(real, sizeof real, "%s", path);
+  if (!ax_realpath(path, real)) snprintf(real, sizeof real, "%s", path);
   for (uint32_t i = 0; i < list->len; i++) {
     AxStr *p = (AxStr *)list->items[i].o;
     char allowed[4096];
-    if (!realpath(p->data, allowed)) snprintf(allowed, sizeof allowed, "%s", p->data);
+    if (!ax_realpath(p->data, allowed)) snprintf(allowed, sizeof allowed, "%s", p->data);
     size_t al = strlen(allowed);
     if (strncmp(real, allowed, al) == 0 && (real[al] == '\0' || real[al] == '/')) return true;
   }
   return false;
 }
+
+bool ax_sandbox_can_read(AxVM *vm, const char *path) { return !vm->sandbox || path_allowed(vm->allow_read, path); }
 
 static void check_read(AxVM *vm, const char *path) {
   if (!vm->sandbox) return;
@@ -448,19 +450,23 @@ NATIVE(n_print) {
   }
   AxStr *msg = ax_str_new(sb.buf, sb.len);
   free(sb.buf);
-  if (!ax_engine_log_msg(vm, msg)) { fwrite(msg->data, 1, msg->len, stdout); fputc('\n', stdout); }
+  if (!ax_engine_log_msg(vm, msg)) ax_write_line(vm, 1, msg->data, msg->len);
   ax_release(ax_strv(msg));
   return ax_null();
 }
 
 NATIVE(n_eprint) {
+  SB sb = {0};
+  sb_addz(&sb, "");
   for (int i = 0; i < argc; i++) {
-    if (i) fputc(' ', stderr);
+    if (i) sb_addz(&sb, " ");
     AxStr *s = ax_to_str(args[i]);
-    fwrite(s->data, 1, s->len, stderr);
+    sb_add(&sb, s->data, s->len);
     ax_release(ax_strv(s));
   }
-  fputc('\n', stderr);
+  fflush(stdout);
+  ax_write_line(vm, 2, sb.buf, sb.len);
+  free(sb.buf);
   return ax_null();
 }
 
@@ -1872,7 +1878,7 @@ NATIVE(n_path_join) {
 NATIVE(n_input) {
   if (argc > 0 && args[0].t != AX_NULL) {
     AxStr *p = arg_str(args[0]);
-    fwrite(p->data, 1, p->len, stdout);
+    ax_write(vm, 1, p->data, p->len);
     fflush(stdout);
     ax_release(ax_strv(p));
   }
@@ -1917,13 +1923,23 @@ NATIVE(n_sh) {
   AxStr *cmd = arg_str(ARG(0));
   SB sb = {0};
   sb_add(&sb, "", 0);
+#ifdef __wasi__
+  // WebAssembly has no processes to start.
+  ax_release(ax_strv(cmd));
+  free(sb.buf);
+  ax_throw(vm, "AX-SANDBOX-001", "sandbox: running commands is not available in the WebAssembly build");
+  FILE *pipe = NULL;
+#else
   FILE *pipe = popen(cmd->data, "r");
+#endif
   int status = -1;
   if (pipe) {
     char buf[4096];
     size_t got;
     while ((got = fread(buf, 1, sizeof buf, pipe)) > 0) sb_add(&sb, buf, got);
+#ifndef __wasi__
     status = pclose(pipe);
+#endif
     if (status != -1) status = WEXITSTATUS(status);
   }
   ax_release(ax_strv(cmd));

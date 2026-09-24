@@ -57,13 +57,50 @@ static AxValue entity_value(AxEntity *e) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Output
+// ---------------------------------------------------------------------------------------------
+
+void ax_write(AxVM *vm, int stream, const char *data, size_t len) {
+  if (vm->write) { vm->write(vm->write_user, stream, data, len); return; }
+  fwrite(data, 1, len, stream == 2 ? stderr : stdout);
+}
+
+void ax_write_line(AxVM *vm, int stream, const char *data, size_t len) {
+  if (!vm->write) {
+    FILE *f = stream == 2 ? stderr : stdout;
+    fwrite(data, 1, len, f);
+    fputc('\n', f);
+    return;
+  }
+  // One call per line, so a host sees whole lines.
+  char small[256];
+  char *buf = len + 1 <= sizeof small ? small : malloc(len + 1);
+  memcpy(buf, data, len);
+  buf[len] = '\n';
+  vm->write(vm->write_user, stream, buf, len + 1);
+  if (buf != small) free(buf);
+}
+
+// ---------------------------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------------------------
+
+void ax_live_grow(AxVM *vm) {
+  vm->caplive = vm->caplive ? vm->caplive * 2 : 64;
+  vm->live = realloc(vm->live, sizeof(AxScope *) * (size_t)vm->caplive);
+}
+
+void ax_unwind_scopes(AxVM *vm, int mark) {
+  while (vm->nlive > mark) ax_scope_release(vm->live[--vm->nlive]);
+}
 
 void ax_throw_value(AxVM *vm, AxValue v) {
   ax_release(vm->error);
   vm->error = v;
-  if (vm->nhandlers > 0) longjmp(vm->handlers[vm->nhandlers - 1], 1);
+  if (vm->nhandlers > 0) {
+    ax_unwind_scopes(vm, vm->handler_live[vm->nhandlers - 1]);
+    longjmp(vm->handlers[vm->nhandlers - 1], 1);
+  }
   // Unhandled: print and stop. The message is the one a model will read, so it names the code.
   AxValue msg;
   const char *text = vm->error_msg;
@@ -326,7 +363,7 @@ AxValue ax_call(AxVM *vm, AxValue fnv, AxValue *args, int argc) {
   if (f->entity) vm->ctx.entity = f->entity;
   vm->ctx.in_fn = true;
   vm->ctx.hot = false;
-  AxScope *s = ax_scope_new(f->scope, true);
+  AxScope *s = ax_scope_enter(vm, f->scope, true);
   int off = 0;
   if (f->has_bound) {
     if (f->nparams > 0) ax_scope_declare(s, f->params[0], ax_copy(f->bound));
@@ -356,7 +393,7 @@ AxValue ax_call(AxVM *vm, AxValue fnv, AxValue *args, int argc) {
     if (flow == AX_FLOW_RETURN) result = ret;
     else ax_release(ret);
   }
-  ax_scope_release(s);
+  ax_scope_exit(vm, s);
   vm->call_depth--;
   vm->ctx = saved_ctx;
   return result;
@@ -838,7 +875,7 @@ static AxValue eval_node(AxVM *vm, AxNode *n, AxScope *scope) {
       AxArr *seq = ax_to_seq(vm, iter);
       ax_release(iter);
       AxArr *out = ax_arr_new(seq->len);
-      AxScope *inner = ax_scope_new(scope, false);
+      AxScope *inner = ax_scope_enter(vm, scope, false);
       for (uint32_t i = 0; i < seq->len; i++) {
         if (n->nnames == 1) {
           ax_scope_declare(inner, n->names[0], ax_copy(seq->items[i]));
@@ -855,7 +892,7 @@ static AxValue eval_node(AxVM *vm, AxNode *n, AxScope *scope) {
         }
         ax_arr_push(out, eval_node(vm, n->a, inner));
       }
-      ax_scope_release(inner);
+      ax_scope_exit(vm, inner);
       ax_release(ax_arrv(seq));
       return ax_arrv(out);
     }
@@ -1116,13 +1153,13 @@ static void assign_member_path(AxVM *vm, AxNode *n, AxScope *scope) {
 static __attribute__((noinline)) int exec_try(AxVM *vm, AxNode *n, AxScope *scope, AxValue *out) {
   volatile int flow = AX_FLOW_NORMAL;
   if (vm->nhandlers >= AX_MAX_HANDLERS) ax_throw(vm, "AX-TRY", "too many nested ^try blocks");
-  int hidx = vm->nhandlers++;
+  int hidx = ax_handler_push(vm);
   int saved_depth = vm->call_depth;
   AxCtx saved_ctx = vm->ctx;
   if (setjmp(vm->handlers[hidx]) == 0) {
-    AxScope *inner = ax_scope_new(scope, false);
+    AxScope *inner = ax_scope_enter(vm, scope, false);
     flow = exec_list(vm, n->list, n->nlist, inner, out);
-    ax_scope_release(inner);
+    ax_scope_exit(vm, inner);
     vm->nhandlers--;
   } else {
     // An error unwound to here: the handler is already popped by the throw path's caller.
@@ -1130,21 +1167,21 @@ static __attribute__((noinline)) int exec_try(AxVM *vm, AxNode *n, AxScope *scop
     vm->call_depth = saved_depth;
     vm->ctx = saved_ctx;
     if (n->c) {
-      AxScope *cscope = ax_scope_new(scope, false);
+      AxScope *cscope = ax_scope_enter(vm, scope, false);
       if (n->str) ax_scope_declare(cscope, n->str, ax_copy(vm->error));
       flow = exec_list(vm, n->c->list, n->c->nlist, cscope, out);
-      ax_scope_release(cscope);
+      ax_scope_exit(vm, cscope);
     } else {
       if (n->b) {
-        AxScope *fscope = ax_scope_new(scope, false);
+        AxScope *fscope = ax_scope_enter(vm, scope, false);
         exec_list(vm, n->b->list, n->b->nlist, fscope, out);
-        ax_scope_release(fscope);
+        ax_scope_exit(vm, fscope);
       }
       ax_throw_value(vm, ax_copy(vm->error));   // no catch clause: keep unwinding
     }
   }
   if (n->b) {
-    AxScope *fscope = ax_scope_new(scope, false);
+    AxScope *fscope = ax_scope_enter(vm, scope, false);
     AxValue ignored = ax_null();
     int fflow = exec_list(vm, n->b->list, n->b->nlist, fscope, &ignored);
     ax_release(ignored);
@@ -1278,17 +1315,17 @@ static int exec_stmt(AxVM *vm, AxNode *n, AxScope *scope, AxValue *out) {
           }
         }
         if (!hit) { bind_free(&binds); continue; }
-        AxScope *arm_scope = ax_scope_new(scope, false);
+        AxScope *arm_scope = ax_scope_enter(vm, scope, false);
         for (int b = 0; b < binds.n; b++) ax_scope_declare(arm_scope, binds.items[b].name, ax_copy(binds.items[b].val));
         bind_free(&binds);
         if (arm->guard) {
           AxValue g = eval_node(vm, arm->guard, arm_scope);
           bool pass = ax_truthy(g);
           ax_release(g);
-          if (!pass) { ax_scope_release(arm_scope); continue; }
+          if (!pass) { ax_scope_exit(vm, arm_scope); continue; }
         }
         int flow = exec_list(vm, arm->body, arm->nbody, arm_scope, out);
-        ax_scope_release(arm_scope);
+        ax_scope_exit(vm, arm_scope);
         ax_release(subject);
         return flow;
       }
@@ -1343,15 +1380,15 @@ static int exec_stmt(AxVM *vm, AxNode *n, AxScope *scope, AxValue *out) {
       }
       ax_release(iter);
       bool fresh = body_creates_closure(n);
-      AxScope *inner = ax_scope_new(scope, false);
+      AxScope *inner = ax_scope_enter(vm, scope, false);
       int flow = AX_FLOW_NORMAL;
       for (uint32_t i = 0; i < seq->len; i++) {
         if (vm->ctx.hot && i >= HOT_LOOP_LIMIT) {
-          ax_scope_release(inner);
+          ax_scope_exit(vm, inner);
           ax_release(ax_arrv(seq));
           ax_throw(vm, "AX-LOOP-002", "for loop exceeded %d iterations in a hot block", HOT_LOOP_LIMIT);
         }
-        if (fresh) { ax_scope_release(inner); inner = ax_scope_new(scope, false); }
+        if (fresh) { ax_scope_exit(vm, inner); inner = ax_scope_enter(vm, scope, false); }
         if (n->nnames == 1) {
           ax_scope_declare(inner, n->names[0], ax_copy(seq->items[i]));
         } else {
@@ -1363,7 +1400,7 @@ static int exec_stmt(AxVM *vm, AxNode *n, AxScope *scope, AxValue *out) {
         if (f == AX_FLOW_BREAK) break;
         if (f == AX_FLOW_RETURN) { flow = f; break; }
       }
-      ax_scope_release(inner);
+      ax_scope_exit(vm, inner);
       ax_release(ax_arrv(seq));
       return flow;
     }
@@ -1456,7 +1493,7 @@ void ax_program_declare(AxVM *vm, AxNode *program) {
   // A global whose initializer faults is recorded and declared null; the program goes on
   // (interpreter.js loadProgram).
   if (vm->nhandlers >= AX_MAX_HANDLERS) ax_throw(vm, "AX-TRY", "handlers nested too deeply");
-  int hidx = vm->nhandlers++;
+  int hidx = ax_handler_push(vm);
   int saved_depth = vm->call_depth;
   for (volatile int i = 0; i < program->nlist; i++) {
     AxNode *d = program->list[i];
@@ -1493,7 +1530,7 @@ bool ax_run_main(AxVM *vm, AxNode *program, AxArr *argv, AxValue *result) {
     *result = ax_null();
     return false;
   }
-  AxScope *s = ax_scope_new(vm->globals, true);
+  AxScope *s = ax_scope_enter(vm, vm->globals, true);
   if (main_decl->nnames > 0) {
     ax_retain(ax_arrv(argv));
     ax_scope_declare(s, main_decl->names[0], ax_arrv(argv));
@@ -1510,7 +1547,7 @@ bool ax_run_main(AxVM *vm, AxNode *program, AxArr *argv, AxValue *result) {
   AxValue ret = ax_null();
   bool ok = true;
   if (vm->nhandlers >= AX_MAX_HANDLERS) ax_throw(vm, "AX-TRY", "handlers nested too deeply");
-  int hidx = vm->nhandlers++;
+  int hidx = ax_handler_push(vm);
   int saved_depth = vm->call_depth;
   volatile int i = 0;
   if (setjmp(vm->handlers[hidx]) == 0) {
@@ -1531,7 +1568,7 @@ bool ax_run_main(AxVM *vm, AxNode *program, AxArr *argv, AxValue *result) {
     ok = false;
   }
   vm->ctx = saved;
-  ax_scope_release(s);
+  ax_scope_exit(vm, s);
   *result = ret;
   return ok;
 }
@@ -1566,6 +1603,10 @@ void ax_vm_free(AxVM *vm) {
   ax_release(ax_arrv(vm->argv));
   ax_release(ax_arrv(vm->allow_read));
   ax_release(ax_arrv(vm->allow_write));
+  ax_unwind_scopes(vm, 0);
+  free(vm->live);
+  ax_scope_clear(vm->globals);
+  ax_scope_clear(vm->builtins);
   ax_scope_release(vm->globals);
   ax_scope_release(vm->builtins);
   free(vm);

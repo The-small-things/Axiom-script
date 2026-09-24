@@ -1360,9 +1360,9 @@ static void run_block(AxVM *vm, AxNode *block, AxEntity *e, double dt, AxDict *p
   vm->ctx.block = block->str;
   vm->ctx.in_fn = false;
   vm->ctx.hot = hot_block(block->str);
-  AxScope *scope = ax_scope_new(vm->globals, false);
   if (vm->nhandlers >= AX_MAX_HANDLERS) ax_throw(vm, "AX-TRY", "frame blocks nested too deeply");
-  int hidx = vm->nhandlers++;
+  AxScope *scope = ax_scope_enter(vm, vm->globals, false);
+  int hidx = ax_handler_push(vm);
   int saved_depth = vm->call_depth;
   volatile int i = 0;
   if (setjmp(vm->handlers[hidx]) == 0) {
@@ -1379,7 +1379,7 @@ static void run_block(AxVM *vm, AxNode *block, AxEntity *e, double dt, AxDict *p
     push_diag(vm, e, block->str, block->list[i]);
     vm->error_code[0] = '\0';
   }
-  ax_scope_release(scope);
+  ax_scope_exit(vm, scope);
   vm->ctx = saved;
 }
 
@@ -1442,7 +1442,7 @@ static AxEntity *entity_new(AxVM *vm, AxStr *name, AxStr *prefab, AxStr *base, A
   for (int i = 0; i < nmembers; i++) {
     AxNode *m = members[i];
     if (m->kind != N_FIELD) continue;
-    AxScope *scope = ax_scope_new(vm->globals, false);
+    AxScope *scope = ax_scope_enter(vm, vm->globals, false);
     AxValue v;
     if (m->op == 1 || (m->a && m->a->kind == N_POOLTYPE)) {
       v = ax_host_from_field(vm, m, e);
@@ -1464,7 +1464,7 @@ static AxEntity *entity_new(AxVM *vm, AxStr *name, AxStr *prefab, AxStr *base, A
         v = t;
       }
     }
-    ax_scope_release(scope);
+    ax_scope_exit(vm, scope);
     ax_dict_set(e->fields, m->str, v);
   }
   for (int i = 0; i < nmembers; i++) {
@@ -1628,6 +1628,43 @@ void ax_engine_init(AxVM *vm, const char *source) {
   vm->world->source = source;
 }
 
+// The embedding API frees a world with its VM. Entity reference cycles (an entity field holding
+// another entity that points back) are not collected, as everywhere else in the runtime.
+void ax_engine_free(AxVM *vm) {
+  AxWorld *w = vm->world;
+  if (!w) return;
+  vm->world = NULL;
+  for (int i = 0; i < w->nents; i++) ax_release((AxValue){ .t = AX_ENTITY, .o = (AxObj *)w->ents[i] });
+  free(w->ents);
+  ax_release(ax_dictv(w->tags));
+  ax_release(ax_dictv(w->resources));
+  ax_release(ax_arrv(w->log));
+  ax_release(ax_dictv(w->tick_acc));
+  ax_release(ax_dictv(w->channels));
+  ax_release(ax_arrv(w->draw_list));
+  ax_release(ax_dictv(w->save_slots));
+  ax_release(ax_dictv(w->input));
+  for (int i = 0; i < w->npending; i++) {
+    if (w->pending[i].payload) ax_release(ax_dictv(w->pending[i].payload));
+  }
+  free(w->pending);
+  for (int i = 0; i < w->ntweens; i++) {
+    ax_release(w->tweens[i].target);
+    ax_release(w->tweens[i].start);
+    ax_release(w->tweens[i].end);
+  }
+  free(w->tweens);
+  free(w->diags);
+  for (int i = 0; i < w->nmeshes; i++) ax_release(ax_strv(w->meshes[i].name));
+  free(w->meshes);
+  free(w->events);
+  free(w->mixins);
+  free(w->materials);
+  for (int i = 0; i < w->ndecls; i++) free(w->decls[i].members);   // shared by its entities
+  free(w->decls);
+  free(w);
+}
+
 bool ax_engine_load(AxVM *vm, AxNode *program, const char *source) {
   ax_engine_init(vm, source);
   AxWorld *w = vm->world;
@@ -1671,9 +1708,9 @@ bool ax_engine_load(AxVM *vm, AxNode *program, const char *source) {
     AxXform *pose = ent_pose(e);
     AxCtx saved = vm->ctx;
     vm->ctx.entity = e; vm->ctx.in_fn = false; vm->ctx.dt = 0; vm->ctx.payload = NULL;
-    AxScope *scope = ax_scope_new(vm->globals, false);
+    AxScope *scope = ax_scope_enter(vm, vm->globals, false);
     AxValue val = ax_eval(vm, d->a, scope);
-    ax_scope_release(scope);
+    ax_scope_exit(vm, scope);
     vm->ctx = saved;
     if (val.t == AX_VEC3 && pose) {
       xform_set(pose, K_pos, ax_copy(val));
@@ -2770,7 +2807,7 @@ static void action(AxVM *vm, AxNode *n, AxScope *scope) {
   if (!strcmp(name, "print") || !strcmp(name, "log")) {
     AxStr *msg = join_args(vm, n, scope);
     bool quiet = w ? ax_engine_log_msg(vm, msg) : false;
-    if (!quiet) { fwrite(msg->data, 1, msg->len, stdout); fputc('\n', stdout); }
+    if (!quiet) ax_write_line(vm, 1, msg->data, msg->len);
     ax_release(ax_strv(msg));
     return;
   }

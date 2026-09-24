@@ -38,6 +38,13 @@
 
 #define AX_VERSION "0.9.2"
 
+// WASI has no realpath: there, paths are compared as written.
+#ifdef __wasi__
+static inline char *ax_realpath(const char *path, char *out) { snprintf(out, 4096, "%s", path); return out; }
+#else
+#define ax_realpath realpath
+#endif
+
 // ============================================================================================
 // Values
 // ============================================================================================
@@ -336,6 +343,9 @@ typedef struct {
 
 bool ax_parse(AxTokens *toks, AxParseResult *out);
 void ax_ast_free_all(void);   // frees the whole AST arena
+void *ax_arena_new(void);            // an AST arena of its own (the embedding API: one per instance)
+void *ax_arena_swap(void *arena);    // make `arena` current (NULL: the default); returns the old
+void ax_arena_free(void *arena);
 
 // ============================================================================================
 // Runtime
@@ -358,6 +368,7 @@ struct AxScope {
 
 AxScope *ax_scope_new(AxScope *parent, bool fn_root);
 void ax_scope_release(AxScope *s);
+void ax_scope_clear(AxScope *s);     // drop every binding (breaks function ↔ scope cycles)
 bool ax_scope_lookup(AxScope *s, AxStr *name, AxValue *out);   // out is +1
 bool ax_scope_lookup_local(AxScope *s, AxStr *name, AxValue *out);   // one frame only
 bool ax_scope_set_existing(AxScope *s, AxStr *name, AxValue v);
@@ -404,11 +415,44 @@ struct AxVM {
   // engine
   AxCtx ctx;
   struct AxWorld *world;   // NULL until a program with entities is loaded
+  // output of print(), eprint() and the console copy of !log (stream 1 or 2); NULL → stdio
+  void (*write)(void *user, int stream, const char *data, size_t len);
+  void *write_user;
+  void *embed;             // the embedding API's handle (api.c), or NULL
+  int repl_seen;           // diagnostics a REPL session has already reported
+  void *imports;           // files ^use has loaded (imports.c)
+  // Scopes live on a stack, so an error unwinding past their C frames (longjmp) still
+  // releases them: a throw releases every scope above its handler's mark.
+  AxScope **live;
+  int nlive, caplive;
+  int handler_live[AX_MAX_HANDLERS];
 };
+
+void ax_live_grow(AxVM *vm);
+void ax_unwind_scopes(AxVM *vm, int mark);
+static inline AxScope *ax_scope_enter(AxVM *vm, AxScope *parent, bool fn_root) {
+  AxScope *s = ax_scope_new(parent, fn_root);
+  if (vm->nlive == vm->caplive) ax_live_grow(vm);
+  vm->live[vm->nlive++] = s;
+  return s;
+}
+static inline void ax_scope_exit(AxVM *vm, AxScope *s) {   // s is the innermost live scope
+  vm->nlive--;
+  ax_scope_release(s);
+}
+static inline int ax_handler_push(AxVM *vm) {
+  int h = vm->nhandlers++;
+  vm->handler_live[h] = vm->nlive;
+  return h;
+}
 
 AxVM *ax_vm_new(void);
 void ax_vm_free(AxVM *vm);
 void ax_stdlib_install(AxVM *vm);
+
+// Program output, through vm->write when an embedding host set one.
+void ax_write(AxVM *vm, int stream, const char *data, size_t len);
+void ax_write_line(AxVM *vm, int stream, const char *data, size_t len);   // appends '\n'
 
 // Raise a runtime error. Never returns.
 void ax_throw(AxVM *vm, const char *code, const char *fmt, ...);
@@ -485,12 +529,22 @@ static inline bool ax_is_vec(AxValue v) { return v.t == AX_VEC2 || v.t == AX_VEC
 // engine.c
 void ax_engine_install(AxVM *vm);                          // engine intrinsics (v3, sphere, …)
 void ax_engine_init(AxVM *vm, const char *source);   // the world, before globals run (they may log)
+void ax_engine_free(AxVM *vm);                       // the world, for an embedding host
 bool ax_engine_load(AxVM *vm, AxNode *program, const char *source);   // true if it declares entities
 void ax_engine_fault(AxVM *vm, const char *block, AxNode *stmt);      // record the pending error
 int  ax_engine_last_fault(AxVM *vm, char *code, size_t coden, char *msg, size_t msgn);   // → its line
 void ax_engine_print_script_json(AxVM *vm, AxValue result, int code, FILE *out);
 bool ax_engine_diag_at(AxVM *vm, int i, const char **code, const char **msg);   // raw message
 int  ax_repl(AxVM *vm);                                                          // repl.c
+int  ax_repl_eval(AxVM *vm, const char *code, char **echo);                  // → errors reported
+const char *ax_repl_error(void);                                             // the latest, or NULL
+
+// ^use (imports.c): splice imported declarations into `program`. `sandboxed` denies files the
+// VM's allow-read list does not cover.
+void ax_imports_seed(AxVM *vm, const char *path);   // the entry file counts as loaded
+bool ax_imports_resolve(AxVM *vm, AxNode *program, const char *from_path, bool sandboxed, char *err, size_t errn);
+void ax_imports_free(AxVM *vm);
+bool ax_sandbox_can_read(AxVM *vm, const char *path);
 
 // check.c — the static checker (checker.js). A parse error, when given, is the only diagnostic.
 typedef struct AxCheck AxCheck;

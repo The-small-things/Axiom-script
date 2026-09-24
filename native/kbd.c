@@ -15,10 +15,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <signal.h>
 #include <unistd.h>
-#include <termios.h>
 #include "term.h"
+#ifndef __wasi__
+#include <signal.h>
+#include <termios.h>
+#endif
 
 #define HOLD_MOVE 0.35
 #define HOLD_TAP 0.12
@@ -66,6 +68,13 @@ void ax_kbd_state(const AxKbd *k, double now, double *mx, double *my, bool *jump
 
 // ---- the terminal ----------------------------------------------------------------------------
 
+#ifdef __wasi__
+// WASI has no terminal control: there is no live keyboard, and a run takes its input from
+// --input (or the embedding host's axiom_set_input).
+void ax_kbd_restore(void) {}
+bool ax_kbd_enable(void) { return false; }
+void ax_kbd_poll(AxKbd *k, double now) { (void)k; (void)now; }
+#else
 static struct termios saved;
 static bool raw_on;
 static volatile sig_atomic_t interrupted;
@@ -105,3 +114,4 @@ void ax_kbd_poll(AxKbd *k, double now) {
   while ((n = read(STDIN_FILENO, buf, sizeof buf)) > 0) ax_kbd_feed(k, buf, (int)n, now);
   if (interrupted) k->quit = true;
 }
+#endif
