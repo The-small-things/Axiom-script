@@ -1,0 +1,2 @@
+^use "util"
+^fn deep() = util(1)

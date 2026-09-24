@@ -16,3 +16,4 @@
   print(0.00001234, 0.0000123, 2 ** 60, 2 ** 53 + 1, 1e21, 123e18, 5e-324, 2 / 3 * 1e-5, -0.000001, 1e-7)
   // from_json is JSON.parse: one value and nothing after it
   print(from_json("1 2"), from_json(" [1] "), from_json("{\"a\": 1} x"), from_json("tru"), from_json("\"s\"\n"), from_json(""))
+  print(unzip([[1, "a"], [2, "b"], [3]]), unzip([]), unzip([[1, 2, 3]]), unzip("ab"), unzip([5, [1, 2]]))

@@ -1,0 +1,12 @@
+@F &Fluid3D
+  ~resolution: 8
+  &physics:
+    !fluid_step()
+    !force(v3(1,0,0))
+    a = 1
+    b = a.x
+    c = a + 1
+    d = ?path(1, 2)
+    a
+    ?a > 1: !fluid_step()
+    a += 2

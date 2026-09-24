@@ -1,0 +1,31 @@
+^type Pair: a, b
+^mix M: ~armor: 1
+^event Hit: damage
+~G: 5
+@E +M
+  ~hp: 10
+  &on(Hit):
+    hp -= damage * armor
+    x = source
+  &tick(1hz):
+    y = helth - 10
+    z = -spd
+    w = arr[0]
+    v = obj.field
+    u = G + 1
+    t = unknown_thing
+    ?* hp:
+      n if n > 3: print(n)
+      Pair(a, b): print(a + b)
+      _: print(0)
+    s = [k * 2 for k in [1, 2]]
+    r = (\m: m + 1)(1)
+    q = idle
+    ?state == idle: print(1)
+    mis = hp + helth
+^fn f(a):
+  ^return a + bogus
+^main:
+  total = 0
+  total += count
+  ^return totl

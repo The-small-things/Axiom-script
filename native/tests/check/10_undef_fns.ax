@@ -1,0 +1,22 @@
+^fn helper(x) = x
+^type P: x, y
+@A
+  ~cb: 0
+  &tick(1hz):
+    a = abx(-1)
+    b = helpr(2)
+    c = P(1, 2)
+    h = \x: x + 1
+    d = h(3)
+    e = cb(1)
+    f = completely_unknown_thing(1)
+    *g in [1]:
+      z = g(1)
+    ^try:
+      k = 1
+    ^catch err:
+      err(1)
+    m = observe(1)
+    n = [q(1) for q in [1]]
+    o = sqrtt(4)
+    ?true: pp = prnt(1)

@@ -1,0 +1,19 @@
+^event Hit: amount:: number, source:: #Entity, note:: string?
+^event Raw: x, y:: string
+@A
+  &tick(10hz):
+    ^Hit(amount: 5)
+    ^Hit(amount: "five", extra: 1)
+    ^Hit(note: "n")
+    ^Nope(a: 1)
+    ^Raw(x: 1, y: 2)
+    ?true:
+      ^Hit(amount: 1, source: self)
+    *i in 0..2:
+      ^Missing()
+  &on(Undeclared):
+    print("x")
+  &on(Collide):
+    print("ok")
+  &on(Hit):
+    print(amount, note, source)

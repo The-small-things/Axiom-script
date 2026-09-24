@@ -1,0 +1,19 @@
+@Target
+  ~score: 0
+  ~hp!: 3
+  @Sub
+    ~depth: 1
+@Writer
+  &tick(1hz):
+    #Target.score = 1
+    #Target.socre = 2
+    #Target.pos = v3(0, 0, 0)
+    #Target.vel.y = 1
+    #Target.wpose = 1
+    #Target.nope.x = 1
+    #Target.score += 1
+    #Sub.depth = 2
+    #Sub.nope = 3
+    #Unknown.x = 1
+    ?true:
+      #Target.bad = 1

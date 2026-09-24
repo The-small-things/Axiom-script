@@ -74,6 +74,38 @@ for f in "$ROOT"/native/tests/repl/*.txt; do
   fi
 done
 
+# The static checker: `--check --json` on both, compared by checkcmp.js (everything identical
+# but a parse error's wording and position). The corpus in tests/check trips every diagnostic;
+# every other program must check the same too; then 300 mutants of all of them.
+check_case() {
+  $NODE_RUN "$1" --no-restack --check --json > /tmp/ax_js.json 2>/dev/null; js_code=$?
+  "$NATIVE" "$1" --check --json > /tmp/ax_c.json 2>/dev/null; c_code=$?
+  node "$ROOT/native/checkcmp.js" /tmp/ax_js.json /tmp/ax_c.json > /tmp/ax_cmp.txt 2>&1 && [ "$js_code" = "$c_code" ]
+}
+CHECK_FILES="$(ls "$ROOT"/native/tests/check/*.ax "$ROOT"/native/tests/*.ax "$ROOT"/native/tests/engine/*.ax "$ROOT"/native/tests/json/*.ax "$ROOT"/examples/*.ax)"
+cfail=0; cn=0
+for f in $CHECK_FILES; do
+  cn=$((cn + 1))
+  if ! check_case "$f"; then cfail=$((cfail + 1)); printf '  differs: %s\n' "$f"; head -3 /tmp/ax_cmp.txt; fi
+done
+if [ "$cfail" -eq 0 ]; then pass=$((pass + 1)); printf 'OK   --check identical on %s programs (tests/check trips every diagnostic)\n' "$cn"
+else fail=$((fail + 1)); printf 'FAIL --check on %s of %s programs\n' "$cfail" "$cn"; fi
+MDIR=$(mktemp -d)
+mkdir -p "$MDIR/lib" && cp "$ROOT"/native/tests/check/lib/* "$MDIR/lib/"
+node "$ROOT/native/tests/check/mutate.js" "$MDIR" 300 $CHECK_FILES
+cfail=0
+for f in "$MDIR"/m*.ax; do
+  if ! check_case "$f"; then cfail=$((cfail + 1)); [ "$cfail" -le 3 ] && { printf '  differs: %s\n' "$f"; head -3 /tmp/ax_cmp.txt; cp "$f" /tmp/ax_mutant_$(basename "$f"); }; fi
+done
+if [ "$cfail" -eq 0 ]; then pass=$((pass + 1)); printf 'OK   --check identical on 300 mutants of them\n'
+else fail=$((fail + 1)); printf 'FAIL --check on %s of 300 mutants (kept in /tmp/ax_mutant_*)\n' "$cfail"; fi
+rm -rf "$MDIR"
+if node "$ROOT/native/tools/gen_checknames.js" | cmp -s - "$ROOT/native/checknames.h"; then
+  pass=$((pass + 1)); printf 'OK   checknames.h matches checker.js and interpreter.js\n'
+else
+  fail=$((fail + 1)); printf 'FAIL checknames.h is stale: node tools/gen_checknames.js > checknames.h\n'
+fi
+
 # Imports: a three-file program with a diamond, built in a temp directory.
 IMPDIR=$(mktemp -d)
 printf '~TWO: 2\n^fn triple(x) = x * 3\n' > "$IMPDIR/mathlib.ax"

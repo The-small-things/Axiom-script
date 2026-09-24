@@ -89,6 +89,7 @@ static void perr(P *p, const char *fmt, ...) {
     vsnprintf(p->res->err, sizeof p->res->err, fmt, ap);
     va_end(ap);
     p->res->err_line = peek(p, 0)->line;
+    p->res->err_col = peek(p, 0)->col;
   }
   p->res->nerrors++;
   longjmp(p->bail, 1);
@@ -541,6 +542,7 @@ static AxNode *parse_primary(P *p) {
       AxTok *id = expect(p, T_IDENT, "after '$'");
       AxNode *n = node(p, N_IDENT);
       n->str = tok_name_str(id);
+      n->op = 1;   // written `$name` (the checker leaves distributions alone)
       return n;
     }
     case T_HASH: return parse_tagref(p);
@@ -1313,12 +1315,24 @@ static AxNode *parse_stmt_inner(P *p) {
 // Declarations
 // ---------------------------------------------------------------------------------------------
 
-static void parse_params(P *p, NameList *names, NodeList *defaults) {
+// `-> T` / `-> #T`: the declared return type, kept as written for the checker.
+static AxStr *parse_ret_type(P *p) {
+  advance(p);   // ->
+  bool hash = at(p, T_HASH);
+  if (hash) advance(p);
+  AxTok *t = expect(p, T_IDENT, "as a return type");
+  if (!hash) return tok_name_str(t);
+  char buf[256];
+  snprintf(buf, sizeof buf, "#%s", t->payload);
+  return ax_internz(buf);
+}
+
+static void parse_params(P *p, NameList *names, NodeList *defaults, AxStr **ret) {
   if (!at(p, T_LPAREN)) return;
   advance(p);
-  if (at(p, T_RPAREN)) { advance(p); return; }
+  if (at(p, T_RPAREN)) { advance(p); if (at(p, T_ARROW)) *ret = parse_ret_type(p); return; }
   for (;;) {
-    if (at(p, T_ARROW)) { advance(p); /* return type */ if (at(p, T_HASH)) advance(p); expect(p, T_IDENT, "as a return type"); break; }
+    if (at(p, T_ARROW)) { *ret = parse_ret_type(p); break; }
     AxTok *nm = expect(p, T_IDENT, "as a parameter");
     name_push(names, tok_name_str(nm));
     AxNode *def = NULL;
@@ -1327,26 +1341,31 @@ static void parse_params(P *p, NameList *names, NodeList *defaults) {
     if (at(p, T_COMMA)) { advance(p); continue; }
     break;
   }
-  if (at(p, T_ARROW)) { advance(p); if (at(p, T_HASH)) advance(p); expect(p, T_IDENT, "as a return type"); }
+  if (at(p, T_ARROW)) *ret = parse_ret_type(p);
   expect(p, T_RPAREN, "to close the parameter list");
-  if (at(p, T_ARROW)) { advance(p); if (at(p, T_HASH)) advance(p); expect(p, T_IDENT, "as a return type"); }
+  if (at(p, T_ARROW)) *ret = parse_ret_type(p);
 }
 
 static AxNode *parse_fn(P *p, bool is_main) {
   AxNode *n = node(p, is_main ? N_MAIN : N_FN);
   advance(p);   // ^
-  advance(p);   // fn / proc / main
+  AxTok *kw = advance(p);   // fn / proc / main
+  if (!is_main && strcmp(kw->payload, "proc") == 0) n->op = 1;   // ^proc (the checker names it so)
   if (!is_main) n->str = tok_name_str(expect(p, T_IDENT, "as the function name"));
   NameList names = {0};
   NodeList defaults = {0};
-  parse_params(p, &names, &defaults);
+  AxStr *ret = NULL;
+  parse_params(p, &names, &defaults, &ret);
+  n->str2 = ret;
   n->names = names.items;
   n->nnames = names.n;
   n->defaults = defaults.items;
   if (at(p, T_ASSIGN)) {
-    // Expression body: `^fn f(x) = expr`
+    // Expression body: `^fn f(x) = expr` — a ^return located at the declaration (parser.js)
     advance(p);
     AxNode *ret = node(p, N_RETURN);
+    ret->line = n->line;
+    ret->col = n->col;
     ret->a = parse_expr(p);
     end_stmt(p);
     NodeList body = {0};
@@ -1363,6 +1382,17 @@ static AxNode *parse_fn(P *p, bool is_main) {
   return n;
 }
 
+// `:: T` / `:: #T` in a field list, kept as written.
+static AxStr *field_type(P *p) {
+  bool hash = at(p, T_HASH);
+  if (hash) advance(p);
+  AxTok *t = expect(p, T_IDENT, "as a field type");
+  if (!hash) return tok_name_str(t);
+  char buf[256];
+  snprintf(buf, sizeof buf, "#%s", t->payload);
+  return ax_internz(buf);
+}
+
 static AxNode *parse_type(P *p) {
   AxNode *n = node(p, N_TYPE);
   advance(p);   // ^
@@ -1370,14 +1400,17 @@ static AxNode *parse_type(P *p) {
   n->str = tok_name_str(expect(p, T_IDENT, "as the type name"));
   expect(p, T_COLON, "after the type name");
   NameList names = {0};
+  NodeList ftypes = {0};
   bool inline_form = !at(p, T_NEWLINE);
   if (!inline_form) { advance(p); expect(p, T_INDENT, "to start the field list"); }
   for (;;) {
     if (!inline_form && (at(p, T_DEDENT) || at(p, T_EOF))) break;
     AxTok *f = expect(p, T_IDENT, "as a field name");
     name_push(&names, tok_name_str(f));
-    if (at(p, T_COLONCOLON)) { advance(p); if (at(p, T_HASH)) advance(p); expect(p, T_IDENT, "as a field type"); }
+    AxNode *ft = node(p, N_IDENT);            // the declared type (str NULL when absent)
+    if (at(p, T_COLONCOLON)) { advance(p); ft->str = field_type(p); }
     if (at(p, T_QUESTION)) advance(p);
+    nl_push(&ftypes, ft);
     if (at(p, T_COMMA)) { advance(p); continue; }
     if (inline_form) break;
     expect(p, T_NEWLINE, "after a field");
@@ -1386,6 +1419,8 @@ static AxNode *parse_type(P *p) {
   else { expect(p, T_DEDENT, "to end the field list"); }
   n->names = names.items;
   n->nnames = names.n;
+  n->list = ftypes.items;
+  n->nlist = ftypes.n;
   return n;
 }
 
@@ -1475,7 +1510,12 @@ static AxNode *field_value(P *p) {
 }
 
 // One `~field` (or the multi-name `~a,b,c: v`) or `$belief: Grid(…) ~ Prior infer: s(n)`.
+// A field is located at its sigil (a bare name after a comma has a line but no column), as in
+// parser.js — where the checker reports it.
+static AxNode *at_pos(AxNode *n, int line, int col) { n->line = line; n->col = col; return n; }
+
 static void parse_field(P *p, NodeList *out) {
+  int fline = peek(p, 0)->line, fcol = peek(p, 0)->col;
   if (at(p, T_TILDE)) {
     advance(p);
     AxStr *name = tok_name_str(expect(p, T_IDENT, "as a field name"));
@@ -1488,17 +1528,17 @@ static void parse_field(P *p, NodeList *out) {
         name_push(&names, name);
         while (at(p, T_COMMA)) { advance(p); name_push(&names, tok_name_str(expect(p, T_IDENT, "as a field name"))); }
         AxNode *value = field_value(p);
-        for (int k = 0; k < names.n; k++) nl_push(out, field_node(p, names.items[k], 0, value));
+        for (int k = 0; k < names.n; k++) nl_push(out, at_pos(field_node(p, names.items[k], 0, value), fline, fcol));
         return;
       }
     }
     if (at(p, T_BANG)) advance(p);       // `~hp!: 50` overrides a mixin default on purpose
-    nl_push(out, field_node(p, name, 0, field_value(p)));
+    nl_push(out, at_pos(field_node(p, name, 0, field_value(p)), fline, fcol));
     return;
   }
   if (at(p, T_DOLLAR)) {
     advance(p);
-    AxNode *f = field_node(p, tok_name_str(expect(p, T_IDENT, "as a field name")), 1, NULL);
+    AxNode *f = at_pos(field_node(p, tok_name_str(expect(p, T_IDENT, "as a field name")), 1, NULL), fline, fcol);
     expect(p, T_COLON, "after the distribution name");
     f->a = parse_call_like(p);
     if (at(p, T_TILDE)) { advance(p); f->b = parse_call_like(p); }
@@ -1518,9 +1558,10 @@ static void parse_fields(P *p, NodeList *out) {
     if (at_kw(p, "at")) break;
     if (at(p, T_IDENT)) {
       int sigil = out->n ? out->items[out->n - 1]->op : 0;
+      int line = peek(p, 0)->line;
       AxStr *name = tok_name_str(advance(p));
       if (at(p, T_BANG)) advance(p);
-      nl_push(out, field_node(p, name, sigil, field_value(p)));
+      nl_push(out, at_pos(field_node(p, name, sigil, field_value(p)), line, 0));
     } else {
       parse_field(p, out);
     }
@@ -1560,7 +1601,7 @@ static AxNode *parse_entity(P *p);
 
 // One line of an entity body: fields, a block, or a nested entity.
 static void parse_member_line(P *p, NodeList *out) {
-  if (at(p, T_AT)) { parse_entity(p); skip_newlines(p); return; }   // nested: parsed, not instantiated
+  if (at(p, T_AT)) { nl_push(out, parse_entity(p)); skip_newlines(p); return; }   // nested: kept (the checker visits it), never instantiated
   if (at(p, T_AMP)) { nl_push(out, parse_eblock(p)); return; }
   if (at(p, T_TILDE) || at(p, T_DOLLAR)) {
     parse_fields(p, out);
@@ -1638,7 +1679,7 @@ static AxNode *parse_event(P *p) {
     if (!inline_form && (at(p, T_DEDENT) || at(p, T_EOF))) break;
     AxNode *f = node(p, N_IDENT);
     f->str = tok_name_str(expect(p, T_IDENT, "as a field name"));
-    if (at(p, T_COLONCOLON)) { advance(p); if (at(p, T_HASH)) advance(p); expect(p, T_IDENT, "as a field type"); }
+    if (at(p, T_COLONCOLON)) { advance(p); f->str2 = field_type(p); }   // str2: the declared type
     if (at(p, T_QUESTION)) { advance(p); f->flag = true; }
     nl_push(&fields, f);
     if (at(p, T_COMMA)) { advance(p); continue; }
@@ -1764,7 +1805,13 @@ bool ax_parse(AxTokens *toks, AxParseResult *out) {
     if (at(&p, T_CARET) && peek(&p, 1)->type == T_IDENT) {
       const char *kw = peek(&p, 1)->payload;
       if (strcmp(kw, "fn") == 0 || strcmp(kw, "proc") == 0) { nl_push(&decls, parse_fn(&p, false)); skip_newlines(&p); continue; }
-      if (strcmp(kw, "main") == 0) { nl_push(&decls, parse_fn(&p, true)); skip_newlines(&p); continue; }
+      if (strcmp(kw, "main") == 0) {
+        for (int i = 0; i < decls.n; i++)
+          if (decls.items[i]->kind == N_MAIN) perr(&p, "duplicate ^main — a program has exactly one entry point");
+        nl_push(&decls, parse_fn(&p, true));
+        skip_newlines(&p);
+        continue;
+      }
       if (strcmp(kw, "type") == 0) { nl_push(&decls, parse_type(&p)); skip_newlines(&p); continue; }
       if (strcmp(kw, "use") == 0) { nl_push(&decls, parse_use(&p)); skip_newlines(&p); continue; }
       if (strcmp(kw, "event") == 0) { nl_push(&decls, parse_event(&p)); skip_newlines(&p); continue; }

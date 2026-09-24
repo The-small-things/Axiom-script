@@ -1,0 +1,16 @@
+^type Point: x, y
+^type Empty: n
+^main:
+  p = Point(1, 2)
+  a = p.x + p.z
+  b = p.yy
+  c = p.norm()
+  q = Point(1, 2)
+  q = Point(3, 4)
+  d = q.zz
+  e = Empty(1)
+  f = e.m
+  *i in [p]:
+    g = i.whatever
+  ?true:
+    h = p.w

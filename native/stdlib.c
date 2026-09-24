@@ -1007,6 +1007,25 @@ NATIVE(n_zip) {
   free(seqs);
   return ax_arrv(out);
 }
+// unzip([[a, 1], [b, 2]]) → [[a, b], [1, 2]]: as many rows as the longest pair, null where a
+// pair is short.
+NATIVE(n_unzip) {
+  AxArr *a = ax_to_seq(vm, ARG(0));
+  AxArr **rows = calloc(a->len ? a->len : 1, sizeof(AxArr *));
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < a->len; i++) { rows[i] = ax_to_seq(vm, a->items[i]); if (rows[i]->len > n) n = rows[i]->len; }
+  AxArr *out = ax_arr_new(n);
+  for (uint32_t k = 0; k < n; k++) {
+    AxArr *col = ax_arr_new(a->len);
+    for (uint32_t i = 0; i < a->len; i++) ax_arr_push(col, k < rows[i]->len ? ax_copy(rows[i]->items[k]) : ax_null());
+    ax_arr_push(out, ax_arrv(col));
+  }
+  for (uint32_t i = 0; i < a->len; i++) ax_release(ax_arrv(rows[i]));
+  free(rows);
+  ax_release(ax_arrv(a));
+  return ax_arrv(out);
+}
+
 NATIVE(n_enumerate) {
   AxArr *a = ax_to_seq(vm, ARG(0));
   AxArr *out = ax_arr_new(a->len);
@@ -2499,6 +2518,7 @@ void ax_stdlib_install(AxVM *vm) {
   def(vm, "any", n_any, 1, 2);            def(vm, "all", n_all, 1, 2);
   def(vm, "count", n_count, 1, 2);        def(vm, "uniq", n_uniq, 1, 2);
   def(vm, "zip", n_zip, 1, -1);           def(vm, "enumerate", n_enumerate, 1, 1);
+  def(vm, "unzip", n_unzip, 1, 1);
   def(vm, "chunk", n_chunk, 2, 2);        def(vm, "windows", n_windows, 2, 2);
   def(vm, "flatten", n_flatten, 1, 2);    def(vm, "partition", n_partition, 2, 2);
   def(vm, "group_by", n_group_by, 2, 2);  def(vm, "count_by", n_count_by, 2, 2);

@@ -100,6 +100,27 @@ raw control characters in strings, and trailing text after the value (`from_json
 A `--sim` run now exits 1 only for a fault, not for an advisory such as the reference's
 "renderer unavailable" note.
 
+### The static checker in C
+
+`native/axiom --check` runs the full checker — a port of checker.js, every diagnostic from
+`AX-ALLOC` to `AX-TYPE-001`, with `^use` resolution — and, as in main.js, a program with a fatal
+or contract-violating diagnostic no longer runs natively (it used to be parsed and run). Both
+runtimes gain `--check --json`, printing `{ok, diagnostics}` to stdout.
+
+The port reproduces the reference's output exactly: codes, severities, locations, snippets,
+messages, suggested fixes and their order, including its quirks (a call inside a conditional
+in a function body is reported twice, because the reference both expands and recurses into
+the conditional). difftest compares `--check --json` on a corpus that trips every diagnostic,
+on every other program in the repository, and on 300 line-level mutants of them; the only
+allowance is the wording and position of a parse error, which come from two different parsers
+(both reject the same programs — 1,500 mutants agreed, once the native parser, too, refused a
+second `^main`). The library-name and subsystem tables the checker needs are generated from the
+reference (`native/tools/gen_checknames.js`) and checked for staleness.
+
+Fixed on the way: the native import splicer treated two resources of the same kind (two
+`#Mesh3D`s) as one declaration, silently dropping an imported one; and `unzip()` was missing
+from the native library.
+
 ### Faults and `exit()` in machine-readable output
 
 - `--json` for a script now always prints its object — also when `^main` faults (with the

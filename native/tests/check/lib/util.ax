@@ -1,0 +1,5 @@
+~SHARED: 1
+^fn util(x) = x * 2
+^type Vec: x, y
+^main:
+  print("lib main")

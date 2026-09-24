@@ -1,0 +1,18 @@
+^fn f(a) = a
+^fn f(b) = b
+^proc f(c):
+  print(c)
+^proc g():
+  ^return 1
+  print("never")
+  print("also never")
+^fn h(x):
+  ^return x
+@A
+  &tick(1hz):
+    a = 1 / 0
+    b = 5 % 0
+    c = 1 / 0.0
+    d = 2 / (1 - 1)
+^main:
+  ^return f(1)

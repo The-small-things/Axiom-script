@@ -830,6 +830,9 @@ section('21. --json for scripts, exit(), and the REPL (v0.9.3)');
   ok('21.8 … and reports an error without ending the session', repl.status === 0 && repl.stderr.includes('error [AX-RUNTIME-FUNC]'), repl.stderr);
   const replExit = js(['--repl'], 'print("a")\nexit(5)\nprint("b")\n');
   eq('21.9 exit() ends a REPL session with its code', [replExit.status, replExit.stdout], [5, 'a\n']);
+  const chk = js(['--eval', '^main:\n  x = helth - 1\n', '--check', '--json']);
+  const chkOut = JSON.parse(chk.stdout);
+  eq('21.10 --check --json prints {ok, diagnostics}', [chk.status, chkOut.ok, chkOut.diagnostics.map(d => d.error_code)], [0, true, ['AX-UNDEF-VAR-001']]);
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

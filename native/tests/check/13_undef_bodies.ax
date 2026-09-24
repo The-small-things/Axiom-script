@@ -1,0 +1,21 @@
+^fn f(x, cb):
+  y = g(x)
+  z = cb(x)
+  ?x > 1:
+    w = nested_missing(1)
+    *i in [1]:
+      deeper_missing(i)
+  ^try:
+    t = in_try(1)
+  ^catch e:
+    e2 = in_catch(1)
+  lam = \v: v2x(v)
+  ?* x:
+    1: in_arm(1)
+    _: fine = 1
+  ^return args
+^proc p():
+  undefined_proc_call()
+^main:
+  q = main_missing(1)
+  r = f(1, \v: v)

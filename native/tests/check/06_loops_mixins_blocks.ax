@@ -1,0 +1,27 @@
+^mix Stats: ~hp: 10
+^fn f():
+  ~break
+^proc g():
+  ?true: ~continue
+@A +Stats, Missing
+  &tick(1hz):
+    ~break
+    *true:
+      ?true: ~break
+      ~continue
+  &init:
+    x = 1
+  &phyiscs:
+    x = 2
+  &rendering:
+    x = 3
+  &totally_wrong:
+    x = 4
+  &Physics:
+    x = 5
+@B +Nope
+  &physics:
+    !v3(1, 2, 3)
+    !bar(1, 2, 3, 4)
+    !sphere(1)
+    !play("x")

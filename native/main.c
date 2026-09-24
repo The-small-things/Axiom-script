@@ -91,6 +91,14 @@ static void dirname_of(const char *path, char *out, size_t n) {
   out[len] = '\0';
 }
 
+// What a declaration is called: a resource by its name (not its kind), a global by its first
+// name, everything else by its own name.
+static const AxStr *decl_name(const AxNode *d) {
+  if (d->kind == N_RESOURCE) return d->str2;
+  if (d->kind == N_GLOBAL) return d->nnames ? d->names[0] : NULL;
+  return d->str;
+}
+
 // Appends every declaration of `src` that `dst` does not already declare.
 static void splice_program(AxNode *dst, AxNode *src) {
   int extra = src->nlist;
@@ -103,10 +111,12 @@ static void splice_program(AxNode *dst, AxNode *src) {
     if (d->kind == N_MAIN) continue;          // only the entry file's ^main runs
     if (d->kind == N_USE) continue;           // already resolved
     bool clash = false;
-    if (d->str) {
+    const AxStr *dn = decl_name(d);
+    if (dn) {
       for (int j = 0; j < dst->nlist && !clash; j++) {
         AxNode *e = dst->list[j];
-        clash = e->str && e->kind == d->kind && ax_str_eq(e->str, d->str);
+        const AxStr *en = decl_name(e);
+        clash = en && e->kind == d->kind && (e->kind != N_FN || e->op == d->op) && ax_str_eq(en, dn);
       }
     }
     if (clash) continue;                      // the importing file wins
@@ -175,7 +185,7 @@ static void usage(void) {
     "\n"
     "  --eval '<source>'   run inline source\n"
     "  --stdin             read the program from standard input\n"
-    "  --check             parse and check only; exit 1 on an error\n"
+    "  --check             parse and check only; exit 1 if anything blocks (--json: as JSON)\n"
     "  --repl              interactive session: statements run as typed, expressions echo\n"
     "  -- a b c            arguments for the program, readable with args()\n"
     "\n"
@@ -274,16 +284,34 @@ int main(int argc, char **argv) {
     } else { usage(); return 2; }
   }
 
+  // Parse and check, as main.js compile() does: --check reports and exits; otherwise a
+  // fatal or contract-violating diagnostic stops the program before it runs.
+  const char *clabel = path ? path : (use_stdin ? "<stdin>" : "<eval>");
   AxTokens toks;
-  if (!ax_tokenize(source, &toks)) {
-    fprintf(stderr, "%s:%d: %s\n", path ? path : "<eval>", toks.err_line, toks.err);
-    return 1;
-  }
   AxParseResult pr;
-  if (!ax_parse(&toks, &pr)) {
-    fprintf(stderr, "%s:%d: %s\n", path ? path : "<eval>", pr.err_line, pr.err);
+  memset(&pr, 0, sizeof pr);
+  bool lexed = ax_tokenize(source, &toks);
+  bool parsed = lexed && ax_parse(&toks, &pr);
+  AxCheck *chk = parsed ? ax_check(pr.program, source, path, toks.version, NULL, 0, 0)
+                        : ax_check(NULL, source, path, NULL, lexed ? pr.err : toks.err, lexed ? pr.err_line : toks.err_line, lexed ? pr.err_col : 0);
+  if (check_only) {
+    bool ok = ax_check_ok(chk);
+    if (json) ax_check_print_json(chk, stdout);
+    else {
+      ax_check_print(chk, stderr);
+      if (ok) fprintf(stderr, "OK: %s compiles clean (%d advisory diagnostics).\n", clabel, ax_check_count(chk));
+      else fprintf(stderr, "FAIL: %s has %d blocking diagnostic(s).\n", clabel, ax_check_blocking(chk));
+    }
+    ax_check_free(chk);
+    return ok ? 0 : 1;
+  }
+  if (!ax_check_ok(chk)) {
+    fprintf(stderr, "compile failed:\n");
+    ax_check_print(chk, stderr);
+    ax_check_free(chk);
     return 1;
   }
+  ax_check_free(chk);
   ImportSet imports = {0};
   if (path) {
     char real[4096];
@@ -293,10 +321,6 @@ int main(int argc, char **argv) {
   if (!resolve_imports(pr.program, path, &imports, imp_err, sizeof imp_err)) {
     fprintf(stderr, "%s: %s\n", path ? path : "<eval>", imp_err);
     return 1;
-  }
-  if (check_only) {
-    fprintf(stderr, "OK: %s parses clean.\n", path ? path : "<eval>");
-    return 0;
   }
 
   AxVM *vm = ax_vm_new();

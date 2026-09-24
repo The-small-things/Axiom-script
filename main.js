@@ -292,6 +292,11 @@ const r = compile(src, { filename: sourceLabel === '<eval>' || sourceLabel === '
 
 // --- --check mode: print diagnostics, exit 0/1, no World creation ---
 if (flags.check) {
+  // v0.9.3: --check --json prints {ok, diagnostics} to stdout and nothing else.
+  if (flags.json) {
+    console.log(JSON.stringify({ ok: r.ok, diagnostics: r.diagnostics }, null, 2));
+    process.exit(r.ok ? 0 : 1);
+  }
   if (r.diagnostics.length > 0) {
     for (const d of r.diagnostics) {
       console.error(`  [${d.error_code}] (${d.severity}) L${d.location?.line}:${d.location?.col} ${d.message_for_human}`);

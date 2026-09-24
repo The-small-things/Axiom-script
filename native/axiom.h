@@ -330,7 +330,7 @@ enum {
 typedef struct {
   AxNode *program;
   char err[512];
-  int err_line;
+  int err_line, err_col;
   int nerrors;
 } AxParseResult;
 
@@ -491,6 +491,17 @@ int  ax_engine_last_fault(AxVM *vm, char *code, size_t coden, char *msg, size_t 
 void ax_engine_print_script_json(AxVM *vm, AxValue result, int code, FILE *out);
 bool ax_engine_diag_at(AxVM *vm, int i, const char **code, const char **msg);   // raw message
 int  ax_repl(AxVM *vm);                                                          // repl.c
+
+// check.c — the static checker (checker.js). A parse error, when given, is the only diagnostic.
+typedef struct AxCheck AxCheck;
+AxCheck *ax_check(AxNode *program, const char *source, const char *filename, const char *version,
+                  const char *parse_err, int parse_line, int parse_col);
+bool ax_check_ok(const AxCheck *c);            // nothing fatal or contract-violating
+int  ax_check_count(const AxCheck *c);
+int  ax_check_blocking(const AxCheck *c);
+void ax_check_print(const AxCheck *c, FILE *out);        // `  [CODE] (severity) Lline:col message`
+void ax_check_print_json(const AxCheck *c, FILE *out);   // {ok, diagnostics}
+void ax_check_free(AxCheck *c);
 
 // glb.c — binary glTF meshes. Vertices are interleaved float32 (pos xyz, normal xyz, uv xy).
 typedef struct { float *verts; int nverts; uint16_t *idx; int nidx; AxValue material; } AxGlbPrim;
