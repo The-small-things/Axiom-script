@@ -454,6 +454,7 @@ typedef struct AxHost {
 typedef struct AxEntity {
   AxObj hdr;
   AxStr *name;           // decl name; a spawned copy is `Name_N`
+  AxStr *prefab;         // the declaration it came from (`Name` for a spawned copy too)
   AxStr *base;           // `&Base`, or NULL
   AxNode **members;      // composed members (mixins first, then the entity's own)
   int nmembers;
@@ -461,6 +462,8 @@ typedef struct AxEntity {
   AxDict *locals;        // everything else assigned in a block (and `pose`)
   bool nosave, pending_remove;
   struct AxWorld *world;
+  AxValue patrol;        // patrol_point(): the current target, re-drawn every 3 s
+  double patrol_t0;
 } AxEntity;
 
 AxValue ax_vec2(double x, double y);

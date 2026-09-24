@@ -158,9 +158,16 @@ static void json_write(SB *sb, AxValue v, int indent, int depth) {
     }
     case AX_DICT: {
       AxDict *d = (AxDict *)v.o;
-      if (!d->live) { sb_addz(sb, "{}"); return; }
+      if (!d->live && !d->type_tag) { sb_addz(sb, "{}"); return; }
       sb_addz(sb, "{");
       bool first = true;
+      if (d->type_tag) {
+        // A record writes its type first, as JSON.stringify does with the reference's `__type`.
+        if (indent) { sb_addz(sb, "\n"); snprintf(pad, sizeof pad, "%*s", indent * (depth + 1), ""); sb_addz(sb, pad); }
+        sb_addz(sb, indent ? "\"__type\": " : "\"__type\":");
+        json_quote(sb, d->type_tag);
+        first = false;
+      }
       for (uint32_t i = 0; i < d->len; i++) {
         if (d->entries[i].dead) continue;
         if (!first) sb_addz(sb, ",");
@@ -257,7 +264,13 @@ static AxValue json_read(JP *j) {
       j->p++;
       AxValue v = json_read(j);
       AxStr *key = ax_intern(((AxStr *)k.o)->data, ((AxStr *)k.o)->len);
-      ax_dict_set(d, key, v);
+      if (strcmp(key->data, "__type") == 0 && v.t == AX_STR && !d->type_tag) {
+        // `"__type": "P"` is how a record serializes; reading it back makes the record again.
+        d->type_tag = ax_intern(((AxStr *)v.o)->data, ((AxStr *)v.o)->len);
+        ax_release(v);
+      } else {
+        ax_dict_set(d, key, v);
+      }
       ax_release(ax_strv(key));
       ax_release(k);
       if (!j->ok) break;

@@ -1,0 +1,18 @@
+// ?nearest finds spawned copies, not just the original declaration.
+@Enemy at v3(50, 0, 0)
+  ~hp: 1
+
+@Base
+  ~n: 0
+  ~found: null
+  ~dist_to: -1
+  &tick(4hz):
+    n += 1
+    ?n <= 3:
+      !spawn(#Enemy, at: v3(n * 3, 0, 0))
+    e = ?nearest(#Enemy)
+    ?e != null:
+      found = e
+      dist_to = dist(e.pos, pose.pos)
+      ?n == 5:
+        !despawn(e)

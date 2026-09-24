@@ -471,7 +471,8 @@ static Nav *load_nav(AxVM *vm, AxValue source) {
   int nlines = 0;
   for (char *save = NULL, *l = strtok_r(text, "\n", &save); l; l = strtok_r(NULL, "\n", &save)) {
     char *t = trim(l);
-    if (!*t || *t == '#') continue;
+    // A '#' line is a comment unless it is a grid row (only '#', '.', '0', '1').
+    if (!*t || (*t == '#' && strspn(t, "#.01") != strlen(t))) continue;
     lines = realloc(lines, sizeof(char *) * (nlines + 1));
     lines[nlines++] = t;
   }

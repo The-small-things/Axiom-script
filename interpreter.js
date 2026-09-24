@@ -317,6 +317,8 @@ class Transform {
 class Atom {
   constructor(name) { this.name = name; }
   toString() { return this.name; }
+  // v0.9.2: an atom serializes as its name (to_json, json_stringify, save files), not {"name": …}.
+  toJSON() { return this.name; }
 }
 function atom(name) { return new Atom(name); }
 
@@ -583,7 +585,10 @@ function clampNum(x, lo, hi) { return Math.max(lo, Math.min(hi, x)); }
 const SUPPORTED_INFER_STRATEGIES = new Set(['particle', 'exact']);
 
 class Distribution {
-  constructor(shapeCall, priorCall, inferCall) {
+  constructor(shapeCall, priorCall, inferCall, rand) {
+    // v0.9.2: draws come from the program's seeded generator (the one random() and seed() use),
+    // so a particle filter is reproducible under seed(n). Non-enumerable: not part of the state.
+    Object.defineProperty(this, '_rand', { value: rand || Math.random, enumerable: false });
     if (shapeCall.callee !== 'Grid') {
       throw new Error(`this reference interpreter only implements Grid(w,h) distributions; got '${shapeCall.callee}(...)'`);
     }
@@ -608,7 +613,7 @@ class Distribution {
     }
     this.particles = [];
     for (let i = 0; i < this.numParticles; i++) {
-      this.particles.push({ x: Math.floor(Math.random() * this.w), y: Math.floor(Math.random() * this.h), w: 1 / this.numParticles });
+      this.particles.push({ x: Math.floor(this._rand() * this.w), y: Math.floor(this._rand() * this.h), w: 1 / this.numParticles });
     }
   }
   _cellLikelihood(x, y, obs, selfPos) {
@@ -648,9 +653,9 @@ class Distribution {
     }
     const DIFFUSE_P = 0.12;
     for (const p of this.particles) {
-      if (Math.random() < DIFFUSE_P) {
+      if (this._rand() < DIFFUSE_P) {
         const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1], [0, 0]];
-        const d = dirs[Math.floor(Math.random() * dirs.length)];
+        const d = dirs[Math.floor(this._rand() * dirs.length)];
         p.x = clampNum(p.x + d[0], 0, this.w - 1);
         p.y = clampNum(p.y + d[1], 0, this.h - 1);
       }
@@ -667,7 +672,7 @@ class Distribution {
     if (N === 0 || this.particles.length === 0) return;
     const out = [];
     const step = 1 / N;
-    const u0 = Math.random() * step;
+    const u0 = this._rand() * step;
     let i = 0, c = this.particles[0].w;
     for (let m = 0; m < N; m++) {
       const U = u0 + m * step;
@@ -692,7 +697,7 @@ class Distribution {
     return { x: best.x, y: best.y, __cell: true };
   }
   sample() {
-    const r = Math.random();
+    const r = this._rand();
     let acc = 0;
     if (this.mode === 'exact') {
       for (let y = 0; y < this.h; y++) for (let x = 0; x < this.w; x++) {
@@ -1824,7 +1829,10 @@ function loadNavGrid(world, sourcePath) {
       const text = fs.readFileSync(fullPath, 'utf8');
       // Strip comments + blank lines but PRESERVE the structure (we need layer index/y lines).
       const rawLines = text.split('\n').map(l => l.trim());
-      const lines = rawLines.filter(l => l.length > 0 && !l.startsWith('#'));
+      // v0.9.2: a line starting with '#' is a comment unless it is a grid row — made only of
+      // '#', '.', '0', '1' — so a row whose first cell is a wall is no longer dropped.
+      const isGridRow = (l) => /^[#.01]+$/.test(l);
+      const lines = rawLines.filter(l => l.length > 0 && (!l.startsWith('#') || isGridRow(l)));
       if (lines.length >= 1) {
         const first = lines[0];
         if (first.startsWith('layers')) {
@@ -2543,7 +2551,7 @@ class EntityInstance {
         const shape = { callee: m.dist.shape.callee, args: m.dist.shape.args.map(a => evalExpr(a.value, this.rootCtx())) };
         const prior = m.dist.prior ? { callee: m.dist.prior.callee, args: m.dist.prior.args.map(a => evalExpr(a.value, this.rootCtx())) } : null;
         const infer = m.infer ? { callee: m.infer.callee, args: m.infer.args.map(a => evalExpr(a.value, this.rootCtx())) } : null;
-        this.fields.set(m.name, new Distribution(shape, prior, infer));
+        this.fields.set(m.name, new Distribution(shape, prior, infer, this.world && this.world.intrinsics.random));
       }
     }
     // v0.4: check for ~nosave flag (a field with no value)
@@ -3275,7 +3283,8 @@ function defaultIntrinsics() {
     json_stringify: (v, pretty) => { try { return pretty ? JSON.stringify(v, null, 2) : JSON.stringify(v); } catch(e) { return '<circular>'; } },
     int: (s) => parseInt(s, 10),
     float: (s) => parseFloat(s),
-    str: (v) => v == null ? 'null' : typeof v === 'object' ? JSON.stringify(v) : String(v),
+    // v0.9.2: str(v) is exactly what f"{v}" shows.
+    str: (v) => stringifyFStringVal(v),
     // v0.9.0: `type()` reports a record's declared ^type name and recognizes functions.
     type: (v) => v == null ? 'null' : typeof v === 'function' ? 'fn' : Array.isArray(v) ? 'array' : typeof v === 'object' ? (v.__callable ? 'fn' : v.__type ? v.__type : v instanceof Atom ? 'atom' : v instanceof Vec3 ? 'vec3' : v instanceof Vec2 ? 'vec2' : v instanceof Quat ? 'quat' : v instanceof EntityInstance ? 'entity' : v instanceof Transform ? 'transform' : v instanceof Mat4 ? 'mat4' : 'dict') : typeof v,
     is_null: (v) => v == null,
@@ -3307,7 +3316,9 @@ function patrolPoint(entity) {
   let s = _patrolState.get(entity);
   const now = entity.world._simTime || 0;
   if (!s || now - s.t0 > 3.0 || !s.target) {
-    s = { t0: now, target: new Vec3(1 + Math.random() * 8, 0, 1 + Math.random() * 8) };
+    const rand = entity.world.intrinsics.random;   // v0.9.2: seeded, like random()
+    const x = 1 + rand() * 8;
+    s = { t0: now, target: new Vec3(x, 0, 1 + rand() * 8) };
     _patrolState.set(entity, s);
   }
   return s.target;
@@ -3360,6 +3371,9 @@ function resolveIdent(name, ctx) {
 // the existing `+` operator (which calls JS `+` and lets the runtime convert), but explicit so
 // Vec3 / Quat / Atom / EntityInstance get useful string forms instead of "[object Object]".
 function stringifyFStringVal(v) {
+  // v0.9.2: one display rule for f-strings, print(), str() and `"text" + v`, shared with the
+  // native runtime: records and dicts show as their JSON (a record with a `name` field used to
+  // print as just the name), functions as <fn name>, containers by their class name.
   if (v === null || v === undefined) return 'null';
   if (typeof v === 'string') return v;
   if (typeof v === 'number') return String(v);
@@ -3370,9 +3384,11 @@ function stringifyFStringVal(v) {
   if (v instanceof Atom) return v.name;
   if (v instanceof EntityInstance) return v._tagName || v.decl.name;
   if (Array.isArray(v)) return '[' + v.map(stringifyFStringVal).join(',') + ']';
-  if (v && v.name) return v.name; // Atom-like / collider-shape-like
+  if (v instanceof Closure) return `<fn ${v.name === '<lambda>' ? 'lambda' : v.name}>`;
+  if (typeof v === 'function') return `<fn ${v.name || 'fn'}>`;
   if (v && typeof v === 'object') {
-    // Best-effort: prefer a name field, then a constructor name, else JSON.
+    // A resource or draw descriptor ({kind, name, …}) shows as its name.
+    if (typeof v.kind === 'string' && typeof v.name === 'string') return v.name;
     if (v.constructor && v.constructor.name && v.constructor.name !== 'Object') return v.constructor.name;
     try { return JSON.stringify(v); } catch (e) { return String(v); }
   }
@@ -3730,6 +3746,16 @@ function memberOf(obj, prop) {
 }
 
 function binaryOp(op, l, r) {
+  // v0.9.2: equality, membership and string concatenation mean the same thing for every type.
+  // Before this, `v == v3(0, 0, 0)`, `pos == null`, `v in path` and `"at " + pos` all raised
+  // "operator not defined for vectors", and `"a" + [1, 2]` gave "a1,2".
+  if (op === '==') return equalsVal(l, r);
+  if (op === '!=') return !equalsVal(l, r);
+  if (op === '+' && (typeof l === 'string' || typeof r === 'string')) {
+    const show = (v) => typeof v === 'string' ? v : (v && v.__timer) ? String(v.remaining) : stringifyFStringVal(v);
+    return show(l) + show(r);
+  }
+  if (op === 'in') return memberIn(l, r);
   if (l instanceof Vec3 || r instanceof Vec3) {
     // v0.5: auto-promote Vec2 to Vec3(x, y, 0) in 3D context
     if (l instanceof Vec2) l = new Vec3(l.x, 0, l.y);
@@ -3791,7 +3817,11 @@ function binaryOp(op, l, r) {
   }
   // v0.9.0: membership. One operator across every container the language has, because an LLM
   // should not have to remember whether the value in hand is an array, a dict or a string.
-  if (op === 'in') {
+  return binaryOpRest(op, l, r);
+}
+
+function memberIn(l, r) {
+  {
     if (r == null) return false;
     if (typeof r === 'string') return r.indexOf(String(l)) !== -1;
     if (Array.isArray(r)) return r.some(v => equalsVal(v, l));
@@ -3802,6 +3832,9 @@ function binaryOp(op, l, r) {
     if (typeof r === 'object') return Object.prototype.hasOwnProperty.call(r, stringifyKey(l));
     return false;
   }
+}
+
+function binaryOpRest(op, l, r) {
   // v0.9.1: array + array concatenates. JavaScript would stringify both sides ("12"), which is
   // never what the program meant.
   if (Array.isArray(l) && Array.isArray(r) && op === '+') return l.concat(r);
@@ -4232,7 +4265,9 @@ function callGlobalQuery(name, argNodes, entity, ctx) {
       if (e === entity) continue; // don't return self
       // Match by declaration name (the @Decl name, not the runtime tag name — spawned instances
       // get unique tag names like 'Enemy_12345' but their decl.name is still 'Enemy').
-      if (e.decl.name !== prefabName) continue;
+      // v0.9.2: a spawned copy is named `Enemy_3` but is still an #Enemy — match on the
+      // declaration it was spawned from, so `?nearest(#Enemy)` finds copies, not just the original.
+      if ((e.decl.prefab || e.decl.name) !== prefabName) continue;
       if (e._pendingRemove) continue; // v0.8.10: skip despawned entities
       const pose = e.locals.get('pose');
       if (!pose) continue;
@@ -5303,7 +5338,7 @@ function execAction(name, argNodes, ctx) {
       // when two !spawn calls happen within the same millisecond.
       if (!ctx.world._spawnCounter) ctx.world._spawnCounter = 0;
       ctx.world._spawnCounter++;
-      const inst = ctx.world.addEntity({ ...decl, name: declName + '_' + ctx.world._spawnCounter, mixins: [] });
+      const inst = ctx.world.addEntity({ ...decl, name: declName + '_' + ctx.world._spawnCounter, prefab: declName, mixins: [] });
       // Apply overrides from named args
       for (let i = 1; i < argNodes.length; i++) {
         const a = argNodes[i];

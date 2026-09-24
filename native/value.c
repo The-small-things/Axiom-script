@@ -187,6 +187,7 @@ static void obj_free(AxObj *o) {
       AxEntity *e = (AxEntity *)o;
       ax_release(ax_dictv(e->fields));
       ax_release(ax_dictv(e->locals));
+      ax_release(e->patrol);
       free(e);
       return;
     }
@@ -581,33 +582,30 @@ static void render(AxValue v, char **buf, size_t *len, size_t *cap, int depth) {
       return;
     }
     case AX_DICT: {
-      // Matches the reference: a dict renders as JSON in string position.
-      if (depth > 16) { str_append(buf, len, cap, "{...}", 5); return; }
+      // A dict shows as its JSON (JSON.stringify's, `__type` first for a record); a resource
+      // or draw descriptor ({kind, name, …}) shows as its name.
       AxDict *d = (AxDict *)v.o;
-      str_append(buf, len, cap, "{", 1);
-      bool first = true;
-      for (uint32_t i = 0; i < d->len; i++) {
-        if (d->entries[i].dead) continue;
-        if (!first) str_append(buf, len, cap, ",", 1);
-        first = false;
-        str_append(buf, len, cap, "\"", 1);
-        str_append(buf, len, cap, d->entries[i].key->data, d->entries[i].key->len);
-        str_append(buf, len, cap, "\":", 2);
-        AxValue ev = d->entries[i].val;
-        if (ev.t == AX_STR) {
-          str_append(buf, len, cap, "\"", 1);
-          render(ev, buf, len, cap, depth + 1);
-          str_append(buf, len, cap, "\"", 1);
-        } else {
-          render(ev, buf, len, cap, depth + 1);
-        }
+      AxStr *kk = ax_internz("kind"), *kn = ax_internz("name");
+      AxValue kind, name;
+      bool hk = ax_dict_get(d, kk, &kind), hn = ax_dict_get(d, kn, &name);
+      ax_release(ax_strv(kk)); ax_release(ax_strv(kn));
+      if (hk && hn && kind.t == AX_STR && name.t == AX_STR) {
+        AxStr *ns = (AxStr *)name.o;
+        str_append(buf, len, cap, ns->data, ns->len);
+        ax_release(kind); ax_release(name);
+        return;
       }
-      str_append(buf, len, cap, "}", 1);
+      if (hk) ax_release(kind);
+      if (hn) ax_release(name);
+      char *json = NULL;
+      ax_json_write(v, 0, &json);
+      str_append(buf, len, cap, json, strlen(json));
+      free(json);
       return;
     }
     case AX_FN: {
       AxFn *f = (AxFn *)v.o;
-      const char *nm = f->native ? f->name : "fn";
+      const char *nm = f->name ? f->name : "fn";
       str_append(buf, len, cap, "<fn ", 4);
       str_append(buf, len, cap, nm, strlen(nm));
       str_append(buf, len, cap, ">", 1);

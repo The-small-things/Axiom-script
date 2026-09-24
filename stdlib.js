@@ -102,7 +102,9 @@ function stdlibIntrinsics(world, rt) {
   const keyOf = (sel, ctx) => {
     if (sel == null) return (v) => v;
     if (typeof sel === 'string') return (v) => (v == null ? null : v[sel]);
-    if (sel instanceof rt.Atom) return (v) => (v == null ? null : v[sel.name]);
+    // v0.9.2: a bare library-function name reads as an atom; when it names a function it is
+    // that function (`map(xs, abs)`), as it already was for the method form `xs.map(abs)`.
+    if (sel instanceof rt.Atom && !(world && (world.fns.has(sel.name) || world.procs.has(sel.name) || typeof world.intrinsics[sel.name] === 'function'))) return (v) => (v == null ? null : v[sel.name]);
     return (v, i) => call(sel, [v, i], ctx);
   };
   const predOf = (sel, ctx) => {

@@ -622,7 +622,7 @@ static void json_value(JB *b, AxValue v, int indent, int depth, bool sim) {
     case AX_ATOM: {
       AxStr *s = (AxStr *)v.o;
       if (sim) { KV kv[1] = { { "atom", ax_strv(s), false } }; json_object(b, kv, 1, indent, depth, sim); }
-      else { KV kv[1] = { { "name", ax_strv(s), false } }; json_object(b, kv, 1, indent, depth, sim); }
+      else jstr(b, s->data, s->len);   // an atom serializes as its name
       return;
     }
     case AX_ARR: {
@@ -847,6 +847,10 @@ bool ax_engine_binary(AxVM *vm, int op, AxValue l, AxValue r, AxValue *out) {
     *out = raycast_world(W(vm), v3of(l), v3norm(rv), v3mag(rv));
     return true;
   }
+  // Equality, membership and string concatenation mean the same thing for every type; the
+  // interpreter's generic rules handle them (a string `+` renders the other side like f"{v}").
+  if (op == OP_EQ || op == OP_NE || op == OP_IN) return false;
+  if (op == OP_ADD && (l.t == AX_STR || r.t == AX_STR)) return false;
   bool fall = false;   // a `*` that no vector rule claimed falls through to the next block
   if (l.t == AX_VEC3 || r.t == AX_VEC3) {
     bool lv = l.t == AX_VEC3 || l.t == AX_VEC2, rv = r.t == AX_VEC3 || r.t == AX_VEC2;
@@ -1381,13 +1385,14 @@ static void world_add(AxWorld *w, AxEntity *e) {
 extern AxValue ax_host_from_field(AxVM *vm, AxNode *field, AxEntity *e);
 
 // new EntityInstance(decl): the legacy 2D locals, the pose, then every field in order.
-static AxEntity *entity_new(AxVM *vm, AxStr *name, AxStr *base, AxNode **members, int nmembers) {
+static AxEntity *entity_new(AxVM *vm, AxStr *name, AxStr *prefab, AxStr *base, AxNode **members, int nmembers) {
   AxWorld *w = W(vm);
   AxEntity *e = calloc(1, sizeof(AxEntity));
   e->hdr.rc = 1;
   e->hdr.type = AX_ENTITY;
   e->name = name;
   ax_retain(ax_strv(name));
+  e->prefab = prefab;
   e->base = base;
   e->members = members;
   e->nmembers = nmembers;
@@ -1535,7 +1540,7 @@ bool ax_engine_load(AxVM *vm, AxNode *program, const char *source) {
     w->decls[w->ndecls].members = members;
     w->decls[w->ndecls].nmembers = n;
     w->ndecls++;
-    entity_new(vm, d->str, d->str2, members, n);
+    entity_new(vm, d->str, d->str, d->str2, members, n);
   }
   // `@E at v3(...)` — initial poses, applied once every entity exists.
   for (int i = 0; i < program->nlist; i++) {
@@ -2238,7 +2243,7 @@ static AxValue global_query(AxVM *vm, AxNode *n, AxScope *scope) {
     double best_d = INFINITY;
     for (int i = 0; w && i < w->nents; i++) {
       AxEntity *e = w->ents[i];
-      if (e == self || e->name != a0->names[0] || e->pending_remove) continue;
+      if (e == self || e->prefab != a0->names[0] || e->pending_remove) continue;
       AxXform *p = ent_pose(e);
       if (!p) continue;
       V3 q = v3of(p->pos);
@@ -2381,7 +2386,7 @@ static AxEntity *spawn(AxVM *vm, AxNode *n, AxScope *scope) {
   char nm[256];
   snprintf(nm, sizeof nm, "%s_%d", decl_name->data, w->spawn_counter);
   AxStr *name = ax_internz(nm);
-  AxEntity *inst = entity_new(vm, name, w->decls[di].base, w->decls[di].members, w->decls[di].nmembers);
+  AxEntity *inst = entity_new(vm, name, decl_name, w->decls[di].base, w->decls[di].members, w->decls[di].nmembers);
   ax_release(ax_strv(name));
   for (int i = 1; i < n->nlist; i++) {
     AxNode *a = n->list[i];
@@ -2892,6 +2897,25 @@ NATIVE(e_vision_cells) {
   return ax_dictv(out);
 }
 
-void ax_engine_install_more(AxVM *vm) { def(vm, "vision_cells", e_vision_cells, 0, 5); }
+// patrol_point() — a random point in the 1..9 square, held for 3 seconds of simulation time,
+// drawn from the seeded generator.
+NATIVE(e_patrol_point) {
+  AxEntity *e = vm->ctx.entity;
+  if (!e) ax_throw(vm, "AX-RUNTIME-000", "Cannot read properties of null (reading 'world')");
+  double now = W(vm) ? W(vm)->sim_time : 0;
+  if (e->patrol.t == AX_NULL || now - e->patrol_t0 > 3.0) {
+    double x = 1 + ax_rng_next(vm) * 8;
+    double z = 1 + ax_rng_next(vm) * 8;
+    ax_release(e->patrol);
+    e->patrol = ax_vec3(x, 0, z);
+    e->patrol_t0 = now;
+  }
+  return ax_copy(e->patrol);
+}
+
+void ax_engine_install_more(AxVM *vm) {
+  def(vm, "vision_cells", e_vision_cells, 0, 5);
+  def(vm, "patrol_point", e_patrol_point, 0, 0);
+}
 
 AxArr *ax_world_draw_list(AxVM *vm) { return W(vm) ? W(vm)->draw_list : NULL; }

@@ -180,7 +180,7 @@ static AxValue binary_op(AxVM *vm, int op, AxValue l, AxValue r) {
         default: return ax_bool(c <= 0);
       }
     }
-    case OP_IN: return ax_bool(value_in(vm, l, r));
+    case OP_IN: return ax_bool(r.t == AX_HOST ? ax_host_contains(vm, r, l) : value_in(vm, l, r));
     case OP_RANGE: return ax_range(ax_to_num(l), ax_to_num(r), 1);
     case OP_DOT: case OP_CROSS: return ax_num(NAN);
     default:
@@ -288,7 +288,22 @@ AxValue ax_index_get(AxVM *vm, AxValue obj, AxValue idx) {
 static AxValue eval_node(AxVM *vm, AxNode *n, AxScope *scope);
 static int exec_list(AxVM *vm, AxNode **stmts, int n, AxScope *scope, AxValue *out);
 
+// An atom that names a library function stands for it.
+static bool atom_function(AxVM *vm, AxValue v, AxValue *out) {
+  if (v.t != AX_ATOM) return false;
+  if (!ax_scope_lookup_local(vm->builtins, (AxStr *)v.o, out)) return false;
+  if (out->t == AX_FN) return true;
+  ax_release(*out);
+  return false;
+}
+
 AxValue ax_call(AxVM *vm, AxValue fnv, AxValue *args, int argc) {
+  AxValue named;
+  if (atom_function(vm, fnv, &named)) {
+    AxValue r = ax_call(vm, named, args, argc);
+    ax_release(named);
+    return r;
+  }
   if (fnv.t != AX_FN) {
     ax_throw(vm, "AX-CALL-001", "%s is not callable", ax_type_name(fnv));
     return ax_null();
@@ -350,6 +365,13 @@ AxValue ax_key_apply(AxVM *vm, AxValue sel, AxValue item, double index) {
   if (sel.t == AX_FN) {
     AxValue args[2] = { item, ax_num(index) };
     return ax_call(vm, sel, args, 2);
+  }
+  AxValue named;
+  if (atom_function(vm, sel, &named)) {
+    AxValue args[2] = { item, ax_num(index) };
+    AxValue r = ax_call(vm, named, args, 2);
+    ax_release(named);
+    return r;
   }
   if (sel.t == AX_STR || sel.t == AX_ATOM) {
     if (item.t == AX_DICT) {
@@ -423,7 +445,13 @@ static AxValue resolve_ident(AxVM *vm, AxScope *scope, AxStr *name) {
   if (vm->ctx.payload && ax_dict_get(vm->ctx.payload, name, &out)) return out;
   if (vm->ctx.entity && ax_entity_get(vm->ctx.entity, name, &out)) return out;
   if (name == S_input && vm->world) return ax_engine_input(vm);
-  if (ax_scope_lookup(scope, name, &out)) return out;
+  // A declared ^fn/^proc is a function value; a library function's bare name stays an atom
+  // (as in the reference), so `?state == sleep:` compares atoms even though sleep() exists —
+  // and the atom is still callable wherever a function is expected.
+  if (ax_scope_lookup(scope, name, &out)) {
+    if (!(out.t == AX_FN && ((AxFn *)out.o)->native)) return out;
+    ax_release(out);
+  }
   ax_retain(ax_strv(name));
   return ax_atom(name);
 }
