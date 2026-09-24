@@ -1004,7 +1004,19 @@ static AxNode *parse_try(P *p) {
   return n;
 }
 
+static AxNode *parse_stmt_inner(P *p);
+
+// A statement is located at its first token (parser.js), which is where a runtime fault in it
+// is reported.
 static AxNode *parse_stmt(P *p) {
+  AxTok *t = peek(p, 0);
+  int line = t->line, col = t->col;
+  AxNode *n = parse_stmt_inner(p);
+  if (n) { n->line = line; n->col = col; }
+  return n;
+}
+
+static AxNode *parse_stmt_inner(P *p) {
   // !!assert
   if (at(p, T_BANGBANG)) {
     advance(p);

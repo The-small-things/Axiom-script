@@ -25,6 +25,7 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
+#include <setjmp.h>
 #include "term.h"
 #include "render.h"
 
@@ -153,6 +154,13 @@ static bool resolve_imports(AxNode *program, const char *from_path, ImportSet *s
   return true;
 }
 
+// For the REPL: each declaration chunk resolves its imports against one shared set, so a
+// library is loaded once per session.
+bool ax_imports_resolve(AxNode *program, const char *from_path, char *err, size_t errn) {
+  static ImportSet session;
+  return resolve_imports(program, from_path, &session, err, errn);
+}
+
 static void usage(void) {
   printf(
     "AxiomScript %s (native)\n"
@@ -162,6 +170,7 @@ static void usage(void) {
     "  --eval '<source>'   run inline source\n"
     "  --stdin             read the program from standard input\n"
     "  --check             parse and check only; exit 1 on an error\n"
+    "  --repl              interactive session: statements run as typed, expressions echo\n"
     "  -- a b c            arguments for the program, readable with args()\n"
     "\n"
     "  --sim N             step a simulation N frames headless, no renderer\n"
@@ -188,26 +197,28 @@ static void usage(void) {
 }
 
 int main(int argc, char **argv) {
-  const char *path = NULL;
-  char *source = NULL;
-  bool check_only = false, use_stdin = false;
-  bool sandbox = false, allow_exec = false;
-  const char *allow_read[64];
-  int n_allow_read = 0;
-  const char *allow_write[64];
-  int n_allow_write = 0;
-  char **prog_args = NULL;
-  int n_prog_args = 0;
-  bool sim = false, json = false, run_only = false;
-  bool terminal = false, headless = false, ascii = false, no_color = false, subpixel = false;
-  int frames = 60, term_fps = 15, png_every = 30, width = 0, height = 0;
-  const char *input_path = NULL;
+  // static: exit() longjmps back into main, and these must survive it.
+  static const char *path = NULL;
+  static char *source = NULL;
+  static bool check_only = false, use_stdin = false;
+  static bool sandbox = false, allow_exec = false;
+  static const char *allow_read[64];
+  static int n_allow_read = 0;
+  static const char *allow_write[64];
+  static int n_allow_write = 0;
+  static char **prog_args = NULL;
+  static int n_prog_args = 0;
+  static bool sim = false, json = false, run_only = false, repl = false;
+  static bool terminal = false, headless = false, ascii = false, no_color = false, subpixel = false;
+  static int frames = 60, term_fps = 15, png_every = 30, width = 0, height = 0;
+  static const char *input_path = NULL;
 
   for (int i = 1; i < argc; i++) {
     const char *a = argv[i];
     if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) { usage(); return 0; }
     if (strcmp(a, "--version") == 0 || strcmp(a, "-v") == 0) { printf("%s\n", AX_VERSION); return 0; }
     if (strcmp(a, "--check") == 0) { check_only = true; continue; }
+    if (strcmp(a, "--repl") == 0) { repl = true; continue; }
     if (strcmp(a, "--stdin") == 0) { use_stdin = true; continue; }
     if (strcmp(a, "--eval") == 0 && i + 1 < argc) { source = strdup(argv[++i]); continue; }
     if (strcmp(a, "--sandbox") == 0) { sandbox = true; continue; }
@@ -235,6 +246,17 @@ int main(int argc, char **argv) {
     if (strcmp(a, "--") == 0) { prog_args = &argv[i + 1]; n_prog_args = argc - i - 1; break; }
     if (a[0] == '-' && a[1] == '-') { fprintf(stderr, "axiom: unknown flag %s (try --help)\n", a); return 2; }
     if (!path) path = a;
+  }
+
+  if (repl) {
+    AxVM *vm = ax_vm_new();
+    ax_stdlib_install(vm);
+    vm->sandbox = sandbox;
+    vm->allow_exec = allow_exec;
+    for (int i = 0; i < n_allow_read; i++) ax_arr_push(vm->allow_read, ax_str_from(allow_read[i]));
+    for (int i = 0; i < n_allow_write; i++) ax_arr_push(vm->allow_write, ax_str_from(allow_write[i]));
+    for (int i = 0; i < n_prog_args; i++) ax_arr_push(vm->argv, ax_str_from(prog_args[i]));
+    return ax_repl(vm);
   }
 
   if (!source) {
@@ -280,9 +302,29 @@ int main(int argc, char **argv) {
   vm->source_path = path;
 
   const char *label = path ? path : (use_stdin ? "<stdin>" : "<eval>");
+  // exit(n) lands here from wherever it is called. What is printed depends on the phase the
+  // program was in, exactly as main.js: during ^main, the script result; during a --sim run,
+  // the state dump; otherwise just the diagnostics.
+  static jmp_buf exit_target;
+  static volatile int phase = 0;          // 0 loading, 1 ^main, 2 frame loop
+  static volatile int frames_done = 0;
+  static volatile bool drawing = false;
+  vm->exit_jmp = &exit_target;
+  if (setjmp(exit_target)) {
+    int code = vm->exit_code;
+    fflush(stdout);
+    if (drawing && isatty(STDOUT_FILENO)) fputs("\x1b[0m", stdout);
+    if (phase == 1 && json) ax_engine_print_script_json(vm, ax_null(), code, stdout);
+    else if (phase == 2 && sim && json) ax_engine_print_json(vm, frames_done, stdout);
+    else if (!json) ax_engine_print_diags(vm, stderr);
+    fflush(stdout);
+    return code & 0xff;
+  }
+
+  ax_engine_init(vm, source);
+  if (json) ax_engine_quiet(vm, true);
   ax_program_declare(vm, pr.program);
   bool has_entities = ax_engine_load(vm, pr.program, source);
-  if (json) ax_engine_quiet(vm, true);
   ax_engine_set_version(vm, toks.version);
   int n_entities = ax_engine_entity_count(vm);
   bool has_main = false;
@@ -295,22 +337,33 @@ int main(int argc, char **argv) {
     bool loop_follows = !run_only && n_entities > 0;
     if (!json && loop_follows) printf("Loaded %s: running ^main, then %d entities\n", label, n_entities);
     AxValue result = ax_null();
-    ax_run_main(vm, pr.program, vm->argv, &result);
+    phase = 1;
+    bool ok = ax_run_main(vm, pr.program, vm->argv, &result);
+    if (!ok) {
+      // A fault in ^main ends the program, reported at the statement it escaped from.
+      fflush(stdout);
+      if (json) ax_engine_print_script_json(vm, ax_null(), 1, stdout);
+      else {
+        char code[32], msg[512];
+        int line = ax_engine_last_fault(vm, code, sizeof code, msg, sizeof msg);
+        if (line) fprintf(stderr, "%s:%d: runtime error [%s]: %s\n", label, line, code, msg);
+        else fprintf(stderr, "%s:?: runtime error [%s]: %s\n", label, code, msg);
+        ax_engine_print_diags(vm, stderr);
+      }
+      fflush(stdout);
+      return 1;
+    }
     int code = vm->exit_code;
-    if (result.t == AX_NUM) code = (int)result.num;
+    if (result.t == AX_NUM) code = ax_to_int32(result.num);
     if (!loop_follows) {
-      if (json) {
-        // {main_result, log, diagnostics, exit_code}
-        char *mr = NULL;
-        ax_json_write(result, 0, &mr);
-        printf("{\n  \"main_result\": %s,\n  \"log\": ", mr);
-        free(mr);
-        ax_engine_print_log_json(vm, stdout, 1);
-        printf(",\n  \"diagnostics\": [],\n  \"exit_code\": %d\n}\n", code);
+      if (json) ax_engine_print_script_json(vm, result, code, stdout);
+      else {
+        fflush(stdout);
+        ax_engine_print_diags(vm, stderr);
       }
       ax_release(result);
       fflush(stdout);
-      return code;
+      return code & 0xff;
     }
     ax_release(result);
   } else if (run_only) {
@@ -320,6 +373,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "axiom: %s declares no ^main and no entities, so running it does nothing.\n", label);
     return 0;
   }
+  phase = 2;
   if (!json && !has_main) {
     printf("Loaded %s: ", label);
     ax_engine_summary(vm, stdout);
@@ -329,6 +383,7 @@ int main(int argc, char **argv) {
   // The frame loop: --sim steps it with no rendering at all; --headless renders to PNG files;
   // otherwise (as in main.js when there is no SDL window) it draws in the terminal.
   bool draw_terminal = !sim && !headless;
+  drawing = draw_terminal;
   (void)terminal;
   AxTermOptions topt = { 0 };
   int rw = width > 0 ? width : (draw_terminal ? 160 : 640), rh = height > 0 ? height : (draw_terminal ? 120 : 480);
@@ -380,6 +435,7 @@ int main(int argc, char **argv) {
       }
     }
     ax_engine_set_input(vm, mx, my, jump);
+    frames_done = f + 1;
     ax_engine_update(vm, 1.0 / 60);
     if (draw_terminal) {
       uint8_t *px = ax_render_frame(vm, rw, rh);

@@ -300,7 +300,7 @@ function stdlibIntrinsics(world, rt) {
     args: () => (world.argv || []).slice(),
     env: (name, dflt) => { const v = process.env[String(name)]; return v === undefined ? (dflt === undefined ? null : dflt) : v; },
     eprint: (...vals) => { process.stderr.write(vals.map(v => typeof v === 'string' ? v : rt.stringify(v)).join(' ') + '\n'); return null; },
-    exit: (code) => { const c = Number(code) || 0; world.exitCode = c; const e = new rt.AxiomError(`exit(${c})`, 'AX-EXIT'); e.__exit = c; throw e; },
+    exit: (code) => { const c = (Number(code) || 0) | 0; world.exitCode = c; const e = new rt.AxiomError(`exit(${c})`, 'AX-EXIT'); e.__exit = c; throw e; },
     sh: (cmd) => {
       if (world.sandbox && !world.allowExec) fail(`sandbox: running commands is not allowed (pass --allow-exec)`, 'AX-SANDBOX-001');
       const { execSync } = require('child_process');

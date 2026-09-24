@@ -1288,6 +1288,7 @@ static int exec_stmt(AxVM *vm, AxNode *n, AxScope *scope, AxValue *out) {
       AxValue v = n->a ? eval_node(vm, n->a, scope) : ax_null();
       if (v.t == AX_DICT) {
         AxValue code;
+        snprintf(vm->error_code, sizeof vm->error_code, "AX-THROW");
         if (ax_dict_get((AxDict *)v.o, S_code, &code)) {
           AxStr *cs = ax_to_str(code);
           snprintf(vm->error_code, sizeof vm->error_code, "%s", cs->data);
@@ -1401,14 +1402,36 @@ void ax_program_declare(AxVM *vm, AxNode *program) {
   }
   AxCtx saved = vm->ctx;
   vm->ctx.in_fn = true;
-  for (int i = 0; i < program->nlist; i++) {
+  // A global whose initializer faults is recorded and declared null; the program goes on
+  // (interpreter.js loadProgram).
+  if (vm->nhandlers >= AX_MAX_HANDLERS) ax_throw(vm, "AX-TRY", "handlers nested too deeply");
+  int hidx = vm->nhandlers++;
+  int saved_depth = vm->call_depth;
+  for (volatile int i = 0; i < program->nlist; i++) {
     AxNode *d = program->list[i];
     if (d->kind != N_GLOBAL) continue;
-    AxValue v = eval_node(vm, d->a, vm->globals);
+    AxValue v = ax_null();
+    if (setjmp(vm->handlers[hidx]) == 0) {
+      v = eval_node(vm, d->a, vm->globals);
+    } else {
+      vm->nhandlers = hidx + 1;
+      vm->call_depth = saved_depth;
+      vm->ctx = saved;
+      vm->ctx.in_fn = true;
+      ax_engine_fault(vm, "global", d);
+    }
     for (int k = 0; k < d->nnames; k++) ax_scope_declare(vm->globals, d->names[k], ax_copy(v));
     ax_release(v);
   }
+  vm->nhandlers = hidx;
   vm->ctx = saved;
+}
+
+int ax_to_int32(double x) {
+  if (!isfinite(x)) return 0;
+  double t = fmod(trunc(x), 4294967296.0);
+  if (t < 0) t += 4294967296.0;
+  return (int)(uint32_t)t;
 }
 
 bool ax_run_main(AxVM *vm, AxNode *program, AxArr *argv, AxValue *result) {
@@ -1431,13 +1454,35 @@ bool ax_run_main(AxVM *vm, AxNode *program, AxArr *argv, AxValue *result) {
   vm->ctx.in_fn = true;
   vm->ctx.hot = false;
   vm->ctx.dt = 0;
+  // Statement by statement under one handler, so a fault is located at the ^main statement it
+  // escaped from (interpreter.js runMain).
   AxValue ret = ax_null();
-  int flow = exec_list(vm, main_decl->list, main_decl->nlist, s, &ret);
-  (void)flow;
+  bool ok = true;
+  if (vm->nhandlers >= AX_MAX_HANDLERS) ax_throw(vm, "AX-TRY", "handlers nested too deeply");
+  int hidx = vm->nhandlers++;
+  int saved_depth = vm->call_depth;
+  volatile int i = 0;
+  if (setjmp(vm->handlers[hidx]) == 0) {
+    for (; i < main_decl->nlist; i++) {
+      int flow = ax_exec(vm, main_decl->list[i], s, &ret);
+      if (flow == AX_FLOW_RETURN) break;
+      ax_release(ret);
+      ret = ax_null();
+    }
+    vm->nhandlers = hidx;
+  } else {
+    vm->nhandlers = hidx;
+    vm->call_depth = saved_depth;
+    vm->ctx = saved;
+    ax_engine_fault(vm, "main", main_decl->list[i]);
+    vm->exit_code = 1;
+    ret = ax_null();
+    ok = false;
+  }
   vm->ctx = saved;
   ax_scope_release(s);
   *result = ret;
-  return true;
+  return ok;
 }
 
 bool ax_run_program(AxVM *vm, AxNode *program, AxArr *argv, AxValue *result) {

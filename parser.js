@@ -1137,6 +1137,14 @@ class Parser {
     if (this.at(TT.TILDE)) {
       return this.parseAssignOrExprStmt();
     }
+    // v0.9.3: an expression statement may start with a literal or a bracket — `[a, b].each(f)`,
+    // `"x".upper()`, `(f)(1)` — as it could in the native runtime all along.
+    if ([TT.LPAREN, TT.LBRACKET, TT.LBRACE, TT.NUMBER, TT.HEXNUM, TT.STRING, TT.FSTRING, TT.BACKSLASH, TT.MINUS].includes(this.peek().type)) {
+      const line = this.peek().line, col = this.peek().col;
+      const expr = this.parseExpr();
+      this.expect(TT.NEWLINE);
+      return { type: 'ExprStmt', expr, line, col };
+    }
     throw new ParseError(`unexpected statement token ${this.peek().type}`, this.peek());
   }
 

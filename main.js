@@ -183,6 +183,8 @@ for (let i = 0; i < args.length; i++) {
     // declares entities. Without it, a program with a ^main runs ^main and then starts the
     // frame loop only if it has entities to simulate.
     else if (a === '--run' || a === '-r') { flags.run = true; }
+    // v0.9.3: --repl — an interactive session (or a scripted one over a pipe); see repl.js.
+    else if (a === '--repl') { flags.repl = true; }
     else if (a === '--no-restack') { /* handled before start-up; accepted here so it is not "unknown" */ }
     else if (a === '--help' || a === '-h') { flags.help = true; }
     else if (a === '--version' || a === '-v') { flags.version = true; }
@@ -226,6 +228,7 @@ running
   --run, -r              script mode: run ^main and exit (even if the program has entities)
   --sim N                step a simulation N frames headless, no renderer
   --check                parse and check only; exit 1 if anything blocks
+  --repl                 interactive session: statements run as typed, expressions echo
   --json                 machine-readable output (result, log, diagnostics, entity state)
   --no-restack           skip the larger-stack re-exec (lowers the recursion limit)
 
@@ -246,6 +249,10 @@ docs: README.md (language tour) · STDLIB.md (library) · GRAMMAR.md (full gramm
   process.exit(0);
 }
 if (flags.version) { console.log(require('./package.json').version); process.exit(0); }
+if (flags.repl) {
+  require('./repl').startRepl();
+  return;   // the session runs on stdin events; nothing below applies (CommonJS allows this)
+}
 
 const WIDTH = flags.width || 640;
 const HEIGHT = flags.height || 480;
@@ -306,7 +313,19 @@ if (!r.ok) {
   }
   process.exit(1);
 }
-const w = new World().loadProgram(r.program, src);
+// v0.9.3: exit(n) ends the program wherever it is called — a global initializer, ^main, or a
+// frame block in any run mode — so it is handled once, here, rather than in every loop.
+let w;
+process.on('uncaughtException', (err) => {
+  if (err && err.__exit !== undefined) {
+    if (process.stdout.isTTY) process.stdout.write('\x1b[0m');
+    if (w) flushRuntimeDiagnostics(w);
+    process.exit(err.__exit);
+  }
+  console.error(err && err.stack ? err.stack : String(err));
+  process.exit(1);
+});
+w = new World().loadProgram(r.program, src);
 // v0.8.15: suppress console.log from !log/!print when --json is active (would corrupt JSON output)
 if (flags.json) w._suppressConsole = true;
 // v0.8.7: activate sandbox mode if --sandbox was passed.
@@ -339,30 +358,32 @@ if (w.mainDecl) {
   if (!flags.json && loopFollows) {
     console.log(`Loaded ${sourceLabel}: running ^main, then ${w.entities.length} entities`);
   }
+  // The script's outcome. With --json it is one object — including when ^main faulted or
+  // called exit() — so a caller always gets the log and the diagnostics.
+  const finishScript = (code, result) => {
+    flushRuntimeDiagnostics(w);
+    if (flags.json) {
+      console.log(JSON.stringify({
+        main_result: serializeForJson(result),
+        log: w.log.map(l => l.msg).filter(Boolean),
+        diagnostics: w.runtimeDiagnostics,
+        exit_code: code,
+      }, null, 2));
+    }
+    process.exit(code);
+  };
   try {
     w.runMain(scriptArgv);
   } catch (err) {
     // exit() is an ordinary control-flow signal, not a failure.
-    if (err && err.__exit !== undefined) {
-      flushRuntimeDiagnostics(w);
-      process.exit(err.__exit);
+    if (err && err.__exit !== undefined) finishScript(err.__exit, null);
+    const f = w.mainFault;
+    if (!flags.json) {
+      console.error(`${sourceLabel}:${(f && f.location.line) || '?'}: runtime error [${f ? f.error_code : 'AX-RUNTIME-000'}]: ${err && err.message ? err.message : err}`);
     }
-    console.error(`runtime error in ^main: ${err && err.message ? err.message : err}`);
-    flushRuntimeDiagnostics(w);
-    process.exit(1);
+    finishScript(1, null);
   }
-  if (!loopFollows) {
-    flushRuntimeDiagnostics(w);
-    if (flags.json) {
-      console.log(JSON.stringify({
-        main_result: serializeForJson(w.mainResult),
-        log: w.log.map(l => l.msg).filter(Boolean),
-        diagnostics: w.runtimeDiagnostics,
-        exit_code: w.exitCode,
-      }, null, 2));
-    }
-    process.exit(w.exitCode || 0);
-  }
+  if (!loopFollows) finishScript(w.exitCode || 0, w.mainResult);
 } else if (flags.run) {
   console.error(`--run needs a '^main:' entry point; ${sourceLabel} has none.`);
   process.exit(1);
@@ -373,6 +394,7 @@ if (w.mainDecl) {
 function flushRuntimeDiagnostics(world) {
   if (flags.json) return;
   for (const d of world.runtimeDiagnostics || []) {
+    if (d === world.mainFault) continue;      // already reported with its line
     console.error(`  [${d.error_code}] ${d.message_for_human}`);
   }
 }
@@ -427,14 +449,22 @@ function dumpFrame(frameNum) {
 // v0.9.0: --sim — headless simulation with no renderer.
 if (flags.sim) {
   const dt = 1 / 60;
+  let framesRun = flags.frames, exitCode = null;
   for (let i = 0; i < flags.frames; i++) {
     applyInput(inputSteps[i]);
-    w.update(dt);
+    try { w.update(dt); }
+    catch (err) {
+      // v0.9.3: exit(n) in a frame block ends the run; the state at that point is still dumped.
+      if (!(err && err.__exit !== undefined)) throw err;
+      framesRun = i + 1;
+      exitCode = err.__exit;
+      break;
+    }
   }
   flushRuntimeDiagnostics(w);
   if (flags.json) {
     console.log(JSON.stringify({
-      frames_run: flags.frames,
+      frames_run: framesRun,
       sim_time: w._simTime,
       entities: w.entities.map(e => ({
         tag: e._tagName,
@@ -445,7 +475,7 @@ if (flags.sim) {
       diagnostics: w.runtimeDiagnostics,
     }, null, 2));
   }
-  process.exit(w.runtimeDiagnostics.length ? 1 : 0);
+  process.exit(exitCode !== null ? exitCode : w.runtimeDiagnostics.length ? 1 : 0);
 }
 
 // --- Mode detection ---

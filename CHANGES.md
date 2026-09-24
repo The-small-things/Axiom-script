@@ -1,5 +1,42 @@
 # AxiomScript — Change Log
 
+## v0.9.3 — Both runtimes, more to do with them
+
+Every item lands in both runtimes, and `native/difftest.sh` holds them to the same output.
+
+### f-string format specs
+
+`{x:.2f}` `{n:>5}` `{n:05d}` `{total:,.2f}` `{ratio:.1%}` `{n:x}` `{name:<12}` — Python's
+mini-language (`[[fill]align][sign][0][width][,][.precision][type]`, types `f e % d x X o b s`)
+after the last top-level `:` of a placeholder. Numbers round the way `toFixed` does (ties away
+from zero on the exact value), so the native build derives its digits from the exact decimal
+expansion instead of printf. A colon is only a separator when what follows parses as a spec and
+it cannot close a ternary or a lambda: `{a ? b : c}` and `{\v: v}` are unchanged.
+
+### A REPL
+
+`axiom --repl` / `node main.js --repl`. Complete lines run at once, blocks end at a blank line,
+bare expressions echo, declarations join the session, top-level names are globals (a `^fn`
+declared later sees them), `:step N` advances the simulation. It works over a pipe with no
+prompts, so a harness can drive it a line at a time.
+
+### Faults and `exit()` in machine-readable output
+
+- `--json` for a script now always prints its object — also when `^main` faults (with the
+  diagnostic) or calls `exit(n)` (with `exit_code: n`). It used to print nothing.
+- A fault in `^main` is located at the statement it escaped from, not the `^main:` line, and
+  the plain message is `prog.ax:LINE: runtime error [CODE]: message`.
+- `exit(n)` ends the program wherever it is called. In the JavaScript runtime `^try` used to
+  catch it, and in a frame block it was recorded as an `AX-EXIT` fault while the simulation
+  carried on; in `--sim` the state at the exit is still dumped.
+- The native runtime records a faulting `~GLOBAL:` initializer and continues (the global is
+  null), as the reference does, instead of stopping; `^main` faults, `^throw` of a dict without
+  a `code`, statement columns, and the hint text in `message_for_agent` now match exactly.
+- `e.code` for an error the runtime classified from its message was an object in the
+  JavaScript runtime; it is the code string.
+- An expression statement may start with a literal or a bracket (`[a, b].each(f)`), as the
+  native parser always allowed.
+
 ## v0.9.2 — The engine in C
 
 The native runtime now runs the engine as well as the language: entities, frame blocks, events,

@@ -382,7 +382,7 @@ struct AxVM {
   AxDict *fns;          // ^fn/^proc name → AX_FN value
   AxArr *argv;          // program arguments
   int exit_code;
-  bool exiting;
+  jmp_buf *exit_jmp;    // where exit() lands (the command's top level); NULL → exit the process
   // error handling
   jmp_buf handlers[AX_MAX_HANDLERS];
   int nhandlers;
@@ -415,7 +415,8 @@ int ax_exec(AxVM *vm, AxNode *stmt, AxScope *scope, AxValue *out); // returns AX
 AxValue ax_call(AxVM *vm, AxValue fn, AxValue *args, int argc);    // returns +1
 bool ax_run_program(AxVM *vm, AxNode *program, AxArr *argv, AxValue *result);
 void ax_program_declare(AxVM *vm, AxNode *program);   // functions, types, globals
-bool ax_run_main(AxVM *vm, AxNode *program, AxArr *argv, AxValue *result);
+bool ax_run_main(AxVM *vm, AxNode *program, AxArr *argv, AxValue *result);   // false: ^main faulted (recorded)
+int ax_to_int32(double x);                            // JavaScript's ToInt32 (`x | 0`)
 
 enum { AX_FLOW_NORMAL = 0, AX_FLOW_BREAK, AX_FLOW_CONTINUE, AX_FLOW_RETURN };
 
@@ -478,7 +479,13 @@ static inline bool ax_is_vec(AxValue v) { return v.t == AX_VEC2 || v.t == AX_VEC
 
 // engine.c
 void ax_engine_install(AxVM *vm);                          // engine intrinsics (v3, sphere, …)
+void ax_engine_init(AxVM *vm, const char *source);   // the world, before globals run (they may log)
 bool ax_engine_load(AxVM *vm, AxNode *program, const char *source);   // true if it declares entities
+void ax_engine_fault(AxVM *vm, const char *block, AxNode *stmt);      // record the pending error
+int  ax_engine_last_fault(AxVM *vm, char *code, size_t coden, char *msg, size_t msgn);   // → its line
+void ax_engine_print_script_json(AxVM *vm, AxValue result, int code, FILE *out);
+bool ax_engine_diag_at(AxVM *vm, int i, const char **code, const char **msg);   // raw message
+int  ax_repl(AxVM *vm);                                                          // repl.c
 void ax_engine_update(AxVM *vm, double dt);
 int  ax_engine_entity_count(AxVM *vm);
 void ax_engine_summary(AxVM *vm, FILE *out);               // "N entities (A, B)"

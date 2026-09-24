@@ -1,0 +1,38 @@
+1 + 2
+x = 10
+x * 2
+"hi" + str(x)
+^fn sq(n) = n * n
+sq(7)
+^type P: x, y
+p = P(1, 2)
+p
+p.x + p.y
+*i in 0..3:
+  print("i", i)
+print("after loop")
+?x > 5:
+  print("big")
+?!:
+  print("small")
+
+xs = [1,
+  2, 3]
+xs.map(\v: v * 10)
+f"{x:05d}"
+undefined_fn(3)
+[1, 2][5]
+^throw "boom"
+print("still here")
+~G: 42
+G + 1
+@Ball &Body3D
+  ~r: 1
+
+:step 30
+#Ball.pos.y < 0
+null
+v3(1, 2, 3)
+{a: 1, b: [idle, 2]}
+exit(3)
+print("never")

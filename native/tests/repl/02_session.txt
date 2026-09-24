@@ -1,0 +1,53 @@
+// comments are skipped
+d = {a: 1}
+d["b"] = 2
+d
+keys(d)
+add = \a, b: a + b
+add(2, 3)
+counter = 0
+^fn bump():
+  counter += 1
+  ^return counter
+
+bump()
+bump()
+counter
+s = """
+  line one
+  line two
+"""
+s
+?* 5:
+  1: print("one")
+  n if n > 3: print("big", n)
+  _: print("other")
+^try:
+  ^throw {msg: "bad", code: "E-7"}
+^catch e:
+  print("caught", e.code, e.msg)
+^fin:
+  print("fin")
+x = (1 +
+  2)
+x
+1 +
+^return 99
+@Ticker
+  ~n: 0
+  &tick(60hz):
+    n += 1
+    ?n == 2: print("tick two")
+    ?n == 3: [1][0].nope()
+:step 5
+#Ticker.n
+:bogus
+v = v3(1, 2, 3)
+v.x = 9
+v
+[x * 2 for x in 0..4]
+range(0, 3) |> map(\v: v + 1)
+str(1/3)
+f"{1/3:.3f}"
+"quote\"d"
+'single'

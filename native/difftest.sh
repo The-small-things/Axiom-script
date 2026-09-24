@@ -36,6 +36,44 @@ for f in "$ROOT"/native/tests/*.ax; do
   run_case "$(basename "$f")" "$f"
 done
 
+# Script mode's --json: {main_result, log, diagnostics, exit_code}, including when ^main
+# faults or calls exit(). Compared like the simulation dumps (below): exactly, except the prose
+# of a raw error message.
+json_case() {
+  desc="$1"; file="$2"; shift 2
+  $NODE_RUN "$file" --no-restack --json "$@" > /tmp/ax_js.json 2>/dev/null
+  js_code=$?
+  "$NATIVE" "$file" --json "$@" > /tmp/ax_c.json 2>/dev/null
+  c_code=$?
+  if node "$ROOT/native/simcmp.js" /tmp/ax_js.json /tmp/ax_c.json > /tmp/ax_cmp.txt 2>&1 && [ "$js_code" = "$c_code" ]; then
+    pass=$((pass + 1))
+    printf 'OK   %s\n' "$desc"
+  else
+    fail=$((fail + 1))
+    printf 'FAIL %s (js exit %s, native exit %s)\n' "$desc" "$js_code" "$c_code"
+    head -6 /tmp/ax_cmp.txt
+  fi
+}
+for f in "$ROOT"/native/tests/json/*.ax; do
+  [ -e "$f" ] || continue
+  run_case "$(basename "$f")" "$f" --run
+  json_case "$(basename "$f") --json" "$f" --run
+done
+
+# The REPL: the same transcript through both, stdout and exit code identical.
+for f in "$ROOT"/native/tests/repl/*.txt; do
+  [ -e "$f" ] || continue
+  js_out=$($NODE_RUN --repl --no-restack < "$f" 2>/dev/null); js_code=$?
+  c_out=$("$NATIVE" --repl < "$f" 2>/dev/null); c_code=$?
+  if [ "$js_out" = "$c_out" ] && [ "$js_code" = "$c_code" ]; then
+    pass=$((pass + 1)); printf 'OK   repl %s\n' "$(basename "$f")"
+  else
+    fail=$((fail + 1)); printf 'FAIL repl %s (js exit %s, native exit %s)\n' "$(basename "$f")" "$js_code" "$c_code"
+    printf '%s\n' "$js_out" > /tmp/ax_js.txt; printf '%s\n' "$c_out" > /tmp/ax_c.txt
+    diff /tmp/ax_js.txt /tmp/ax_c.txt | head -12
+  fi
+done
+
 # Imports: a three-file program with a diamond, built in a temp directory.
 IMPDIR=$(mktemp -d)
 printf '~TWO: 2\n^fn triple(x) = x * 3\n' > "$IMPDIR/mathlib.ax"

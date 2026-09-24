@@ -407,7 +407,7 @@ function errorToValue(err) {
     }
     return { msg: err.message, code: err.axiomCode, value: v };
   }
-  return { msg: err && err.message ? err.message : String(err), code: classifyRuntimeError(err), value: null };
+  return { msg: err && err.message ? err.message : String(err), code: classifyRuntimeError(err).code, value: null };
 }
 
 // v0.9.0: guards against the two ways a general-purpose program hangs the host instead of
@@ -2721,16 +2721,22 @@ class World {
     if (decl.params.length) scope.declare(decl.params[0], this.argv.slice());
     scope.declare('args', this.argv.slice());
     const mainCtx = { ...ctx, scope };
+    // v0.9.3: a fault is located at the ^main statement it escaped from (as runBlock locates a
+    // frame-block fault), not at the `^main:` line.
+    let current = decl;
     try {
       for (const stmt of decl.body) {
+        current = stmt;
         const r = execStmtInner(stmt, mainCtx);
         if (r instanceof ReturnSignal) { this.mainResult = r.value; break; }
       }
     } catch (err) {
       if (err instanceof ReturnSignal) { this.mainResult = err.value; }
+      else if (err && err.__exit !== undefined) throw err;          // exit(n) is not a fault
       else {
-        const v = errorToValue(err);
-        this.runtimeDiagnostics.push(makeRuntimeFault(null, { name: 'main' }, { line: decl.line, col: decl.col }, err, this));
+        const fault = makeRuntimeFault(null, { name: 'main' }, current, err, this);
+        this.runtimeDiagnostics.push(fault);
+        this.mainFault = fault;
         this.exitCode = 1;
         throw err;
       }
@@ -2906,6 +2912,7 @@ class World {
       let v = null;
       try { v = evalExpr(g.value, ctx); }
       catch (err) {
+        if (err && err.__exit !== undefined) throw err;
         this.runtimeDiagnostics.push(makeRuntimeFault(null, { name: 'global' }, g, err, this));
       }
       for (const n of g.names) this.globalScope.declare(n, v);
@@ -4736,6 +4743,7 @@ function execStmtInner(stmt, ctx) {
         signal = execBody(stmt.body, ctx, new Scope(ctx.scope || ctx.world.globalScope));
       } catch (err) {
         if (err instanceof BreakSignal || err instanceof ContinueSignal || err instanceof ReturnSignal) throw err;
+        if (err && err.__exit !== undefined) throw err;            // v0.9.3: exit() is not catchable
         if (!stmt.catchBody) {
           if (stmt.finallyBody) execBody(stmt.finallyBody, ctx, new Scope(ctx.scope || ctx.world.globalScope));
           throw err;
@@ -5863,6 +5871,7 @@ function runBlock(block, entity, world, dt, eventPayload) {
       execStmtInner(stmt, ctx);
     } catch (err) {
       if (err instanceof BreakSignal || err instanceof ContinueSignal || err instanceof ReturnSignal) throw err;
+      if (err && err.__exit !== undefined) throw err;              // v0.9.3: exit() ends the program
       world.runtimeDiagnostics.push(makeRuntimeFault(entity, block, stmt, err, world));
       break;
     }
@@ -5895,4 +5904,6 @@ module.exports = {
   killAudioChannel, activeAudioChannels, stopAllAudio,
   // v0.8.1: save/load schema versioning helpers
   computeSaveSchema, compareSaveSchemas, makeSchemaMismatchFault,
+  // v0.9.3: the REPL (repl.js) runs statements in its own long-lived scope
+  Scope, makeRuntimeFault, stringifyFStringVal,
 };

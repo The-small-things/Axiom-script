@@ -1324,6 +1324,29 @@ static void push_diag(AxVM *vm, AxEntity *e, AxStr *block, AxNode *stmt) {
   }
 }
 
+// A fault outside any entity: a global initializer ("global") or ^main ("main").
+void ax_engine_fault(AxVM *vm, const char *block, AxNode *stmt) {
+  if (!vm->world) ax_engine_init(vm, NULL);
+  push_diag(vm, NULL, ax_internz(block), stmt);
+  vm->error_code[0] = '\0';
+}
+
+bool ax_engine_diag_at(AxVM *vm, int i, const char **code, const char **msg) {
+  AxWorld *w = W(vm);
+  if (!w || i < 0 || i >= w->ndiags) return false;
+  *code = w->diags[i].code;
+  *msg = w->diags[i].human;
+  return true;
+}
+
+int ax_engine_last_fault(AxVM *vm, char *code, size_t coden, char *msg, size_t msgn) {
+  AxWorld *w = W(vm);
+  if (!w || !w->ndiags) { snprintf(code, coden, "AX-RUNTIME-000"); snprintf(msg, msgn, "?"); return 0; }
+  snprintf(code, coden, "%s", w->diags[w->ndiags - 1].code);
+  snprintf(msg, msgn, "%s", w->diags[w->ndiags - 1].human);
+  return w->diags[w->ndiags - 1].line;
+}
+
 static bool hot_block(AxStr *name) { return name == K_physics || name == K_render || name == K_tick || name == K_on; }
 
 // Run one frame block. Each statement runs in turn; a fault is recorded and ends the block.
@@ -1509,11 +1532,15 @@ static AxWorld *world_new(void) {
 
 #define PUSH(arr, n, item) do { arr = realloc(arr, sizeof(*(arr)) * ((n) + 1)); (arr)[(n)++] = (item); } while (0)
 
-bool ax_engine_load(AxVM *vm, AxNode *program, const char *source) {
+void ax_engine_init(AxVM *vm, const char *source) {
   init_keys();
-  AxWorld *w = world_new();
-  w->source = source;
-  vm->world = w;
+  if (!vm->world) vm->world = world_new();
+  vm->world->source = source;
+}
+
+bool ax_engine_load(AxVM *vm, AxNode *program, const char *source) {
+  ax_engine_init(vm, source);
+  AxWorld *w = vm->world;
   bool any = false;
   for (int i = 0; i < program->nlist; i++) {
     AxNode *d = program->list[i];
@@ -2692,10 +2719,48 @@ static const char *classify_human(const char *code, const char *msg) {
   return msg;
 }
 
+// The advice interpreter.js classifyRuntimeError appends to message_for_agent, by code.
+static const char *fault_hint(const char *code) {
+  static const struct { const char *code, *hint; } H[] = {
+    { "AX-DEPTH-001", "Add a base case, or convert the recursion to a loop. Use memo(fn) if the recursion is re-computing the same arguments." },
+    { "AX-LOOP-002", "Frame blocks (&physics/&render/&tick/&on) are capped so one frame cannot hang the program. Move the long computation into a ^fn called from ^main, or bound the loop." },
+    { "AX-CALL-001", "Check the value: type(v) reports \"fn\" for callables. A ^fn name used without () is a function value; a field holding a number is not." },
+    { "AX-SANDBOX-001", "Pass --allow-read/--allow-write for the path, or --allow-exec for commands. Sandbox mode denies all three by default." },
+    { "AX-RUNTIME-INDEX", "Guard the value first: `?is_null(v):` or `v ?? []`, and use len(v) to check the range. Reading past the end of an array gives null rather than an error." },
+    { "AX-RUNTIME-METHOD", "Check the receiver type with type(v). Array, dict, and string methods are listed in STDLIB.md; a dict field holding a function is callable as a method." },
+    { "AX-RUNTIME-FUNC", "Declare it with ^fn/^proc, import it with ^use, or check the spelling against STDLIB.md." },
+    { "AX-CHECK", "A check()/check_eq() assertion failed. Catch it with ^try:/^catch e: or fix the condition." },
+    { "AX-RUNTIME-ACTION", "Only intrinsic actions and native subsystem declared actions exist." },
+    { "AX-RUNTIME-QUERY", "Queries are declared on the subsystem. Check the entity has the right base type." },
+    { "AX-RUNTIME-KERNEL", "Check that the '~='/'~>' target is actually a '$'-declared field." },
+    { "AX-RUNTIME-TAG", "Check the tag is spelled correctly and that entity exists." },
+    { "AX-RUNTIME-MEMBER", "The object does not have the requested property." },
+    { "AX-RUNTIME-000", "See the raw message for details." },
+  };
+  for (size_t i = 0; i < sizeof H / sizeof H[0]; i++) if (!strcmp(code, H[i].code)) return H[i].hint;
+  return "Raised by ^throw or by the standard library. Wrap the call in ^try:/^catch e: to handle it.";
+}
+
+// interpreter.js attaches a suggested fix to the faults it classifies from a message; these
+// codes arise only that way.
+static const char *fault_fix(const char *code) {
+  if (!strcmp(code, "AX-RUNTIME-ACTION")) return "Available actions: !play(snd,vol), !music(snd), !play_anim(#Mesh,clip,loop?), !mesh(#Ref,mat/color:), !tween(target,dest,dur,ease), !save(slot), !load(slot), !dbg_line(a,b), !log(msg,level), !d(msg,...), !spawn(#Entity,at:), !despawn(self|#Tag), !move(delta). Body3D: !force(v), !impulse(v).";
+  if (!strcmp(code, "AX-RUNTIME-KERNEL")) return "Distributions are declared with $field: shape ~infer: strategy. The ~= and ~> operators only work on $-fields.";
+  if (!strcmp(code, "AX-RUNTIME-TAG")) return "Tag references like #Player.pos resolve to entity tags. Ensure the entity @Player is declared. For resources, use #Mesh3D Name: \"path\" and reference as #Name.";
+  if (!strcmp(code, "AX-RUNTIME-QUERY")) return "NavMesh3D queries: ?path(from,to), ?raycast(origin,dir,maxDist). No other subsystems have queries. Ensure the entity has &NavMesh3D as its base type.";
+  if (!strcmp(code, "AX-RUNTIME-MEMBER")) return "Vec3: .x .y .z .mag .norm. Quat: .euler .conj .normalized. Mat4: .inv .T. Transform: .pos .rot .scl .vel. Entity: .hp .speed etc (your ~fields). Use pose.pos not self.pos (pose is implicit).";
+  if (!strcmp(code, "AX-RUNTIME-000")) return "Check the line for syntax errors, undefined references, or type mismatches.";
+  return NULL;
+}
+
 void ax_engine_print_diags(AxVM *vm, FILE *out) {
   AxWorld *w = W(vm);
   if (!w) return;
-  for (int i = 0; i < w->ndiags; i++) fprintf(out, "  [%s] %s\n", w->diags[i].code, classify_human(w->diags[i].code, w->diags[i].human));
+  AxStr *main_block = ax_internz("main");
+  for (int i = 0; i < w->ndiags; i++) {
+    if (w->diags[i].block == main_block && !w->diags[i].entity) continue;   // reported with its line
+    fprintf(out, "  [%s] %s\n", w->diags[i].code, classify_human(w->diags[i].code, w->diags[i].human));
+  }
 }
 
 static void json_diag(JB *b, Diag *d, int depth) {
@@ -2716,10 +2781,15 @@ static void json_diag(JB *b, Diag *d, int depth) {
   jpad(b, I, depth + 1); jb(b, "\"context_snippet\": "); if (d->has_snippet) jstr(b, d->snippet, strlen(d->snippet)); else jb(b, "null"); jb(b, ",");
   const char *human = d->title[0] == 'S' ? d->human : classify_human(d->code, d->human);
   jpad(b, I, depth + 1); jb(b, "\"message_for_human\": "); jstr(b, human, strlen(human)); jb(b, ",");
-  char agent[1200];
-  snprintf(agent, sizeof agent, "%s Raw error: \"%s\".", human, d->human);
+  char agent[1600];
+  const char *hint = d->title[0] == 'S' ? NULL : fault_hint(d->code);
+  if (hint) snprintf(agent, sizeof agent, "%s Raw error: \"%s\". %s", human, d->human, hint);
+  else snprintf(agent, sizeof agent, "%s Raw error: \"%s\".", human, d->human);
   jpad(b, I, depth + 1); jb(b, "\"message_for_agent\": "); jstr(b, agent, strlen(agent)); jb(b, ",");
-  jpad(b, I, depth + 1); jb(b, "\"suggested_fix\": null,");
+  const char *fix = d->title[0] == 'S' ? NULL : fault_fix(d->code);
+  jpad(b, I, depth + 1); jb(b, "\"suggested_fix\": ");
+  if (fix) jstr(b, fix, strlen(fix)); else jb(b, "null");
+  jb(b, ",");
   jpad(b, I, depth + 1); jb(b, "\"auto_fixable\": false,");
   jpad(b, I, depth + 1); jb(b, "\"__axiomRuntimeFault\": true");
   jpad(b, I, depth); jb(b, "}");
@@ -2785,6 +2855,52 @@ void ax_engine_print_json(AxVM *vm, int frames, FILE *out) {
     jpad(&b, I, 1);
     jb(&b, "]");
   }
+  jpad(&b, I, 0);
+  jb(&b, "}");
+  fprintf(out, "%s\n", b.buf);
+  free(b.buf);
+}
+
+// Script mode's --json (main.js): {main_result, log, diagnostics, exit_code}.
+void ax_engine_print_script_json(AxVM *vm, AxValue result, int code, FILE *out) {
+  init_keys();
+  AxWorld *w = W(vm);
+  JB b = { 0 };
+  const int I = 2;
+  jb(&b, "{");
+  jpad(&b, I, 1); jb(&b, "\"main_result\": "); json_value(&b, result, I, 1, true); jb(&b, ",");
+  jpad(&b, I, 1); jb(&b, "\"log\": ");
+  int nlog = 0;
+  if (w) for (uint32_t i = 0; i < w->log->len; i++) if (((AxStr *)w->log->items[i].o)->len) nlog++;
+  if (!nlog) jb(&b, "[]");
+  else {
+    jb(&b, "[");
+    int k = 0;
+    for (uint32_t i = 0; i < w->log->len; i++) {
+      AxStr *s = (AxStr *)w->log->items[i].o;
+      if (!s->len) continue;
+      if (k++) jb(&b, ",");
+      jpad(&b, I, 2);
+      jstr(&b, s->data, s->len);
+    }
+    jpad(&b, I, 1);
+    jb(&b, "]");
+  }
+  jb(&b, ",");
+  jpad(&b, I, 1); jb(&b, "\"diagnostics\": ");
+  if (!w || !w->ndiags) jb(&b, "[]");
+  else {
+    jb(&b, "[");
+    for (int i = 0; i < w->ndiags; i++) {
+      if (i) jb(&b, ",");
+      jpad(&b, I, 2);
+      json_diag(&b, &w->diags[i], 2);
+    }
+    jpad(&b, I, 1);
+    jb(&b, "]");
+  }
+  jb(&b, ",");
+  jpad(&b, I, 1); jb(&b, "\"exit_code\": "); jnum(&b, code);
   jpad(&b, I, 0);
   jb(&b, "}");
   fprintf(out, "%s\n", b.buf);

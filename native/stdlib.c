@@ -1844,8 +1844,12 @@ NATIVE(n_env) {
   return ax_str_from(v);
 }
 NATIVE(n_exit) {
-  int code = (int)NUM(0);
+  int code = ax_to_int32(NUM(0));
   vm->exit_code = code;
+  // exit() ends the program wherever it is called: not catchable by ^try, not a fault. The
+  // command's top level lands here to flush output and, with --json, print the result.
+  if (vm->exit_jmp) longjmp(*vm->exit_jmp, 1);
+  fflush(stdout);
   exit(code);
 }
 NATIVE(n_sh) {

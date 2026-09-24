@@ -803,5 +803,34 @@ section('20. f-string format specs (v0.9.3)');
     compile(`^main:\n  ^return f"{1 2}"\n`, { imports: false }).diagnostics.some(d => d.severity === 'fatal'));
 }
 
+// =========================================================================================
+section('21. --json for scripts, exit(), and the REPL (v0.9.3)');
+// =========================================================================================
+{
+  const node = process.execPath;
+  const mainJs = path.join(__dirname, 'main.js');
+  const js = (args, input) => spawnSync(node, [mainJs, ...args], { encoding: 'utf8', input });
+  const json = (src) => { const r = js(['--eval', src, '--json']); return { code: r.status, out: JSON.parse(r.stdout) }; };
+
+  const fault = json('^main:\n  print("a")\n  x = 1\n  y = [1].nope()\n');
+  eq('21.1 a fault in ^main still produces the JSON result', [fault.code, fault.out.exit_code, fault.out.log], [1, 1, ['a']]);
+  eq('21.2 … located at the statement it escaped from', [fault.out.diagnostics[0].location.block, fault.out.diagnostics[0].location.line], ['main', 4]);
+  const ex = json('^main:\n  print("bye")\n  exit(3)\n');
+  eq('21.3 exit(n) in --json mode reports exit_code n', [ex.code, ex.out.exit_code, ex.out.log], [3, 3, ['bye']]);
+  const caught = js(['--eval', '^main:\n  ^try:\n    exit(2)\n  ^catch e:\n    print("caught")\n  print("after")\n']);
+  eq('21.4 exit() cannot be caught by ^try', [caught.status, caught.stdout], [2, '']);
+  const plain = js(['--eval', '^main:\n  ^throw "boom"\n']);
+  ok('21.5 an uncaught error names the line and the code', plain.status === 1 && plain.stderr.includes('<eval>:2: runtime error [AX-THROW]: boom'), plain.stderr);
+  const sim = js(['--eval', '@A\n  ~n: 0\n  &tick(60hz):\n    n += 1\n    ?n == 3: exit(4)\n', '--sim', '10', '--json']);
+  const simOut = JSON.parse(sim.stdout);
+  eq('21.6 exit() in a frame block ends a --sim run with its state', [sim.status, simOut.frames_run, simOut.entities[0].fields.n, simOut.diagnostics.length], [4, 3, 3, 0]);
+
+  const repl = js(['--repl'], '1 + 2\nx = 10\n^fn f(n) = n * x\nf(4)\n"s"\n*i in 0..2:\n  print(i)\nprint("done")\n[1,\n 2]\nnope()\nx\n');
+  eq('21.7 the REPL echoes expressions, runs blocks, keeps names', repl.stdout, '3\n40\n"s"\n0\n1\ndone\n[1,2]\n10\n');
+  ok('21.8 … and reports an error without ending the session', repl.status === 0 && repl.stderr.includes('error [AX-RUNTIME-FUNC]'), repl.stderr);
+  const replExit = js(['--repl'], 'print("a")\nexit(5)\nprint("b")\n');
+  eq('21.9 exit() ends a REPL session with its code', [replExit.status, replExit.stdout], [5, 'a\n']);
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed === 0 ? 0 : 1);

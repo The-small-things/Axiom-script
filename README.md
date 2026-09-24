@@ -60,12 +60,30 @@ node main.js --help                  # every flag, with one line each
 node main.js prog.ax --check         # parse and check only; exit 1 if anything blocks
 node main.js prog.ax --json          # machine-readable result, log, and diagnostics
 node main.js --eval '^main: print(1+1)'
+node main.js --repl                  # a session: statements run as typed, expressions echo
 node main.js world.ax --sim 120      # step a simulation 120 frames headless, no renderer
 node main.js world.ax --terminal     # render a 3D world as Unicode blocks in the terminal
 ```
 
 Sandboxing: `--sandbox` denies file writes and subprocesses; open holes explicitly with
 `--allow-read PATH`, `--allow-write PATH`, `--allow-exec`, `--allow-net`.
+
+`--json` always prints one object, `{main_result, log, diagnostics, exit_code}` — also when
+`^main` faults (the diagnostic names the statement's line) or calls `exit(n)`. Without it, an
+uncaught error prints `prog.ax:LINE: runtime error [CODE]: message`. `exit(n)` ends the program
+wherever it is called and cannot be caught.
+
+The REPL reads a program a chunk at a time, from a terminal or a pipe: a complete line runs at
+once (so a harness can write a line and read the answer), a block (a line ending in `:`) ends at
+a blank line, a bare expression prints its value (strings quoted), declarations (`^fn`, `^type`,
+`~G:`, `@Entity`, `^use`) join the session, and `:step N` advances the simulation N frames.
+Errors print `error [CODE]: message` to stderr and the session continues.
+
+```
+$ printf 'x = 6\n^fn f(n) = n * x\nf(7)\nf"{f(7):>6.1f}"\n' | node main.js --repl
+42
+"  42.0"
+```
 
 ---
 
