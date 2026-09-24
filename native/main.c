@@ -29,6 +29,12 @@
 #include "term.h"
 #include "render.h"
 
+static double now_seconds(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
 static char *read_file(const char *path) {
   FILE *f = fopen(path, "rb");
   if (!f) return NULL;
@@ -211,6 +217,7 @@ int main(int argc, char **argv) {
   static bool sim = false, json = false, run_only = false, repl = false;
   static bool terminal = false, headless = false, ascii = false, no_color = false, subpixel = false;
   static int frames = 60, term_fps = 15, png_every = 30, width = 0, height = 0;
+  static bool frames_given = false;
   static const char *input_path = NULL;
 
   for (int i = 1; i < argc; i++) {
@@ -225,14 +232,14 @@ int main(int argc, char **argv) {
     if (strcmp(a, "--allow-exec") == 0) { allow_exec = true; continue; }
     if (strcmp(a, "--allow-read") == 0 && i + 1 < argc) { if (n_allow_read < 64) allow_read[n_allow_read++] = argv[++i]; continue; }
     if (strcmp(a, "--allow-write") == 0 && i + 1 < argc) { if (n_allow_write < 64) allow_write[n_allow_write++] = argv[++i]; continue; }
-    if (strcmp(a, "--sim") == 0) { sim = true; if (i + 1 < argc) { frames = atoi(argv[++i]); if (frames <= 0) frames = 60; } continue; }
+    if (strcmp(a, "--sim") == 0) { sim = true; frames_given = true; if (i + 1 < argc) { frames = atoi(argv[++i]); if (frames <= 0) frames = 60; } continue; }
     if (strcmp(a, "--json") == 0) { json = true; continue; }
     if (strcmp(a, "--terminal") == 0 || strcmp(a, "-t") == 0) {
       terminal = true;
-      if (i + 1 < argc && argv[i + 1][0] && strspn(argv[i + 1], "0123456789") == strlen(argv[i + 1])) frames = atoi(argv[++i]);
+      if (i + 1 < argc && argv[i + 1][0] && strspn(argv[i + 1], "0123456789") == strlen(argv[i + 1])) { frames = atoi(argv[++i]); frames_given = true; }
       continue;
     }
-    if (strcmp(a, "--headless") == 0) { headless = true; if (i + 1 < argc) { frames = atoi(argv[++i]); if (frames <= 0) frames = 60; } continue; }
+    if (strcmp(a, "--headless") == 0) { headless = true; frames_given = true; if (i + 1 < argc) { frames = atoi(argv[++i]); if (frames <= 0) frames = 60; } continue; }
     if (strcmp(a, "--ascii") == 0 || strcmp(a, "-A") == 0) { terminal = true; ascii = true; continue; }
     if (strcmp(a, "--no-color") == 0 || strcmp(a, "-C") == 0) { no_color = true; continue; }
     if (strcmp(a, "--subpixel") == 0 || strcmp(a, "-S") == 0) { terminal = true; subpixel = true; continue; }
@@ -314,6 +321,7 @@ int main(int argc, char **argv) {
     int code = vm->exit_code;
     fflush(stdout);
     if (drawing && isatty(STDOUT_FILENO)) fputs("\x1b[0m", stdout);
+    ax_kbd_restore();
     if (phase == 1 && json) ax_engine_print_script_json(vm, ax_null(), code, stdout);
     else if (phase == 2 && sim && json) ax_engine_print_json(vm, frames_done, stdout);
     else if (!json) ax_engine_print_diags(vm, stderr);
@@ -401,9 +409,17 @@ int main(int argc, char **argv) {
     topt.is_tty = isatty(STDOUT_FILENO);
     if (term_fps < 1) term_fps = 1;
     if (term_fps > 60) term_fps = 60;
+  }
+  // LIVE: a person at the keyboard. With stdin and stdout both terminals, no --input script
+  // and no frame count, the program runs in real time until q / Esc / Ctrl-C, and the keys
+  // drive `input` (kbd.c). A keyboard attached to a run with a frame count still drives input.
+  bool keys = draw_terminal && !input_path && !json && isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
+  bool live = keys && !frames_given;
+  if (draw_terminal) {
     if (!json) {
       fprintf(stderr, "\nMode: terminal @ %dx%d (%s%s, %s).\n", rw, rh, topt.unicode ? "unicode" : "ASCII", topt.subpixel ? "+subpixel" : "", topt.color ? "color" : "no color");
-      fprintf(stderr, "Running %d frames @ %d fps target.\n", frames, term_fps);
+      if (live) fprintf(stderr, "Running live @ %d fps: WASD/arrows move, space jump, F fire, q quit.\n", term_fps);
+      else fprintf(stderr, "Running %d frames @ %d fps target.\n", frames, term_fps);
     }
   } else if (headless && !json) {
     printf("\nMode: headless.\nRunning %d frames @ %dx%d, saving PNG every %d frames.\n", frames, rw, rh, png_every);
@@ -423,29 +439,57 @@ int main(int argc, char **argv) {
       }
     }
   }
-  for (int f = 0; f < frames; f++) {
+  AxKbd kb = { 0 };
+  if (keys && !ax_kbd_enable()) keys = live = false;
+  if (live) fputs("\x1b[2J\x1b[?25l", stdout);   // a clean screen, no cursor flicker
+  double t_last = now_seconds(), acc = 0;
+  for (int f = 0; live || f < frames; f++) {
     double mx = 0, my = 0;
-    bool jump = false;
-    if (f < n_input) {
+    bool jump = false, fire = false;
+    if (keys) {
+      double t = now_seconds();
+      ax_kbd_poll(&kb, t);
+      if (kb.quit) break;
+      ax_kbd_state(&kb, t, &mx, &my, &jump, &fire);
+    } else if (f < n_input) {
       for (const char *c = input_lines[f]; *c; c++) {
         char u = (char)toupper((unsigned char)*c);
         if (u == 'W') my += 1; else if (u == 'S') my -= 1;
         else if (u == 'A') mx -= 1; else if (u == 'D') mx += 1;
         else if (u == ' ') jump = true;
+        else if (u == 'F') fire = true;
       }
     }
-    ax_engine_set_input(vm, mx, my, jump);
-    frames_done = f + 1;
-    ax_engine_update(vm, 1.0 / 60);
+    ax_engine_set_input(vm, mx, my, jump, fire);
+    double t_frame = now_seconds();
+    if (live) {
+      // Real time: as many 60 Hz steps as the wall clock says (at most a quarter second's
+      // worth, so a stall does not turn into a burst).
+      acc += t_frame - t_last;
+      t_last = t_frame;
+      if (acc > 0.25) acc = 0.25;
+      while (acc >= 1.0 / 60) {
+        frames_done = frames_done + 1;
+        ax_engine_update(vm, 1.0 / 60);
+        acc -= 1.0 / 60;
+      }
+    } else {
+      frames_done = f + 1;
+      ax_engine_update(vm, 1.0 / 60);
+    }
     if (draw_terminal) {
       uint8_t *px = ax_render_frame(vm, rw, rh);
       char *text = ax_term_render(px, rw, rh, &topt);
       fputs(text, stdout);
+      if (live) fputs("\x1b[0m\x1b[KWASD/arrows move  space jump  F fire  q quit", stdout);
       fflush(stdout);
       free(text);
       free(px);
-      struct timespec ts = { 0, (long)(1e9 / term_fps) };
-      nanosleep(&ts, NULL);
+      double left = 1.0 / term_fps - (now_seconds() - t_frame);
+      if (left > 0) {
+        struct timespec ts = { (time_t)left, (long)((left - (time_t)left) * 1e9) };
+        nanosleep(&ts, NULL);
+      }
     } else if (headless && ((f + 1) % png_every == 0 || f == frames - 1)) {
       uint8_t *px = ax_render_frame(vm, rw, rh);
       mkdir("screenshots", 0777);
@@ -455,7 +499,8 @@ int main(int argc, char **argv) {
       free(px);
     }
   }
-  if (draw_terminal) fputs("\x1b[0m\n", stdout);
+  if (keys) ax_kbd_restore();
+  if (draw_terminal && !keys) fputs("\x1b[0m\n", stdout);
   if (!json) ax_engine_print_diags(vm, stderr);
   else ax_engine_print_json(vm, frames, stdout);
   fflush(stdout);

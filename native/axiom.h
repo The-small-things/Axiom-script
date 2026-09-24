@@ -513,7 +513,7 @@ AxDict *ax_world_saves(AxVM *vm);
 const char *ax_world_version(AxVM *vm);
 void ax_engine_set_version(AxVM *vm, const char *v);
 void ax_world_diag(AxVM *vm, AxEntity *e, AxStr *block, const char *code, const char *severity, const char *title, const char *human);
-void ax_engine_set_input(AxVM *vm, double mx, double my, bool jump);
+void ax_engine_set_input(AxVM *vm, double mx, double my, bool jump, bool fire);
 
 // Hooks the interpreter calls when it meets an engine construct.
 AxValue ax_engine_eval(AxVM *vm, AxNode *n, AxScope *scope);            // N_TAGREF, N_QUERY, N_INFER

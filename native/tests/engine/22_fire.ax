@@ -1,0 +1,9 @@
+// input.fire from an --input script (F), alongside move and jump.
+@Gun
+  ~shots: 0
+  ~jumps: 0
+  ~x: 0
+  &physics:
+    ?input.fire: shots += 1
+    ?input.jump: jumps += 1
+    x += input.move.x

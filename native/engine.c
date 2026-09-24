@@ -1618,7 +1618,7 @@ bool ax_engine_log_msg(AxVM *vm, AxStr *msg) {
 void ax_engine_log(AxVM *vm, const char *msg) { AxStr *s = ax_str_newz(msg); ax_engine_log_msg(vm, s); ax_release(ax_strv(s)); }
 void ax_engine_quiet(AxVM *vm, bool quiet) { if (W(vm)) W(vm)->suppress_console = quiet; }
 
-void ax_engine_set_input(AxVM *vm, double mx, double my, bool jump) {
+void ax_engine_set_input(AxVM *vm, double mx, double my, bool jump, bool fire) {
   AxWorld *w = W(vm);
   if (!w) return;
   AxValue mv;
@@ -1627,6 +1627,7 @@ void ax_engine_set_input(AxVM *vm, double mx, double my, bool jump) {
     ax_release(mv);
   }
   ax_dict_set(w->input, K_jump, ax_bool(jump));
+  ax_dict_set(w->input, K_fire, ax_bool(fire));
 }
 
 // ---------------------------------------------------------------------------------------------

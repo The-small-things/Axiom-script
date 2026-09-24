@@ -122,6 +122,7 @@ for f in "$ROOT"/native/tests/engine/*.ax; do
   sim_case "sim $(basename "$f")" "$f" 240
 done
 sim_case "sim examples/sim.ax (1000 frames)" "$ROOT/examples/sim.ax" 1000
+sim_case "sim 22_fire.ax with --input (F = fire)" "$ROOT/native/tests/engine/22_fire.ax" 12 --input "$ROOT/native/tests/engine/fire.txt"
 if [ -e "$ROOT/native/tests/engine/input.txt" ]; then
   sim_case "sim 11_misc.ax with --input" "$ROOT/native/tests/engine/11_misc.ax" 240 --input "$ROOT/native/tests/engine/input.txt"
 fi

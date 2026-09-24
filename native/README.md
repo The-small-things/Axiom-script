@@ -19,7 +19,8 @@ Everything the JavaScript runtime runs, with the same results:
 |---|---|
 | **The language** | `^main`, `^fn`/`^proc`, `^type` records, `~globals`, closures and lambdas, pattern matching with bindings and guards, `^try`/`^catch`/`^fin`/`^throw`, destructuring, comprehensions, pipelines, `^use` imports, and ~190 standard-library functions |
 | **The engine** | `@entities` with `~fields`, `^mix` mixins, one-line blocks and `at` poses; `&physics` (60 Hz fixed step), `&tick(Nhz)`, `&render`, `&on(Event)`; `^event` broadcasts — global, `to #Tag`, `within(r)`, deferred when sent from `&tick`; `&Body3D` gravity, drag, `!force`/`!impulse`; the ground plane; sphere/box/capsule collisions with layers, masks and `Collide` events; timers (`~cd: 0.5s`), tweens and easing, transition chains; `#Tag` reads and cross-entity writes; `?nearest`/`?exists`/`?dist`, the `?>` raycast; `!spawn`/`!despawn`/`!move`; `&Pool`/`&Vec`/`&Map` fields; `$` grid distributions with `~=` and `~>`; NavMesh3D `?path` (single- and multi-layer A*), `?raycast` and dynamic obstacles; `!save`/`!load` with the schema check; `^emit` channels; Vec2/Vec3/Quat/Mat4/Transform values |
-| **Output** | `--sim N [--json]` prints exactly main.js's state dump; `--terminal` draws each frame with the same half-block/ASCII encoder as terminal.js; `--headless N` writes PNGs |
+| **Output** | `--sim N [--json]` prints exactly main.js's state dump; `--terminal` draws each frame with the same half-block/ASCII encoder as terminal.js — live, steered from the keyboard, when run at a terminal; `--headless N` writes PNGs |
+| **Tools** | `--repl` (the same session as `node main.js --repl`); `--json` for scripts, faults and `exit()` included |
 
 ### What differs, and why
 

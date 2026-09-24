@@ -20,6 +20,16 @@ bare expressions echo, declarations join the session, top-level names are global
 declared later sees them), `:step N` advances the simulation. It works over a pipe with no
 prompts, so a harness can drive it a line at a time.
 
+### Playing in the terminal
+
+Terminal mode reads the keyboard. When stdin and stdout are both terminals and no frame count
+or `--input` script is given, the program runs live, in real time, until `q`, Esc or Ctrl-C:
+W A S D or the arrow keys drive `input.move`, space `input.jump`, F or Enter `input.fire`. A
+terminal reports presses but not releases, so a movement key counts as held for 0.35 s after
+its last press — auto-repeat keeps it held — and jump and fire are taps. Before this, the
+terminal showed 60 frames of a simulation nobody could steer. `--input` scripts gain `F` for
+fire.
+
 ### Faults and `exit()` in machine-readable output
 
 - `--json` for a script now always prints its object — also when `^main` faults (with the

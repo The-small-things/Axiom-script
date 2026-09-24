@@ -141,7 +141,7 @@ for (let i = 0; i < args.length; i++) {
   // v0.8.17: accept both --long and -short flags. Previously only --long flags were parsed;
   // -t/-A/-C were listed in the conditionals but never matched (a.startsWith('--') excluded them).
   if (a.startsWith('--') || /^-[a-zA-Z]+$/.test(a)) {
-    if (a === '--headless') { flags.headless = true; flags.frames = parseInt(args[++i], 10) || 60; }
+    if (a === '--headless') { flags.headless = true; flags.framesGiven = true; flags.frames = parseInt(args[++i], 10) || 60; }
     else if (a === '--sdl') { flags.sdl = true; }
     // v0.8.16: terminal rendering backend. --terminal/-t overrides --headless and --sdl.
     // Optional frame count arg matches --headless convention (parseInt(args[++i]) || 60).
@@ -149,7 +149,7 @@ for (let i = 0; i < args.length; i++) {
     else if (a === '--terminal' || a === '-t') {
       flags.terminal = true;
       const next = args[i + 1];
-      if (next !== undefined && /^\d+$/.test(next)) { flags.frames = parseInt(args[++i], 10); }
+      if (next !== undefined && /^\d+$/.test(next)) { flags.frames = parseInt(args[++i], 10); flags.framesGiven = true; }
       else { flags.frames = 60; }
     }
     // v0.8.16: --ascii/-A forces ASCII density mode (implies --terminal). Pure flag, no arg.
@@ -191,7 +191,7 @@ for (let i = 0; i < args.length; i++) {
     // v0.9.0: --sim N steps the simulation N frames with NO rendering at all. Game logic can
     // then be exercised (and asserted on, with --json) on a machine with no display and no
     // rasterizer — the same way a script runs.
-    else if (a === '--sim') { flags.sim = true; flags.frames = parseInt(args[++i], 10) || 60; }
+    else if (a === '--sim') { flags.sim = true; flags.framesGiven = true; flags.frames = parseInt(args[++i], 10) || 60; }
     // v0.9.0: everything after `--` is the program's own argv, readable with args().
     else if (a === '--') { flags.scriptArgs = args.slice(i + 1); i = args.length; }
     // v0.8.15: --check (parse-only, no World creation). For linting/CI/IDE. Exits 0 if no
@@ -416,18 +416,42 @@ if (flags.inputScript && fs.existsSync(flags.inputScript)) {
 }
 
 function applyInput(step) {
-  if (!step) { w.input.move.x = 0; w.input.move.y = 0; w.input.jump = false; return; }
-  let x = 0, y = 0, jump = false;
+  if (!step) { w.input.move.x = 0; w.input.move.y = 0; w.input.jump = false; w.input.fire = false; return; }
+  let x = 0, y = 0, jump = false, fire = false;
   for (const c of step.toUpperCase()) {
     if (c === 'W') y += 1;
     else if (c === 'S') y -= 1;
     else if (c === 'A') x -= 1;
     else if (c === 'D') x += 1;
     else if (c === ' ') jump = true;
+    else if (c === 'F') fire = true;          // v0.9.3
   }
   w.input.move.x = x;
   w.input.move.y = y;
   w.input.jump = jump;
+  w.input.fire = fire;
+}
+
+// v0.9.3: live keyboard input for terminal mode (native/kbd.c has the same rules). A terminal
+// reports presses, never releases, so a movement key counts as held for 0.35 s after its last
+// press (auto-repeat renews it while the key is down); jump and fire are taps held for 0.12 s,
+// long enough for a 60 Hz step to see them. A direction cancels its opposite.
+function feedKey(kb, str, key, now) {
+  const name = key && key.name ? key.name : (str || '').toLowerCase();
+  const HOLD = 0.35, TAP = 0.12;
+  if ((key && key.ctrl && (name === 'c' || name === 'd')) || name === 'q' || name === 'escape') { kb.quit = true; return; }
+  if (name === 'w' || name === 'up') { kb.up = now + HOLD; kb.down = 0; }
+  else if (name === 's' || name === 'down') { kb.down = now + HOLD; kb.up = 0; }
+  else if (name === 'a' || name === 'left') { kb.left = now + HOLD; kb.right = 0; }
+  else if (name === 'd' || name === 'right') { kb.right = now + HOLD; kb.left = 0; }
+  else if (name === 'space') kb.jump = now + TAP;
+  else if (name === 'f' || name === 'return' || name === 'enter') kb.fire = now + TAP;
+}
+function applyKeys(kb, now) {
+  w.input.move.x = (kb.right > now ? 1 : 0) - (kb.left > now ? 1 : 0);
+  w.input.move.y = (kb.up > now ? 1 : 0) - (kb.down > now ? 1 : 0);
+  w.input.jump = kb.jump > now;
+  w.input.fire = kb.fire > now;
 }
 
 // --- Frame output ---
@@ -526,12 +550,33 @@ if (TERMINAL) {
   if (flags.subpixel && flags.ascii && !flags.json) {
     console.warn('--subpixel ignored in ASCII mode (half-block characters unavailable).');
   }
+  // v0.9.3: LIVE — a person at the keyboard. With stdin and stdout both terminals, no --input
+  // script and no frame count, the program runs in real time until q / Esc / Ctrl-C and the
+  // keys drive `input`. A keyboard attached to a run with a frame count still drives input.
+  const keys = !flags.inputScript && !flags.json && !!process.stdin.isTTY && !!process.stdout.isTTY;
+  const live = keys && !flags.framesGiven;
   if (!flags.json) {
     const modeLabel = flags.ascii ? 'ASCII' : (detectColorSupport().mode + (flags.subpixel ? '+subpixel' : ''));
     console.error(`\nMode: terminal @ ${TERM_WIDTH}×${TERM_HEIGHT} (${modeLabel}, ${flags.noColor ? 'no color' : (detectColorSupport().color ? 'color' : 'no color')}).`);
     const fpsPreview = flags.termFps !== undefined ? Math.max(1, Math.min(60, flags.termFps)) : 15;
-    console.error(`Running ${flags.frames || 60} frames @ ${fpsPreview} fps target.`);
+    if (live) console.error(`Running live @ ${fpsPreview} fps: WASD/arrows move, space jump, F fire, q quit.`);
+    else console.error(`Running ${flags.frames || 60} frames @ ${fpsPreview} fps target.`);
   }
+  const nowS = () => performance.now() / 1000;
+  const kb = { up: 0, down: 0, left: 0, right: 0, jump: 0, fire: 0, quit: false };
+  const restoreKeys = () => {
+    if (!keys) return;
+    try { process.stdin.setRawMode(false); } catch (e) { /* already closed */ }
+    process.stdin.pause();
+    process.stdout.write('\x1b[0m\x1b[?25h\n');
+  };
+  if (keys) {
+    require('readline').emitKeypressEvents(process.stdin);
+    process.stdin.setRawMode(true);
+    process.stdin.on('keypress', (str, key) => feedKey(kb, str, key, nowS()));
+    process.on('exit', () => { try { process.stdin.setRawMode(false); } catch (e) { /* closed */ } });
+  }
+  if (live) process.stdout.write('\x1b[2J\x1b[?25l');
   const colorSupport = detectColorSupport();
   const termOptions = {
     mode: flags.ascii ? 'ascii' : colorSupport.mode,
@@ -551,10 +596,12 @@ if (TERMINAL) {
   if (TARGET_FPS > 60) { console.warn(`--term-fps ${TARGET_FPS} above maximum; clamped to 60.`); TARGET_FPS = 60; }
   const FRAME_MS = 1000 / TARGET_FPS;
   let frameNum = 0;
+  let tLast = nowS(), acc = 0;
   function terminalLoop() {
-    if (frameNum >= framesRun) {
+    if ((!live && frameNum >= framesRun) || kb.quit) {
       // Final frame: reset attributes + newline so the shell prompt doesn't pick up the last color.
-      process.stdout.write('\x1b[0m\n');
+      if (keys) restoreKeys(); else process.stdout.write('\x1b[0m\n');
+      if (kb.quit) { flushRuntimeDiagnostics(w); process.exit(0); }
       if (flags.json) {
         // v0.8.16: --json + --terminal interaction. During the run, terminal frames went to
         // stdout. After the final frame resets the terminal, the JSON state dump is emitted
@@ -609,14 +656,24 @@ if (TERMINAL) {
       process.exit(0);
       return;
     }
-    applyInput(inputSteps[frameNum] || '');
-    // Simulate at 60 Hz physics. Terminal renders at 15 fps but physics stays smooth.
-    w.update(1 / 60);
+    const tFrame = nowS();
+    if (keys) applyKeys(kb, tFrame);
+    else applyInput(inputSteps[frameNum] || '');
+    if (live) {
+      // Real time: as many 60 Hz steps as the wall clock says (at most a quarter second's
+      // worth, so a stall does not turn into a burst).
+      acc = Math.min(0.25, acc + tFrame - tLast);
+      tLast = tFrame;
+      while (acc >= 1 / 60) { w.update(1 / 60); acc -= 1 / 60; }
+    } else {
+      // Simulate at 60 Hz physics. Terminal renders at 15 fps but physics stays smooth.
+      w.update(1 / 60);
+    }
     const { pixels } = rasterizeFrame(w, TERM_WIDTH, TERM_HEIGHT);
     const frame = renderToTerminal(pixels, TERM_WIDTH, TERM_HEIGHT, termOptions);
-    process.stdout.write(frame);
+    process.stdout.write(live ? frame + '\x1b[0m\x1b[KWASD/arrows move  space jump  F fire  q quit' : frame);
     frameNum++;
-    setTimeout(terminalLoop, FRAME_MS);
+    setTimeout(terminalLoop, Math.max(0, FRAME_MS - (nowS() - tFrame) * 1000));
   }
   terminalLoop();
 } else if (HEADLESS) {
