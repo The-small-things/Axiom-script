@@ -285,6 +285,7 @@ typedef enum {
   N_MIXIN,       // ^mix Name: members  str = name, list = members
   N_MATERIAL,    // ^mat Name: k: v     str = name, list = pairs
   N_RESOURCE,    // #Kind Name: "path"  str = kind, str2 = name, a = path (N_STR) or NULL, b = inline base64 (N_STR)
+  N_FMT,         // {expr:spec} in an f-string   a = expr, str = spec
   N_POOLTYPE,    // &Pool(T, n)         str = Pool/Vec/Map, str2 = element (or key) type, names[0] = value type, num = capacity
 } AxNodeKind;
 
@@ -493,6 +494,8 @@ double ax_host_len(AxValue v);
 bool ax_host_contains(AxVM *vm, AxValue hay, AxValue needle);
 AxValue ax_host_index(AxVM *vm, AxValue obj, AxValue idx);
 bool ax_json_parse(const char *text, AxValue *out);
+AxStr *ax_format_spec(AxValue v, const char *spec);        // f-string {x:spec}
+bool ax_is_format_spec(const char *spec);
 double ax_rng_next(AxVM *vm);                              // the seeded generator random() uses
 double ax_js_hypot(int n, const double *vals);
 AxValue ax_entity_pos(AxEntity *e);

@@ -484,8 +484,25 @@ dotted_path = IDENT { '.' IDENT } ;
 fstring = ( 'f' | '$' ) '"' fstring_body '"' ;
 fstring_body = { fstring_part } ;
 fstring_part = literal_text              (* verbatim text, including {{ → { and }} → } *)
-             | '{' expr '}' ;            (* placeholder — full expression grammar available *)
+             | '{' expr [ ':' spec ] '}' ; (* placeholder — full expression grammar available *)
+
+(* v0.9.3: format spec — Python's mini-language, minus the space sign. *)
+spec  = [ [ fill ] align ] [ sign ] [ '0' ] [ width ] [ ',' ] [ '.' precision ] [ type ] ;
+align = '<' | '>' | '^' | '=' ;          (* '=' pads between the sign and the digits *)
+sign  = '+' | '-' ;
+type  = 'f' | 'e' | '%' | 'd' | 'x' | 'X' | 'o' | 'b' | 's' ;
 ```
+
+`{x:.2f}` `{n:>5}` `{n:05d}` `{total:,.2f}` `{ratio:.1%}` `{n:x}` `{name:<12}` `{s:.3}` (a
+precision on a string truncates it). Numbers align right and everything else left by default;
+a value that is not a number is padded as it would print. Numbers round as JavaScript's
+`toFixed` does — to the nearest decimal of the exact value, ties away from zero — so
+`{2.5:.0f}` is `3` and `{1.005:.2f}` is `1.00` (1.005 is stored as 1.00499…). Precision is
+capped at 100.
+
+The spec starts at the **last** top-level `:` in the placeholder, and only when what follows
+is a valid spec, there is no space before the colon, and the colon cannot close a ternary or a
+lambda: `{a ? b : c}`, `{a ? b :c}` and `{\v: v}` stay expressions. `{x:}` is `{x}`.
 
 ## Sigil Disambiguation Rules (v0.8.7)
 

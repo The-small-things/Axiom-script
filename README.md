@@ -159,6 +159,7 @@ unknown method, sandbox denial) are catchable through the same handler.
 ```axiom
 name = "world"
 greet = f"hello {name}, {1 + 1} exclamations"   // f-string ($"..." is the same)
+row = f"{item:<12}{qty:>4}{price:>9.2f}{share:>7.1%}"  // format specs: [[fill]align][sign][0][width][,][.prec][type]
 block = """
   multi-line text, dedented
 """

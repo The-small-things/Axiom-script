@@ -779,5 +779,29 @@ section('19. The static safety net (v0.9.1)');
   }
 }
 
+// =========================================================================================
+section('20. f-string format specs (v0.9.3)');
+// =========================================================================================
+{
+  const f = (body, prelude) => val(`f"${body}"`, prelude);
+  eq('20.1 fixed precision', f('{3.14159:.2f}'), '3.14');
+  eq('20.2 width and alignment', f('[{42:>5}] [{"ab":<4}] [{"ab":^6}] [{"x":*>3}]'), '[   42] [ab  ] [  ab  ] [**x]');
+  eq('20.3 zero padding keeps the sign in front', f('{-3.5:08.2f}'), '-0003.50');
+  eq('20.4 thousands separator', f('{1234567.891:,.2f}'), '1,234,567.89');
+  eq('20.5 percent', f('{0.256:.1%}'), '25.6%');
+  eq('20.6 integer bases', f('{255:x} {255:X} {5:b} {8:o}'), 'ff FF 101 10');
+  eq('20.7 explicit sign', f('{3:+d} {-7:=+6}'), '+3 -    7');
+  eq('20.8 exponent', f('{1234.5:.2e}'), '1.23e+3');
+  eq('20.9 rounds like toFixed (half away from zero on the exact value)', f('{2.5:.0f} {1.005:.2f} {1.25:.1f}'), '3 1.00 1.3');
+  eq('20.10 string precision truncates by characters', f('{"naïve":.3}'), 'naï');
+  eq('20.11 a ternary colon is not a spec', f('{1 > 0 ? "yes" : "no"}'), 'yes');
+  eq('20.12 a spaced colon is not a spec', f('{1 ? 2 :3}'), '2');
+  eq('20.13 an empty spec is the plain rendering', f('{7:}'), '7');
+  eq('20.14 non-numbers are padded as displayed', f('[{[1, 2]:>7}] [{idle:>5}]'), '[  [1,2]] [ idle]');
+  eq('20.15 a spec inside a lambda body', val('[1, 2].map(\\v: f"{v:03d}")'), ['001', '002']);
+  ok('20.16 a placeholder with two expressions is a parse error',
+    compile(`^main:\n  ^return f"{1 2}"\n`, { imports: false }).diagnostics.some(d => d.severity === 'fatal'));
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed === 0 ? 0 : 1);

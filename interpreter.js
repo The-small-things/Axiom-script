@@ -3395,6 +3395,55 @@ function stringifyFStringVal(v) {
   return String(v);
 }
 
+// v0.9.2: apply an f-string format spec (grammar in parser.js splitFormatSpec). Numbers round
+// the way toFixed/toExponential do; lengths are counted in characters (code points).
+const FORMAT_SPEC_RE = /^(?:([^{}])?([<>^=]))?([+-])?(0)?(\d+)?(,)?(?:\.(\d+))?([fedxXobs%])?$/;
+function groupThousands(body) {
+  const m = /^(\d+)(.*)$/.exec(body);
+  if (!m) return body;
+  return m[1].replace(/\B(?=(\d{3})+(?!\d))/g, ',') + m[2];
+}
+function formatSpec(v, spec) {
+  const m = FORMAT_SPEC_RE.exec(spec);
+  if (!m) return stringifyFStringVal(v);
+  let [, fill, align, sign, zero, width, comma, prec, type] = m;
+  width = width ? parseInt(width, 10) : 0;
+  const p = prec !== undefined ? Math.min(100, parseInt(prec, 10)) : null;
+  if (v && v.__timer) v = v.remaining;
+  let signStr = '', body, numeric = false;
+  if (typeof v === 'number' && type !== 's') {
+    numeric = true;
+    const x = type === '%' ? v * 100 : v;
+    const a = Math.abs(x);
+    if (x < 0) signStr = '-';
+    else if (sign === '+') signStr = '+';
+    if (!Number.isFinite(a)) body = Number.isNaN(a) ? 'NaN' : 'Infinity';
+    else if (type === 'f' || type === '%') body = a.toFixed(p === null ? 6 : p);
+    else if (type === 'e') body = a.toExponential(p === null ? 6 : p);
+    else if (type === 'd') body = a.toFixed(0);
+    else if (type === 'x' || type === 'X' || type === 'o' || type === 'b') {
+      body = Math.trunc(a).toString(type === 'o' ? 8 : type === 'b' ? 2 : 16);
+      if (type === 'X') body = body.toUpperCase();
+    }
+    else body = p !== null ? a.toFixed(p) : String(a);
+    if (comma) body = groupThousands(body);
+    if (type === '%') body += '%';
+  } else {
+    body = typeof v === 'string' ? v : stringifyFStringVal(v);
+    if (p !== null) body = [...body].slice(0, p).join('');
+  }
+  if (zero && !align) { fill = '0'; align = '='; }
+  if (!align) align = numeric ? '>' : '<';
+  if (fill === undefined) fill = ' ';
+  const len = [...(signStr + body)].length;
+  if (width <= len) return signStr + body;
+  const pad = width - len;
+  if (align === '<') return signStr + body + fill.repeat(pad);
+  if (align === '^') { const l = Math.floor(pad / 2); return fill.repeat(l) + signStr + body + fill.repeat(pad - l); }
+  if (align === '=' && numeric) return signStr + fill.repeat(pad) + body;
+  return fill.repeat(pad) + signStr + body;
+}
+
 // v0.9.0: the name to show a model in an error message. `typeof null` is "object" and
 // `constructor.name` is absent on a null — both produce messages that point at the wrong
 // thing, and a wrong hint is worse than none because it sends the next attempt sideways.
@@ -3464,7 +3513,7 @@ function evalExpr(node, ctx) {
         if (p.kind === 'lit') s += p.text;
         else {
           const v = evalExpr(p.node, ctx);
-          s += stringifyFStringVal(v);
+          s += p.spec !== undefined ? formatSpec(v, p.spec) : stringifyFStringVal(v);
         }
       }
       return s;

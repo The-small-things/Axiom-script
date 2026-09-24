@@ -785,6 +785,12 @@ static AxValue eval_node(AxVM *vm, AxNode *n, AxScope *scope) {
       return out;
     }
     case N_TAGREF: case N_QUERY: case N_INFER: return ax_engine_eval(vm, n, scope);
+    case N_FMT: {
+      AxValue v = eval_node(vm, n->a, scope);
+      AxStr *s = ax_format_spec(v, n->str->data);
+      ax_release(v);
+      return ax_strv(s);
+    }
     case N_COMPREHENSION: {
       AxValue iter = eval_node(vm, n->b, scope);
       AxArr *seq = ax_to_seq(vm, iter);

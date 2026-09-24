@@ -218,6 +218,49 @@ static void parse_args(P *p, NodeList *out) {
   expect(p, T_RPAREN, NULL);
 }
 
+// `{expr:spec}`: the spec follows the last top-level ':' when it parses as one, nothing but
+// the expression precedes it, and the colon cannot belong to an open ternary or a lambda.
+// Returns the offset of that colon within [s, s+n), or -1. (Mirrors parser.js splitFormatSpec.)
+static int format_colon(const char *s, int n, char *spec, size_t specn) {
+  int depth = 0, last = -1;
+  char quote = 0;
+  for (int i = 0; i < n; i++) {
+    char c = s[i];
+    if (quote) { if (c == '\\') i++; else if (c == quote) quote = 0; continue; }
+    if (c == '"' || c == '\'') { quote = c; continue; }
+    if (c == '(' || c == '[' || c == '{') depth++;
+    else if (c == ')' || c == ']' || c == '}') depth--;
+    else if (c == ':' && depth == 0) last = i;
+  }
+  if (last <= 0) return -1;
+  int sl = n - last - 1;
+  if (sl < 0 || (size_t)sl >= specn) return -1;
+  memcpy(spec, s + last + 1, sl);
+  spec[sl] = '\0';
+  if (sl > 0 && !ax_is_format_spec(spec)) return -1;          // `{x:}` is an empty spec: plain `{x}`
+  char before = s[last - 1];
+  if (before == ' ' || before == '\t' || before == '\n' || before == '\r') return -1;
+  int q = 0, colons = 0;
+  bool nonblank = false;
+  depth = 0; quote = 0;
+  for (int i = 0; i < last; i++) {
+    char c = s[i];
+    if (c != ' ' && c != '\t') nonblank = true;
+    if (quote) { if (c == '\\') i++; else if (c == quote) quote = 0; continue; }
+    if (c == '"' || c == '\'') { quote = c; continue; }
+    if (c == '(' || c == '[' || c == '{') depth++;
+    else if (c == ')' || c == ']' || c == '}') depth--;
+    else if (depth == 0 && c == '\\') return -1;
+    else if (depth == 0 && c == ':') colons++;
+    else if (depth == 0 && c == '?') {
+      char nx = i + 1 < last ? s[i + 1] : 0, pv = i > 0 ? s[i - 1] : 0;
+      if (nx != '?' && pv != '?' && nx != '>' && nx != '!' && nx != '.') q++;
+    }
+  }
+  if (q > colons || !nonblank) return -1;
+  return last;
+}
+
 // f-string payload → a list of parts. Literal parts carry flag=true.
 static AxNode *parse_fstring(P *p, AxTok *tok) {
   AxNode *n = node(p, N_FSTR);
@@ -273,8 +316,15 @@ static AxNode *parse_fstring(P *p, AxTok *tok) {
       if (depth != 0) perr(p, "unterminated { } in an f-string");
       // Parse the placeholder by tokenizing it on its own.
       int flen = j - (i + 1);
+      char spec[128];
+      int colon = format_colon(s + i + 1, flen, spec, sizeof spec);
+      if (colon >= 0) flen = colon;
+      // Trimmed, as parser.js trims: `{ x }` is `{x}`, not an indented line.
+      const char *fs = s + i + 1;
+      while (flen > 0 && (*fs == ' ' || *fs == '\t' || *fs == '\n' || *fs == '\r')) { fs++; flen--; }
+      while (flen > 0 && (fs[flen - 1] == ' ' || fs[flen - 1] == '\t' || fs[flen - 1] == '\n' || fs[flen - 1] == '\r')) flen--;
       char *frag = arena_alloc(flen + 2);
-      memcpy(frag, s + i + 1, flen);
+      memcpy(frag, fs, flen);
       frag[flen] = '\n';
       frag[flen + 1] = '\0';
       AxTokens *sub = arena_alloc(sizeof(AxTokens));
@@ -282,7 +332,18 @@ static AxNode *parse_fstring(P *p, AxTok *tok) {
       P sp = { .toks = sub, .pos = 0, .res = p->res };
       if (setjmp(sp.bail) == 0) {
         AxNode *e = parse_expr(&sp);
+        while (sp.pos < sub->count && (sub->toks[sp.pos].type == T_NEWLINE || sub->toks[sp.pos].type == T_INDENT || sub->toks[sp.pos].type == T_DEDENT)) sp.pos++;
+        if (sp.pos < sub->count && sub->toks[sp.pos].type != T_EOF) {
+          sub->src[strcspn(sub->src, "\n")] = '\0';
+          perr(p, "f-string placeholder '{%s}' has trailing tokens (only a single expression is allowed)", sub->src);
+        }
         e->flag = false;
+        if (colon >= 0 && spec[0]) {
+          AxNode *f = node(p, N_FMT);
+          f->a = e;
+          f->str = ax_str_new(spec, strlen(spec));
+          e = f;
+        }
         nl_push(&parts, e);
       } else {
         perr(p, "invalid expression inside an f-string");

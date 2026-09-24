@@ -2010,6 +2010,10 @@ class Parser {
           exprText += cj; j++;
         }
         if (depth !== 0) throw new ParseError(`unterminated '{' in f-string (no matching '}')`, tok);
+        // v0.9.2: `{expr:spec}` — a format spec after the last top-level ':' (see splitFormatSpec).
+        const split = splitFormatSpec(exprText);
+        const spec = split ? split.spec : null;
+        if (split) exprText = split.expr;
         // Recursively tokenize + parse the placeholder expression.
         const trimmed = exprText.trim();
         if (trimmed.length === 0) throw new ParseError(`empty '{}' placeholder in f-string (use '{{' for a literal brace)`, tok);
@@ -2031,7 +2035,7 @@ class Parser {
           if (e instanceof ParseError) throw new ParseError(`f-string placeholder '{${trimmed}}' failed to parse: ${e.message}`, tok);
           throw e;
         }
-        parts.push({ kind: 'expr', node: exprNode });
+        parts.push(spec !== null ? { kind: 'expr', node: exprNode, spec } : { kind: 'expr', node: exprNode });
         i = j;
         continue;
       }
@@ -2229,6 +2233,46 @@ class Parser {
   }
 }
 
+// v0.9.2: f-string format specs — `{x:.2f}`, `{n:>5}`, `{n:05d}`, `{x:,.2f}`, `{p:.1%}`,
+// `{n:x}`, `{s:^9}`. The grammar is Python's format mini-language without the space sign:
+//   [[fill]align][sign][0][width][,][.precision][type]   align < > ^ =   sign + -
+//   type: f fixed, e exponent, % percent, d integer, x X o b bases, s string
+// A ':' introduces a spec only when it is the last one at the top level of the placeholder, the
+// text after it is a valid spec, nothing but the expression precedes it (no space right before
+// it), and it cannot belong to an unclosed ternary `?` or a lambda `\x:`.
+const FORMAT_SPEC_RE = /^(?:([^{}])?([<>^=]))?([+-])?(0)?(\d+)?(,)?(?:\.(\d+))?([fedxXobs%])?$/;
+function splitFormatSpec(text) {
+  let depth = 0, quote = null, lastColon = -1;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (quote) { if (c === '\\') i++; else if (c === quote) quote = null; continue; }
+    if (c === '"' || c === "'") { quote = c; continue; }
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if (c === ')' || c === ']' || c === '}') depth--;
+    else if (c === ':' && depth === 0) lastColon = i;
+  }
+  if (lastColon <= 0) return null;
+  const expr = text.slice(0, lastColon), spec = text.slice(lastColon + 1);
+  if (spec.length && !FORMAT_SPEC_RE.test(spec)) return null;      // `{x:}` is an empty spec: plain `{x}`
+  if (/\s/.test(text[lastColon - 1])) return null;
+  // Count top-level ternary '?' (not '??', '?.', '?>', '?!') and ':' in the expression part.
+  let q = 0, colons = 0;
+  depth = 0; quote = null;
+  for (let i = 0; i < expr.length; i++) {
+    const c = expr[i];
+    if (quote) { if (c === '\\') i++; else if (c === quote) quote = null; continue; }
+    if (c === '"' || c === "'") { quote = c; continue; }
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if (c === ')' || c === ']' || c === '}') depth--;
+    else if (depth === 0 && c === '\\') return null;          // a lambda owns the colon
+    else if (depth === 0 && c === ':') colons++;
+    else if (depth === 0 && c === '?' && expr[i + 1] !== '?' && expr[i - 1] !== '?' && expr[i + 1] !== '>' && expr[i + 1] !== '!' && expr[i + 1] !== '.') q++;
+  }
+  if (q > colons) return null;                                     // the colon closes a ternary
+  if (!expr.trim().length) return null;
+  return { expr, spec: spec.length ? spec : null };
+}
+
 function parse(source) {
   const { tokens, version } = tokenize(source);
   const p = new Parser(tokens);
@@ -2242,4 +2286,4 @@ function parse(source) {
   return program;
 }
 
-module.exports = { parse, Parser, ParseError };
+module.exports = { parse, Parser, ParseError, splitFormatSpec, FORMAT_SPEC_RE };
