@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AxiomScript in the browser</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #5b6475; --border: #d8dce3;
+    --accent: #2f6fdf; --accent-text: #ffffff; --err: #b3261e; --code-bg: #fbfbfc;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14171c; --panel: #1b1f26; --text: #e4e7ec; --muted: #9aa3b2; --border: #2c323c;
+      --accent: #5b8def; --accent-text: #0d1117; --err: #ff8a80; --code-bg: #161a20;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { padding: 14px 20px; border-bottom: 1px solid var(--border); display: flex; gap: 14px; align-items: baseline; flex-wrap: wrap; }
+  header h1 { font-size: 17px; margin: 0; }
+  header span { color: var(--muted); font-size: 13px; }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; padding: 16px 20px; }
+  @media (max-width: 900px) { main { grid-template-columns: minmax(0, 1fr); padding: 12px 16px; } }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; display: flex; flex-direction: column; min-width: 0; }
+  .bar { display: flex; gap: 8px; align-items: center; padding: 8px 10px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  .bar .grow { flex: 1; }
+  select, button { font: inherit; font-size: 14px; border: 1px solid var(--border); border-radius: 6px; padding: 5px 12px; background: var(--panel); color: var(--text); }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
+  button:disabled { opacity: 0.5; }
+  textarea { flex: 1; min-height: 420px; width: 100%; border: 0; resize: vertical; padding: 12px; background: var(--code-bg); color: var(--text);
+             font: 13px/1.55 ui-monospace, "SF Mono", Menlo, Consolas, monospace; tab-size: 2; border-radius: 0 0 8px 8px; outline: none; }
+  canvas { width: 100%; aspect-ratio: 4 / 3; display: block; background: #000; outline: none; }
+  .script canvas, .script .hint { display: none; }
+  .script pre { max-height: none; min-height: 300px; }
+  canvas:focus-visible { box-shadow: 0 0 0 2px var(--accent) inset; }
+  pre { margin: 0; padding: 10px 12px; min-height: 120px; max-height: 260px; overflow: auto; font: 12.5px/1.5 ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
+  pre .err { color: var(--err); }
+  .status { color: var(--muted); font-size: 13px; }
+  .hint { color: var(--muted); font-size: 13px; padding: 6px 12px; border-top: 1px solid var(--border); }
+</style>
+</head>
+<body>
+<header>
+  <h1>AxiomScript</h1>
+  <span id="version">loading the runtime…</span>
+  <span>The native runtime compiled to WebAssembly: scripts, and worlds drawn by its software renderer.</span>
+</header>
+<main>
+  <section class="panel">
+    <div class="bar">
+      <select id="example" aria-label="Example program">
+        <option value="game">3D world</option>
+        <option value="script">Script</option>
+      </select>
+      <span class="grow"></span>
+      <button id="stop" disabled>Stop</button>
+      <button id="run" class="primary" disabled>Run</button>
+    </div>
+    <textarea id="src" spellcheck="false" wrap="off" aria-label="Program"></textarea>
+  </section>
+  <section class="panel" id="view-panel">
+    <div class="bar"><span class="status" id="status">Ready.</span></div>
+    <canvas id="view" width="480" height="360" tabindex="0" aria-label="The world"></canvas>
+    <div class="hint">WASD or arrow keys move, space jumps, F fires — click the picture first. Ctrl+Enter runs.</div>
+    <pre id="out" aria-live="polite"></pre>
+  </section>
+</main>
+<script type="module">
+import { loadAxiom } from './axiom.mjs';
+
+const EXAMPLES = {
+  game: `// WASD / arrow keys move the cube, space jumps. Edit, then Run (Ctrl+Enter).
+#Mesh3D Cube: "box.glb"
+#Mesh3D Orb: "sphere.glb"
+#Mesh3D Ground: "plane"
+
+@Cam &Camera at v3(0, 7, 11)
+  ~target: v3(0, 0.5, 0)
+  ~fov: 55
+
+@Sun &Light
+  ~dir: v3(-0.5, -1, -0.4)
+
+@Floor
+  &render: !mesh(#Ground, color: 0x55aa55, scl: v3(14, 1, 14))
+
+@Player &Body3D at v3(0, 0.5, 0)
+  ~hit: box(v3(1, 1, 1))
+  ~speed: 5
+  &physics:
+    pose.pos.x += input.move.x * speed * dt
+    pose.pos.z -= input.move.y * speed * dt
+    ?input.jump && pose.pos.y < 0.6: pose.vel.y = 6
+  &render: !mesh(#Cube, color: 0xd08040)
+
+@Ball &Body3D at v3(0.6, 6, 0)
+  ~hit: sphere(0.5)
+  &on(Collide): print(f"the ball hit {other}")
+  &render: !mesh(#Orb, color: 0x4070e0)
+`,
+  script: `// A script: ^main runs once. print() output appears below.
+^type Item: name, price, qty
+
+^fn total(items) = items.map(\\i: i.price * i.qty).sum()
+
+^main:
+  cart = [Item("pen", 1.5, 4), Item("book", 12, 1), Item("mug", 8.25, 2)]
+  print(f"{len(cart)} items, total {total(cart):.2f}")
+  print("under 10:", cart.filter(\\i: i.price < 10).map(\\i: i.name))
+  *i in range(1, 16):
+    ?* [i % 3, i % 5]:
+      [0, 0]: print("FizzBuzz")
+      [0, _]: print("Fizz")
+      [_, 0]: print("Buzz")
+      _: print(i)
+`,
+};
+
+const $ = (id) => document.getElementById(id);
+const src = $('src'), out = $('out'), status = $('status'), canvas = $('view');
+const ctx = canvas.getContext('2d');
+let axiom = null, ax = null, raf = 0;
+const held = new Set();
+
+function write(text, isErr) {
+  const span = document.createElement('span');
+  if (isErr) span.className = 'err';
+  span.textContent = text;
+  out.appendChild(span);
+  if (out.childNodes.length > 2000) out.removeChild(out.firstChild);
+  out.scrollTop = out.scrollHeight;
+}
+
+function stop(message) {
+  cancelAnimationFrame(raf);
+  raf = 0;
+  if (ax) { ax.free(); ax = null; }
+  $('stop').disabled = true;
+  if (message) status.textContent = message;
+}
+
+function draw() {
+  const px = ax.render(canvas.width, canvas.height);
+  if (px) ctx.putImageData(new ImageData(px, canvas.width, canvas.height), 0, 0);
+}
+
+function input() {
+  const has = (...ks) => ks.some((k) => held.has(k));
+  return {
+    x: (has('d', 'arrowright') ? 1 : 0) - (has('a', 'arrowleft') ? 1 : 0),
+    y: (has('w', 'arrowup') ? 1 : 0) - (has('s', 'arrowdown') ? 1 : 0),
+    jump: has(' '),
+    fire: has('f', 'enter'),
+  };
+}
+
+function run() {
+  stop();
+  out.textContent = '';
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ax = axiom.create({ onOutput: (stream, text) => write(text, stream === 2) });
+  if (!ax.load(src.value, 'main.ax')) { stop('Did not compile.'); return; }
+  const code = ax.main();
+  const entities = ax.state().entities.length;
+  $('view-panel').classList.toggle('script', !entities);
+  if (!entities || ax.exitCode) {
+    stop(`Finished: exit code ${ax ? ax.exitCode || code : code}.`);
+    return;
+  }
+  status.textContent = `Running: ${entities} entities at 60 Hz.`;
+  $('stop').disabled = false;
+  canvas.focus();
+  let last = performance.now(), acc = 0, frames = 0;
+  const frame = (now) => {
+    acc = Math.min(acc + (now - last) / 1000, 0.25);   // a stalled tab does not come back in a burst
+    last = now;
+    ax.setInput(input());
+    while (acc >= 1 / 60) {
+      acc -= 1 / 60;
+      frames++;
+      if (ax.step(1)) { draw(); stop(`Program called exit(${ax.exitCode}) after ${frames} frames.`); return; }
+    }
+    draw();
+    raf = requestAnimationFrame(frame);
+  };
+  draw();
+  raf = requestAnimationFrame(frame);
+}
+
+canvas.addEventListener('keydown', (e) => {
+  const k = e.key.toLowerCase();
+  if (['w', 'a', 's', 'd', 'f', ' ', 'enter', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(k)) {
+    held.add(k);
+    e.preventDefault();
+  }
+});
+canvas.addEventListener('keyup', (e) => held.delete(e.key.toLowerCase()));
+canvas.addEventListener('blur', () => held.clear());
+src.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); run(); }
+  if (e.key === 'Tab') {
+    e.preventDefault();
+    const s = src.selectionStart;
+    src.setRangeText('  ', s, src.selectionEnd, 'end');
+  }
+});
+$('run').addEventListener('click', run);
+$('stop').addEventListener('click', () => stop('Stopped.'));
+$('example').addEventListener('change', (e) => { stop('Ready.'); src.value = EXAMPLES[e.target.value]; out.textContent = ''; });
+src.value = EXAMPLES.game;
+
+try {
+  axiom = await loadAxiom();
+  $('version').textContent = `runtime ${axiom.version}`;
+  $('run').disabled = false;
+} catch (e) {
+  $('version').textContent = 'the runtime did not load';
+  write(`${e.message}\nBuild it with \`make wasm\` in native/, and serve this directory over HTTP.\n`, true);
+}
+window.axiomDemo = { run, stop, get instance() { return ax; } };
+</script>
+</body>
+</html>

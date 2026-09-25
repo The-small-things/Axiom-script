@@ -138,6 +138,37 @@ from the native library.
 - An expression statement may start with a literal or a bracket (`[a, b].each(f)`), as the
   native parser always allowed.
 
+### Embedding: a C API, and the runtime as WebAssembly
+
+The native runtime is now a library as well as a command. `native/axiom_api.h` runs a program
+with its output captured, gives it host functions (arguments in and result out as JSON; a host
+error is catchable with `^try`), evaluates code with REPL semantics, checks without running,
+and drives a simulation — input in, `--sim --json` state out, frames rendered to RGBA. Nothing
+in it exits the host (`exit(n)`, runtime errors and failed compiles are return values), an
+instance starts sandboxed, and a freed instance leaves nothing behind: each has its own AST
+arena, and freeing the VM breaks the declared-function ↔ scope cycle.
+
+`make wasm` builds the same C to WebAssembly: `axiom.wasm` is the command (under Node's WASI,
+with files: `node native/wasm/axiom-wasi.js prog.ax`), `axiom-lib.wasm` the API, which
+`native/wasm/axiom.mjs` wraps for Node and browsers without needing WASI support from either.
+`native/wasm/index.html` is a playground: edit, run, and steer a world drawn by the software
+renderer onto a canvas. Errors unwind with `setjmp`/`longjmp`, which WebAssembly lacks; they
+become WebAssembly exceptions. difftest compares both builds against the native binary (126
+checks: scripts, every engine test's state, the checker corpus, the REPL) and a C test host
+drives every API entry point, also under ASan with leak detection.
+
+### Caught errors no longer leak memory
+
+A `^throw` unwinds C frames with `longjmp`, and the native runtime used to lose the scopes of
+every frame it jumped past: a loop that caught 200 000 errors grew to 124 MB. Scopes now live on
+a stack that a throw unwinds to its handler's mark; the same loop stays at 10 MB.
+
+### Fixed
+
+- The native parser accepted `^fn f(x): stmt` — which parser.js rejects — and the function
+  returned null. It is now the same parse error in both (the one-line form is
+  `^fn f(x) = expr`).
+
 ## v0.9.2 — The engine in C
 
 The native runtime now runs the engine as well as the language: entities, frame blocks, events,

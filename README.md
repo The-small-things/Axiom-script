@@ -229,15 +229,23 @@ Full detail in [`CHANGES.md`](CHANGES.md).
 | Rendering | needs `render3d.js` (not in this repository) | built-in software rasterizer → terminal or PNG |
 | Start-up | ~45 ms | ~1.6 ms |
 | Simulations (`--sim`) | baseline | 1.7–14× faster |
-| Compute (fib, loops, dictionaries) | baseline | 1.8–2.7× faster |
-| Install | Node 18+ | `make`; one ~400 KB binary, libc and libm only |
+| Compute (fib, loops, dictionaries) | baseline | 2.8–5× faster |
+| Install | Node 18+ | `make`; one ~600 KB binary, libc and libm only |
+| Embedding | — | a C API (`axiom_api.h`) and a WebAssembly build for Node and browsers |
 
 ```
 cd native && make
 ./axiom ../examples/calc.ax -- "2 * (3 + 4) - 10 / 5"
 ./axiom ../examples/sim.ax --sim 400 --json      # a simulation, stepped headless
 ./axiom ../examples/scene.ax                     # drawn in the terminal
+make wasm && node wasm/axiom-wasi.js ../examples/calc.ax -- "1 + 2"   # the same, as WebAssembly
 ```
+
+The C runtime embeds: a host program links `libaxiom.a`, runs AxiomScript with its output
+captured, gives it host functions (JSON in, JSON out), steps its simulations and reads their
+state — sandboxed by default, never exiting the host. Built to WebAssembly, the same runtime
+runs in a browser: `native/wasm/axiom.mjs` is its JavaScript API, and `native/wasm/index.html`
+a playground that draws a world onto a canvas and steers it from the keyboard.
 
 The two are kept identical by differential testing: `native/difftest.sh` runs every conformance
 program, example and engine test on both runtimes and compares stdout, exit codes and the final

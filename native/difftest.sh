@@ -227,5 +227,24 @@ else
 fi
 rm -rf "$RDIR"
 
+# The embedding API: a C host driving every entry point (tests/api/apitest.c).
+if make -s -C "$ROOT/native" tests/api/apitest > /dev/null 2>&1 && "$ROOT/native/tests/api/apitest" > /tmp/ax_api.txt 2>&1; then
+  pass=$((pass + 1)); printf 'OK   embedding API: %s\n' "$(tail -1 /tmp/ax_api.txt)"
+else
+  fail=$((fail + 1)); printf 'FAIL embedding API\n'; grep -v '^OK' /tmp/ax_api.txt | head -12
+fi
+
+# WebAssembly, when a wasm32-wasi toolchain is installed: the command build and the library
+# build (through wasm/axiom.mjs) against this binary (tests/api/wasmtest.mjs).
+if printf 'int main(void){return 0;}' | ${WASI_CC:-clang} --target=wasm32-wasi -x c -o /dev/null - > /dev/null 2>&1; then
+  if make -s -C "$ROOT/native" wasm > /tmp/ax_wasm_build.txt 2>&1 && node "$ROOT/native/tests/api/wasmtest.mjs" > /tmp/ax_wasm.txt 2>&1; then
+    pass=$((pass + 1)); printf 'OK   WebAssembly: %s\n' "$(tail -1 /tmp/ax_wasm.txt)"
+  else
+    fail=$((fail + 1)); printf 'FAIL WebAssembly\n'; cat /tmp/ax_wasm_build.txt /tmp/ax_wasm.txt 2>/dev/null | grep -v '^OK' | head -20
+  fi
+else
+  printf 'SKIP WebAssembly (no wasm32-wasi toolchain: clang with wasi-libc)\n'
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

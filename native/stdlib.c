@@ -1939,8 +1939,8 @@ NATIVE(n_sh) {
     while ((got = fread(buf, 1, sizeof buf, pipe)) > 0) sb_add(&sb, buf, got);
 #ifndef __wasi__
     status = pclose(pipe);
-#endif
     if (status != -1) status = WEXITSTATUS(status);
+#endif
   }
   ax_release(ax_strv(cmd));
   AxDict *d = ax_dict_new();

@@ -1,7 +1,7 @@
 # AxiomScript — native runtime (C11)
 
 A single dependency-free binary that runs AxiomScript programs — scripts and simulations alike.
-No Node, no packages, no runtime to install: `cc`, libc, libm, ~400 KB.
+No Node, no packages, no runtime to install: `cc`, libc, libm, ~600 KB.
 
 ```
 make
@@ -10,6 +10,9 @@ make
 ./axiom ../examples/scene.ax                             # a scene, drawn in the terminal
 ./axiom ../examples/scene.ax --headless 60               # … or to PNG frames in screenshots/
 ```
+
+It also embeds: a C API (`axiom_api.h`, `libaxiom.a`) and a WebAssembly build that runs the same
+programs in Node and in browsers (below).
 
 ## What it runs
 
@@ -45,15 +48,66 @@ Everything the JavaScript runtime runs, with the same results:
   distributions use no randomness and match exactly.
 * `--json` combined with `--terminal` prints the `--sim` state format.
 
+## Embedding: the C API and WebAssembly
+
+**From C** — link `libaxiom.a` (built by `make`) and include `axiom_api.h`:
+
+```c
+axiom *ax = axiom_new();                         // one program: its globals, world and output
+axiom_set_output(ax, my_writer, ctx);            // print()/eprint() → (stream 1|2, whole lines)
+axiom_define(ax, "fetch_price", my_fn, ctx);     // a host function: JSON arguments in, JSON out
+int code = axiom_run(ax, source, "prog.ax");     // check + run ^main → the exit code
+char *res = axiom_result(ax);                    // the script's --json object
+axiom_release(res);
+axiom_free(ax);
+```
+
+The rest of the surface: `axiom_check` (`--check --json` without running), `axiom_load` +
+`axiom_main`, `axiom_eval` (REPL semantics: statements run, declarations join the session, an
+expression returns its value), `axiom_set_input` / `axiom_step` / `axiom_state` (a simulation
+driven by the host, state as `--sim --json`), `axiom_render` (a frame as RGBA pixels),
+`axiom_error`. Nothing in it exits the host: `exit(n)`, a runtime error and a failed compile are
+return values. An instance starts **sandboxed** — no files, no `sh()` — until the host allows
+them (`axiom_allow_read`/`axiom_allow_write`/`axiom_allow_exec`, or `axiom_sandbox(ax, 0)`).
+Instances are independent (one thread each) and free completely: each parses into its own AST
+arena, and freeing the VM breaks the function ↔ scope cycles reference counting cannot.
+`tests/api/apitest.c` drives every entry point (`make apitest`).
+
+**WebAssembly** — `make wasm` (clang with the wasi-libc sysroot; on Debian/Ubuntu the `clang`,
+`lld`, `wasi-libc` and `libclang-rt-18-dev-wasm32` packages, the last for your clang version)
+builds two modules:
+
+```
+node wasm/axiom-wasi.js prog.ax [flags]       # axiom.wasm: the command, all flags, files included
+```
+
+```js
+import { loadAxiom } from './wasm/axiom.mjs';  // axiom-lib.wasm: the C API, for Node and browsers
+const axiom = await loadAxiom();
+const ax = axiom.create({ onOutput: (stream, text) => log(text) });
+ax.define('now_ms', () => Date.now());         // callable from AxiomScript; throwing → ^catch
+ax.run(source);                                // → exit code
+ax.eval('x = 20'); ax.eval('x * 2').value;     // → "40"
+ax.load(world); ax.setInput({ x: 1, jump: true }); ax.step(60); ax.state(); ax.render(480, 360);
+ax.free();
+```
+
+`axiom.mjs` needs nothing from the host — it answers the runtime's few system calls itself —
+and the library build has no file system. `wasm/index.html` is a playground: edit a program,
+run it, and steer a world drawn by the software renderer onto a canvas (serve `wasm/` over HTTP
+after `make wasm`). WebAssembly has no `setjmp`, so errors unwind as WebAssembly exceptions
+(`wasm/sjlj.c` is the runtime half of clang's lowering); a runtime needs exception-handling
+support (Node 17+, current browsers).
+
 ## Conformance
 
 The JavaScript implementation is the specification, so verification is differential: run each
 program on **both** runtimes and require the same result.
 
 ```
-./difftest.sh        # 77 checks: language, --json, the REPL, the checker, imports, examples,
+./difftest.sh        # 79 checks: language, --json, the REPL, the checker, imports, examples,
                      # 24 engine programs, math, number formatting, .glb loading, terminal,
-                     # rendering
+                     # rendering, the C API, and WebAssembly against this binary
 make debug           # ASan + UBSan build; the corpus runs clean under both
 ```
 
@@ -75,6 +129,12 @@ make debug           # ASan + UBSan build; the corpus runs clean under both
   fallback.
 * **Terminal output** — 60 pixel buffers × option combinations through terminal.js and
   `term.c`, byte-identical.
+* **The C API** — `tests/api/apitest.c`: 44 checks of every entry point, also run under ASan
+  with leak detection (300 instances created and freed).
+* **WebAssembly** — `tests/api/wasmtest.mjs` (run by difftest when a wasm32-wasi toolchain is
+  installed): the JavaScript API's own checks; every script and engine test through the library
+  build; and the command build against this binary on the scripts, every engine test's
+  `--sim --json`, the checker corpus and the REPL transcripts — 126 checks, all identical.
 
 ### Why the math is its own file
 
@@ -141,8 +201,11 @@ Node.
 * **Faults in a frame block are recorded, not fatal**: each block runs under its own error
   handler, and a fault ends that block, as in the reference.
 * **Strings, identifiers and dictionary keys are interned**, so a scope lookup is a pointer hash.
-* **Memory is reference counted.** Cycles (a closure capturing its own scope, an entity field
-  pointing at an entity) are not collected; a process exits long before that matters.
+* **Memory is reference counted.** Scopes also live on a stack that a throw unwinds, so a caught
+  error releases the frames it jumped past (a loop catching 200 000 errors stays at 10 MB). A
+  function declared at the top level refers to the scope that holds it; freeing a VM clears
+  its globals first, which breaks that cycle. Other cycles (a closure stored in its own scope,
+  an entity field pointing back at its entity) are not collected.
 * **Control flow** is a return code; **errors** use `setjmp`/`longjmp`.
 
 ## Why C, and not C++ or assembly
@@ -176,5 +239,9 @@ rasterizer's span loop), and nothing is there yet.
 | `kbd.c` | live keyboard input for terminal mode |
 | `render.c` | software rasterizer and PNG writer (new code) |
 | `term.c` | terminal output, ported from terminal.js |
+| `imports.c` | `^use` resolution |
+| `axiom_api.h`, `api.c` | the embedding API |
 | `main.c` | the `axiom` command |
+| `wasm/` | WebAssembly: `sjlj.c` and `include/setjmp.h` (setjmp/longjmp on WebAssembly exceptions), `api_js.c` (the JavaScript entry points), `axiom.mjs` (the JavaScript API), `axiom-wasi.js` (runs the command build under Node), `index.html` (the playground) |
 | `difftest.sh`, `simcmp.js`, `checkcmp.js` | differential tests against the JavaScript runtime |
+| `tests/api/` | the C API's test host and the WebAssembly comparison |

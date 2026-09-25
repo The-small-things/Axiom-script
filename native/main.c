@@ -115,6 +115,13 @@ int main(int argc, char **argv) {
   static bool frames_given = false;
   static const char *input_path = NULL;
 
+#ifdef __wasi__
+  // The WebAssembly runner (wasm/axiom-wasi.js) preopens the host's root as "/" and passes its
+  // working directory, so relative and absolute paths both mean what they do natively.
+  const char *wasi_cwd = getenv("AXIOM_WASI_CWD");
+  if (wasi_cwd) chdir(wasi_cwd);
+#endif
+
   for (int i = 1; i < argc; i++) {
     const char *a = argv[i];
     if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) { usage(); return 0; }
