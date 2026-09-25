@@ -36,7 +36,7 @@
 #include <stdio.h>
 #include <setjmp.h>
 
-#define AX_VERSION "0.9.2"
+#define AX_VERSION "0.9.3"
 
 // WASI has no realpath: there, paths are compared as written.
 #ifdef __wasi__

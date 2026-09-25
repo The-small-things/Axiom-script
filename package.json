@@ -1,6 +1,6 @@
 {
   "name": "axiomscript",
-  "version": "0.9.2",
+  "version": "0.9.3",
   "description": "AxiomScript \u2014 a general-purpose scripting language designed for LLMs to write: token-count is the design metric. Scripts, apps, math and simulation, plus a game/3D runtime. Static checker + interpreter + standard library.",
   "main": "main.js",
   "bin": {
@@ -11,8 +11,7 @@
     "node": ">=18"
   },
   "scripts": {
-    "lint": "node lint.js",
-    "test": "node run_all_tests.js",
+    "test": "npm run test:lang",
     "test:file": "node",
     "prepare": "node -e \"if(require('fs').existsSync('.githooks')){require('child_process').execSync('git config core.hooksPath .githooks',{stdio:'inherit'})}\"",
     "test:lang": "node test_v090_general.js && node test_v0817_features.js",
