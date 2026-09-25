@@ -3424,7 +3424,7 @@ function defaultIntrinsics() {
     // v0.9.2: str(v) is exactly what f"{v}" shows.
     str: (v) => stringifyFStringVal(v),
     // v0.9.0: `type()` reports a record's declared ^type name and recognizes functions.
-    type: (v) => v == null ? 'null' : typeof v === 'function' ? 'fn' : Array.isArray(v) ? 'array' : typeof v === 'object' ? (v.__callable ? 'fn' : v.__type ? v.__type : v instanceof Atom ? 'atom' : v instanceof Vec3 ? 'vec3' : v instanceof Vec2 ? 'vec2' : v instanceof Quat ? 'quat' : v instanceof EntityInstance ? 'entity' : v instanceof Transform ? 'transform' : v instanceof Mat4 ? 'mat4' : 'dict') : typeof v,
+    type: (v) => v == null ? 'null' : typeof v === 'function' ? 'fn' : Array.isArray(v) ? 'array' : typeof v === 'object' ? (v.__callable ? 'fn' : v.__type ? v.__type : v instanceof Atom ? 'atom' : v instanceof Vec3 ? 'vec3' : v instanceof Vec2 ? 'vec2' : v instanceof Quat ? 'quat' : v instanceof EntityInstance ? 'entity' : v instanceof Transform ? 'transform' : v instanceof Mat4 ? 'mat4' : v instanceof Range ? 'range' : 'dict') : typeof v,
     is_null: (v) => v == null,
     is_number: (v) => typeof v === 'number',
     is_string: (v) => typeof v === 'string',
@@ -3522,6 +3522,8 @@ function stringifyFStringVal(v) {
   if (v instanceof Atom) return v.name;
   if (v instanceof EntityInstance) return v._tagName || v.decl.name;
   if (Array.isArray(v)) return '[' + v.map(stringifyFStringVal).join(',') + ']';
+  // v0.9.3: a range shows as the source that makes it, as in the native runtime ("Range" before).
+  if (v instanceof Range) return v.step === 1 ? `${v.lo}..${v.hi}` : `range(${v.lo}, ${v.hi}, ${v.step})`;
   if (v instanceof Closure) return `<fn ${v.name === '<lambda>' ? 'lambda' : v.name}>`;
   if (typeof v === 'function') return `<fn ${v.name || 'fn'}>`;
   if (v && typeof v === 'object') {
@@ -4028,7 +4030,15 @@ function binaryOpRest(op, l, r) {
   switch (op) {
     case '+': return l + r; case '-': return l - r; case '*': return l * r; case '/': return l / r;
     case '%': return l % r;  // v0.8.8: modulo (numbers only — Vec3 has no modulo)
-    case '**': return Math.pow(l, r);  // v0.8.11: exponentiation
+    case '**':  // v0.8.11: exponentiation
+      // v0.9.3: two bigs raise exactly (Math.pow cannot take one); a big with a number is the
+      // same mixing error as the other operators.
+      if (typeof l === 'bigint' || typeof r === 'bigint') {
+        if (typeof l !== 'bigint' || typeof r !== 'bigint') throw new TypeError('Cannot mix BigInt and other types, use explicit conversions');
+        if (r < 0n) throw new RangeError('Exponent must be non-negative');
+        return l ** r;
+      }
+      return Math.pow(l, r);
     case '>': case '<': case '>=': case '<=': case '==': case '!=': return compareOp(op, l, r);
     default: throw new Error(`unknown operator '${op}'`);
   }

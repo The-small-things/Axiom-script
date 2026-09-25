@@ -163,6 +163,43 @@ A `^throw` unwinds C frames with `longjmp`, and the native runtime used to lose 
 every frame it jumped past: a loop that caught 200 000 errors grew to 124 MB. Scopes now live on
 a stack that a throw unwinds to its handler's mark; the same loop stays at 10 MB.
 
+### Big integers in the native runtime
+
+`big(x)` / `is_big(x)` existed only in the JavaScript runtime; the native build now has them,
+with JavaScript's BigInt semantics exactly (`native/bigint.c`): construction from text
+(StringToBigInt: `0x`/`0o`/`0b`, white space, `""` is 0) and from numbers by their exact binary
+value (`big(1e30)` is `1000000000000000019884624838656`), `+ - * / %` with truncating division,
+comparison with numbers by mathematical value, conversion back with correct rounding, digit
+strings in `--json` and state dumps, and the same errors — mixing a big with a number, handing
+one to a `Math` function, dividing by zero. difftest checks a seeded program of 400 operand
+pairs (limb boundaries and 80-digit randoms) against V8, every library function called with a
+big, and the JSON, display and save paths.
+
+Both runtimes gain `big ** big` (it used to fail: the reference passed bigs to `Math.pow`).
+
+### Found while testing it, fixed in the native runtime
+
+- `int(s)` and `float(s)` returned `null` for text that is not a number, and `int` clamped past
+  2^63; they are now `parseInt`/`parseFloat` exactly (`NaN`, correctly rounded).
+- `to_fixed` rounded ties to even (`to_fixed(2.5, 0)` was `2`, JavaScript `3`) and wrote
+  numbers past 1e21 in full; it now shares the f-string `.Nf` code, which is `toFixed`.
+- `band`/`bor`/`bxor`/`bnot`/`shl`/`shr`, `gcd`, `to_hex` and `to_bin` used 64-bit C integers
+  (32-bit in the WebAssembly build); they are 32-bit as in JavaScript (`bor(2 ** 31, 0)` is
+  `-2147483648`, `shl(1, 40)` is `256`).
+- `chr(233)` wrote a raw byte (invalid UTF-8) and `ord` read one; both work in UTF-16 code
+  units, as `fromCharCode`/`charCodeAt` do.
+- `is_nan`, `is_finite` and `is_int` are `Number.isNaN`/`isFinite`/`isInteger`: false for
+  anything that is not a number (`is_nan("abc")` was true).
+- `uniq`, `union`, `intersect` and `difference` compare by displayed text, as the reference's
+  sets do, and are linear rather than quadratic; `deep_eq` compares as JSON text.
+- A `!save` whose state cannot be written as JSON still creates `saves/`, as the reference does.
+
+### Ranges display as their source
+
+A range printed as `Range` in the JavaScript runtime and as `0..3` natively, and `type()` called
+it `dict` there. Both now show `0..3` (or `range(1, 10, 2)` with a step) and name the type
+`range`.
+
 ### Fixed
 
 - The native parser accepted `^fn f(x): stmt` — which parser.js rejects — and the function

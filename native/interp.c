@@ -172,11 +172,86 @@ static bool value_in(AxVM *vm, AxValue needle, AxValue hay) {
   }
 }
 
+// A big on either side: JavaScript's BigInt rules. Arithmetic needs two bigs (a string `+`
+// still concatenates); comparison is by mathematical value against numbers, booleans, null and
+// strings that spell an integer, and false against anything else.
+static const char BIG_MIX[] = "Cannot mix BigInt and other types, use explicit conversions";
+
+static AxValue big_result(AxVM *vm, AxBig *b) {
+  if (!b) ax_throw(vm, "AX-RUNTIME-000", "Maximum BigInt size exceeded");
+  return ax_bigv(b);
+}
+
+// l <=> r with l a big; *unordered when JavaScript's comparison is undefined (always false).
+static int big_relation(AxValue l, AxValue r, bool *unordered) {
+  AxBig *a = (AxBig *)l.o;
+  *unordered = false;
+  switch (r.t) {
+    case AX_BIG: return ax_big_cmp(a, (AxBig *)r.o);
+    case AX_NUM: return ax_big_cmp_num(a, r.num, unordered);
+    case AX_BOOL: return ax_big_cmp_num(a, r.b ? 1 : 0, unordered);
+    case AX_NULL: return ax_big_cmp_num(a, 0, unordered);
+    case AX_TIMER: return ax_big_cmp_num(a, ((AxTimer *)r.o)->remaining, unordered);
+    case AX_STR: case AX_ARR: {
+      // A string that spells an integer; an array through its text ("2" for [2]).
+      AxStr *s = r.t == AX_STR ? (AxStr *)r.o : ax_js_string(r);
+      AxBig *b = ax_big_parse(s->data, s->len);
+      if (r.t == AX_ARR) ax_release(ax_strv(s));
+      if (!b) { *unordered = true; return 0; }
+      int c = ax_big_cmp(a, b);
+      free(b);
+      return c;
+    }
+    default: *unordered = true; return 0;
+  }
+}
+
+static AxValue big_binary(AxVM *vm, int op, AxValue l, AxValue r) {
+  switch (op) {
+    case OP_ADD:
+      if (l.t == AX_STR || r.t == AX_STR) return concat_values(l, r);
+      /* fallthrough */
+    case OP_SUB: case OP_MUL: case OP_DIV: case OP_MOD: case OP_POW: {
+      if (l.t != AX_BIG || r.t != AX_BIG) ax_throw(vm, "AX-RUNTIME-000", "%s", BIG_MIX);
+      AxBig *a = (AxBig *)l.o, *b = (AxBig *)r.o;
+      switch (op) {
+        case OP_ADD: return ax_bigv(ax_big_add(a, b));
+        case OP_SUB: return ax_bigv(ax_big_sub(a, b));
+        case OP_MUL: return big_result(vm, ax_big_mul(a, b));
+        case OP_POW:
+          if (b->neg) ax_throw(vm, "AX-RUNTIME-000", "Exponent must be non-negative");
+          return big_result(vm, ax_big_pow(a, b));
+        default: {
+          if (ax_big_is_zero(b)) ax_throw(vm, "AX-RUNTIME-000", "Division by zero");
+          AxBig *q = NULL, *m = NULL;
+          ax_big_divmod(a, b, op == OP_DIV ? &q : NULL, op == OP_MOD ? &m : NULL);
+          return ax_bigv(op == OP_DIV ? q : m);
+        }
+      }
+    }
+    case OP_GT: case OP_LT: case OP_GE: case OP_LE: {
+      bool unordered;
+      int c = l.t == AX_BIG ? big_relation(l, r, &unordered) : -big_relation(r, l, &unordered);
+      if (unordered) return ax_bool(false);
+      switch (op) {
+        case OP_GT: return ax_bool(c > 0);
+        case OP_LT: return ax_bool(c < 0);
+        case OP_GE: return ax_bool(c >= 0);
+        default: return ax_bool(c <= 0);
+      }
+    }
+    default:
+      ax_throw(vm, "AX-RUNTIME-000", "%s", BIG_MIX);
+      return ax_null();
+  }
+}
+
 static AxValue binary_op(AxVM *vm, int op, AxValue l, AxValue r) {
   // A timer takes part in arithmetic and comparison as its remaining time (the reference's
   // valueOf), so `?cd <= 0:` and `cd - dt` read the way they look.
   if (l.t == AX_TIMER && op != OP_EQ && op != OP_NE) l = ax_num(((AxTimer *)l.o)->remaining);
   if (r.t == AX_TIMER && op != OP_EQ && op != OP_NE) r = ax_num(((AxTimer *)r.o)->remaining);
+  if ((l.t == AX_BIG || r.t == AX_BIG) && op != OP_EQ && op != OP_NE && op != OP_IN && op != OP_RANGE) return big_binary(vm, op, l, r);
   if (l.t >= AX_VEC2 || r.t >= AX_VEC2 || op == OP_DOT || op == OP_CROSS || op == OP_RAY) {
     AxValue out;
     if (ax_engine_binary(vm, op, l, r, &out)) return out;
@@ -280,6 +355,7 @@ AxValue ax_index_get(AxVM *vm, AxValue obj, AxValue idx) {
     }
     case AX_STR: {
       AxStr *s = (AxStr *)obj.o;
+      if (idx.t == AX_BIG) ax_throw(vm, "AX-RUNTIME-000", "Cannot convert a BigInt value to a number");
       int64_t i = (int64_t)ax_to_num(idx);
       if (i < 0) i += s->len;
       if (i < 0 || (uint64_t)i >= s->len) return ax_null();
@@ -771,6 +847,7 @@ static AxValue eval_node(AxVM *vm, AxNode *n, AxScope *scope) {
       AxValue v = eval_node(vm, n->a, scope);
       AxValue res;
       if (n->op == OP_NOT) res = ax_bool(!ax_truthy(v));
+      else if (v.t == AX_BIG) res = ax_bigv(ax_big_neg((AxBig *)v.o));
       else if (v.t == AX_VEC2 || v.t == AX_VEC3) {
         AxValue m1 = ax_num(-1);
         res = binary_op(vm, OP_MUL, v, m1);

@@ -39,10 +39,10 @@ Conventions:
 | `round_to(x, step)` `to_fixed(x, digits)` | quantising and fixed-point formatting (a string) |
 | `hypot(a, b)` `dist(a, b)` | distance — `dist` also takes two vectors |
 | `deg2rad(d)` `rad2deg(r)` | angle conversion |
-| `num(v)` `int(s)` `float(s)` `parse_int(s, radix)` | conversion to number (`num` returns 0 on failure, `parse_int` returns null) |
+| `num(v)` `int(s)` `float(s)` `parse_int(s, radix)` | conversion to number (`num` returns 0 on failure, `int`/`float` NaN — they are `parseInt`/`parseFloat` — and `parse_int` null) |
 | `to_hex(n)` `to_bin(n)` `to_base(n, base)` | number → string |
 | `band(a, b)` `bor(a, b)` `bxor(a, b)` `bnot(x)` `shl(a, n)` `shr(a, n)` | bitwise (the `&` sigil is reserved, so these are functions) |
-| `big(v)` `is_big(v)` | arbitrary-precision integers; `+ - * / %` work between two of them |
+| `big(v)` `is_big(v)` | arbitrary-precision integers (JavaScript's BigInt): `+ - * / % **` between two of them (`/` truncates), exact comparison with numbers; mixing one with a number in arithmetic, or passing one to a `Math` function, is an error — convert with `num(b)` / `big(n)` |
 | `is_nan(x)` `is_int(x)` `is_finite(x)` | numeric predicates |
 
 ## Randomness
@@ -76,7 +76,7 @@ Seeded, so a run is reproducible: call `seed(n)` and the whole sequence repeats.
 | `count_by(xs, key)` | dict of key → count |
 | `count(xs, value_or_pred?)` | number of matches (or the length, with no second argument) |
 | `partition(xs, pred)` | `[matching, rest]` |
-| `uniq(xs, key?)` | duplicates removed, order preserved |
+| `uniq(xs, key?)` | duplicates removed, order preserved (values that display alike are duplicates: `1` and `"1"`) |
 | `zip(a, b, …)` `unzip(pairs)` | transpose lists into tuples and back |
 | `enumerate(xs)` | `[[0, x0], [1, x1], …]` — pairs with `*i, v in enumerate(xs):` |
 | `chunk(xs, size)` `windows(xs, size)` | fixed-size blocks / sliding windows |
@@ -99,8 +99,8 @@ Seeded, so a run is reproducible: call `seed(n)` and the whole sequence repeats.
 | `pick_keys(d, ks)` `omit_keys(d, ks)` | projections |
 | `invert(d)` | values become keys |
 | `has_key(d, k)` | membership by key (`k in d` is the operator form) |
-| `clone(v)` `deep_eq(a, b)` | deep copy / deep comparison |
-| `type(v)` | `"number"`, `"string"`, `"array"`, `"fn"`, `"atom"`, `"vec3"`, a `^type` name, … |
+| `clone(v)` `deep_eq(a, b)` | deep copy / deep comparison (as JSON text, so key order counts and `NaN` equals `NaN`) |
+| `type(v)` | `"number"`, `"string"`, `"array"`, `"fn"`, `"atom"`, `"vec3"`, `"range"`, `"bigint"`, a `^type` name, … |
 | `is_null(v)` `is_number(v)` `is_string(v)` `is_array(v)` `is_dict(v)` `is_bool(v)` `is_fn(v)` | type predicates |
 
 ## Strings, encoding, regular expressions

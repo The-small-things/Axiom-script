@@ -59,6 +59,7 @@ typedef enum {
   AX_DICT,    // heap: AxDict
   AX_FN,      // heap: AxFn   (closure or native function)
   AX_RANGE,   // heap: AxRange
+  AX_BIG,     // heap: AxBig — big(x), an arbitrary-precision integer (JavaScript's BigInt)
   // engine values
   AX_VEC2,    // heap: AxVec (x, y)
   AX_VEC3,    // heap: AxVec (x, y, z)
@@ -156,6 +157,15 @@ struct AxRange {
   double lo, hi, step;
 };
 
+// Magnitude in little-endian 32-bit limbs, no leading zero limb; zero has n == 0 and is never
+// negative (bigint.c).
+typedef struct AxBig {
+  AxObj hdr;
+  bool neg;
+  uint32_t n;
+  uint32_t d[];
+} AxBig;
+
 // ---- constructors / refcounting -------------------------------------------------------------
 
 static inline AxValue ax_null(void) { AxValue v; v.t = AX_NULL; v.o = NULL; return v; }
@@ -202,6 +212,27 @@ AxValue ax_fnv(AxFn *f);
 
 // Ranges
 AxValue ax_range(double lo, double hi, double step);
+
+// Big integers (bigint.c). Constructors return +1 objects; NULL from parse means "not an
+// integer", from mul/pow "past the size limit".
+AxValue ax_bigv(AxBig *b);                              // takes ownership
+AxBig *ax_big_from_int(int64_t v);
+AxBig *ax_big_from_double(double finite);               // the exact value of trunc(x)
+AxBig *ax_big_parse(const char *s, size_t len);         // StringToBigInt
+double ax_big_to_double(const AxBig *b);                // Number(b)
+char *ax_big_to_cstr(const AxBig *b);                   // decimal, malloc'd
+bool ax_big_is_zero(const AxBig *b);
+int ax_big_cmp(const AxBig *a, const AxBig *b);
+int ax_big_cmp_num(const AxBig *a, double x, bool *unordered);
+AxBig *ax_big_add(const AxBig *a, const AxBig *b);
+AxBig *ax_big_sub(const AxBig *a, const AxBig *b);
+AxBig *ax_big_neg(const AxBig *a);
+AxBig *ax_big_mul(const AxBig *a, const AxBig *b);
+void ax_big_divmod(const AxBig *a, const AxBig *b, AxBig **q, AxBig **r);   // b != 0
+AxBig *ax_big_pow(const AxBig *a, const AxBig *e);      // e >= 0
+AxBig *ax_big_parse_digits(const char *s, size_t n, unsigned radix);
+size_t ax_js_space(const char *s, size_t i, size_t len);   // bytes of JS white space at s[i], or 0
+AxStr *ax_js_string(AxValue v);   // JavaScript's String(v): as displayed, but an array joins without brackets
 
 // ---- predicates and conversions ---------------------------------------------------------------
 bool ax_truthy(AxValue v);
@@ -478,6 +509,7 @@ bool ax_is_callable(AxValue v);
 AxValue ax_binary_op(AxVM *vm, int op, AxValue l, AxValue r);
 AxValue ax_member_get(AxVM *vm, AxValue obj, AxStr *prop);
 void ax_json_write(AxValue v, int indent, char **out);   // JSON.stringify-compatible; *out is malloc'd
+bool ax_json_write_checked(AxValue v, int indent, char **out);   // false: JSON.stringify would throw (a big)
 
 // ============================================================================================
 // Engine values

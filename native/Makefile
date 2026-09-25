@@ -9,7 +9,7 @@ LDFLAGS ?=
 LDLIBS  ?= -lm
 
 # The runtime; the command is main.c on top, an embedding host links libaxiom.a (axiom_api.h).
-LIB_SRCS = value.c lexer.c parser.c interp.c stdlib.c engine.c host.c infer.c jsmath.c term.c kbd.c render.c fmt.c glb.c check.c repl.c imports.c api.c
+LIB_SRCS = value.c lexer.c parser.c interp.c stdlib.c engine.c host.c infer.c jsmath.c term.c kbd.c render.c fmt.c glb.c check.c repl.c imports.c api.c bigint.c
 SRCS = $(LIB_SRCS) main.c
 OBJS = $(SRCS:.c=.o)
 LIB_OBJS = $(LIB_SRCS:.c=.o)

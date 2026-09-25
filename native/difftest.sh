@@ -125,10 +125,10 @@ run_case "examples/wordcount.ax" "$ROOT/examples/wordcount.ax" -- "$ROOT/example
 # fields, positions, log, sim time — exactly; diagnostics by code, entity, block and line).
 sim_case() {
   desc="$1"; file="$2"; frames="$3"; shift 3
-  rm -rf saves
+  rm -rf saves /tmp/ax_js_saves
   $NODE_RUN "$file" --sim "$frames" --json "$@" > /tmp/ax_js.json 2>/dev/null
   js_code=$?
-  [ -d saves ] && rm -rf /tmp/ax_js_saves && mv saves /tmp/ax_js_saves
+  [ -d saves ] && mv saves /tmp/ax_js_saves
   "$NATIVE" "$file" --sim "$frames" --json "$@" > /tmp/ax_c.json 2>/dev/null
   c_code=$?
   # !save writes saves/<slot>.json; the files must match too.
@@ -204,6 +204,19 @@ else
 fi
 rmdir screenshots 2>/dev/null
 rm -rf "$GDIR"
+
+# Big integers: a seeded program of limb-boundary and random operands through every operator
+# (tests/bigint/gen.js); V8's BigInt is the reference.
+BDIR=$(mktemp -d)
+node "$ROOT/native/tests/bigint/gen.js" "$BDIR/arith.ax" 400
+$NODE_RUN "$BDIR/arith.ax" --no-restack > "$BDIR/js.txt" 2>&1; bj=$?
+"$NATIVE" "$BDIR/arith.ax" > "$BDIR/c.txt" 2>&1; bc=$?
+if [ "$bj" = "$bc" ] && cmp -s "$BDIR/js.txt" "$BDIR/c.txt"; then
+  pass=$((pass + 1)); printf 'OK   big-integer arithmetic identical to V8 (%s lines)\n' "$(wc -l < "$BDIR/js.txt" | tr -d ' ')"
+else
+  fail=$((fail + 1)); printf 'FAIL big-integer arithmetic\n'; diff "$BDIR/js.txt" "$BDIR/c.txt" | head -8
+fi
+rm -rf "$BDIR"
 
 # Terminal output: the same pixel buffers through terminal.js and term.c must give the same bytes.
 TDIR=$(mktemp -d)

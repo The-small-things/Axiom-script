@@ -169,7 +169,7 @@ static void obj_free(AxObj *o) {
       free(f);
       return;
     }
-    case AX_RANGE: free(o); return;
+    case AX_RANGE: case AX_BIG: free(o); return;
     case AX_XFORM: {
       AxXform *x = (AxXform *)o;
       ax_release(x->pos); ax_release(x->rot); ax_release(x->scl); ax_release(x->vel);
@@ -442,6 +442,7 @@ bool ax_truthy(AxValue v) {
     case AX_NUM:  return v.num != 0 && !isnan(v.num);
     case AX_STR:  return ((AxStr *)v.o)->len > 0;
     case AX_ARR:  return ((AxArr *)v.o)->len > 0;
+    case AX_BIG:  return !ax_big_is_zero((AxBig *)v.o);
     // A vector is "true" when it is meaningfully non-zero, as in the reference — which is what
     // makes `?input.move:` read as "is the stick being pushed".
     case AX_VEC2: { AxVec *q = (AxVec *)v.o; return hypot(q->x, q->y) > 0.1; }
@@ -459,6 +460,7 @@ static bool equals_depth(AxValue a, AxValue b, int depth) {
     case AX_STR:
     case AX_ATOM: return ax_str_eq((AxStr *)a.o, (AxStr *)b.o);
     case AX_FN:   return a.o == b.o;
+    case AX_BIG:  return ax_big_cmp((AxBig *)a.o, (AxBig *)b.o) == 0;
     case AX_VEC2: { AxVec *x = (AxVec *)a.o, *y = (AxVec *)b.o; return x->x == y->x && x->y == y->y; }
     case AX_VEC3: { AxVec *x = (AxVec *)a.o, *y = (AxVec *)b.o; return x->x == y->x && x->y == y->y && x->z == y->z; }
     case AX_QUAT: { AxVec *x = (AxVec *)a.o, *y = (AxVec *)b.o; return x->x == y->x && x->y == y->y && x->z == y->z && x->w == y->w; }
@@ -643,9 +645,10 @@ static void render(AxValue v, char **buf, size_t *len, size_t *cap, int depth) {
       }
       if (hk) ax_release(kind);
       if (hn) ax_release(name);
+      // `try { JSON.stringify(v) } catch { String(v) }`: a dict holding a big shows as an object.
       char *json = NULL;
-      ax_json_write(v, 0, &json);
-      str_append(buf, len, cap, json, strlen(json));
+      if (ax_json_write_checked(v, 0, &json)) str_append(buf, len, cap, json, strlen(json));
+      else str_append(buf, len, cap, "[object Object]", 15);
       free(json);
       return;
     }
@@ -658,14 +661,52 @@ static void render(AxValue v, char **buf, size_t *len, size_t *cap, int depth) {
       return;
     }
     case AX_RANGE: {
+      // As the source that makes it: `0..3`, or `range(0, 10, 2)` with a step.
       AxRange *r = (AxRange *)v.o;
+      bool stepped = r->step != 1;
+      if (stepped) str_append(buf, len, cap, "range(", 6);
       fmt_num(r->lo, tmp, sizeof tmp); str_append(buf, len, cap, tmp, strlen(tmp));
-      str_append(buf, len, cap, "..", 2);
+      str_append(buf, len, cap, stepped ? ", " : "..", 2);
       fmt_num(r->hi, tmp, sizeof tmp); str_append(buf, len, cap, tmp, strlen(tmp));
+      if (stepped) {
+        str_append(buf, len, cap, ", ", 2);
+        fmt_num(r->step, tmp, sizeof tmp); str_append(buf, len, cap, tmp, strlen(tmp));
+        str_append(buf, len, cap, ")", 1);
+      }
+      return;
+    }
+    case AX_BIG: {
+      char *digits = ax_big_to_cstr((AxBig *)v.o);
+      str_append(buf, len, cap, digits, strlen(digits));
+      free(digits);
       return;
     }
     default: ax_render_engine(v, buf, len, cap); return;
   }
+}
+
+// String(v) for an array: elements joined by ",", null as nothing, nested arrays flattened the
+// same way — what parseInt(xs) and `big < xs` see in the reference.
+static void js_join(AxValue v, char **buf, size_t *len, size_t *cap, int depth) {
+  AxArr *a = (AxArr *)v.o;
+  for (uint32_t i = 0; i < a->len; i++) {
+    if (i) str_append(buf, len, cap, ",", 1);
+    AxValue e = a->items[i];
+    if (e.t == AX_NULL) continue;
+    if (e.t == AX_ARR && depth < 32) { js_join(e, buf, len, cap, depth + 1); continue; }
+    render(e, buf, len, cap, 0);
+  }
+}
+
+AxStr *ax_js_string(AxValue v) {
+  if (v.t != AX_ARR) return ax_to_str(v);
+  char *buf = NULL;
+  size_t len = 0, cap = 0;
+  str_append(&buf, &len, &cap, "", 0);
+  js_join(v, &buf, &len, &cap, 0);
+  AxStr *s = ax_str_new(buf, len);
+  free(buf);
+  return s;
 }
 
 AxStr *ax_to_str(AxValue v) {
@@ -690,6 +731,7 @@ const char *ax_type_name(AxValue v) {
     case AX_DICT: return "dict";
     case AX_FN: return "fn";
     case AX_RANGE: return "range";
+    case AX_BIG: return "bigint";
     case AX_VEC2: return "vec2";
     case AX_VEC3: return "vec3";
     case AX_QUAT: return "quat";
@@ -706,6 +748,7 @@ double ax_to_num(AxValue v) {
     case AX_BOOL: return v.b ? 1 : 0;
     case AX_NULL: return 0;
     case AX_TIMER: return ((AxTimer *)v.o)->remaining;   // a timer reads as its remaining time
+    case AX_BIG: return ax_big_to_double((AxBig *)v.o);   // Number(big)
     case AX_STR: {
       AxStr *s = (AxStr *)v.o;
       char *end = NULL;

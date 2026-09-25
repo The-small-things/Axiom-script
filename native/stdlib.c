@@ -31,8 +31,20 @@
 // ---------------------------------------------------------------------------------------------
 
 #define ARG(i) (i < argc ? args[i] : ax_null())
-#define NUM(i) (i < argc ? ax_to_num(args[i]) : 0)
-#define DEF_NUM(i, d) (i < argc && args[i].t != AX_NULL ? ax_to_num(args[i]) : (d))
+// A numeric argument. A big is refused as Math.* refuses one; the library functions that do
+// arithmetic on their arguments instead refuse it as mixing (no_big).
+static const char BIG_CONVERT[] = "Cannot convert a BigInt value to a number";
+static const char BIG_MIX[] = "Cannot mix BigInt and other types, use explicit conversions";
+static double num_arg(AxVM *vm, AxValue v) {
+  if (v.t == AX_BIG) ax_throw(vm, "AX-RUNTIME-000", "%s", BIG_CONVERT);
+  return ax_to_num(v);
+}
+static void no_big(AxVM *vm, AxValue *args, int argc, int used) {   // the first `used` arguments
+  for (int i = 0; i < argc && i < used; i++) if (args[i].t == AX_BIG) ax_throw(vm, "AX-RUNTIME-000", "%s", BIG_MIX);
+}
+#define NUM(i) (i < argc ? num_arg(vm, args[i]) : 0)
+#define DEF_NUM(i, d) (i < argc && args[i].t != AX_NULL ? num_arg(vm, args[i]) : (d))
+#define INT32(i) ax_to_int32(NUM(i))
 
 static AxStr *arg_str(AxValue v) { return ax_to_str(v); }   // +1
 
@@ -99,7 +111,7 @@ static AxArr *sorted_copy(AxVM *vm, AxValue seqv, AxValue sel) {
 // JSON
 // ---------------------------------------------------------------------------------------------
 
-typedef struct { char *buf; size_t len, cap; } SB;
+typedef struct { char *buf; size_t len, cap; bool bigint; } SB;   // bigint: JSON.stringify would throw
 
 static void sb_add(SB *sb, const char *s, size_t n) {
   if (sb->len + n + 1 > sb->cap) {
@@ -143,6 +155,7 @@ static void json_write(SB *sb, AxValue v, int indent, int depth) {
       return;
     }
     case AX_STR: case AX_ATOM: json_quote(sb, (AxStr *)v.o); return;
+    case AX_BIG: sb->bigint = true; return;
     case AX_ARR: {
       AxArr *a = (AxArr *)v.o;
       if (!a->len) { sb_addz(sb, "[]"); return; }
@@ -486,10 +499,12 @@ NATIVE(n_len) {
   }
 }
 
+// The bounds are read as Number(x) reads them (a big included), as the reference's Range does.
+#define RNUM(i) ax_to_num(args[i])
 NATIVE(n_range) {
-  if (argc == 1) return ax_range(0, NUM(0), 1);
-  if (argc >= 3) return ax_range(NUM(0), NUM(1), NUM(2));
-  return ax_range(NUM(0), NUM(1), 1);
+  if (argc == 1) return ax_range(0, RNUM(0), 1);
+  if (argc >= 3) return ax_range(RNUM(0), RNUM(1), RNUM(2));
+  return ax_range(RNUM(0), RNUM(1), 1);
 }
 
 NATIVE(n_str) { AxStr *s = ax_to_str(ARG(0)); return str_take(s); }
@@ -503,30 +518,109 @@ NATIVE(n_type) {
   return ax_str_from(ax_type_name(v));
 }
 NATIVE(n_num) { double d = ax_to_num(ARG(0)); return ax_num(isnan(d) ? 0 : d); }
+
+// JavaScript's Number(v) where it differs from ax_to_num: an array is its one element (or 0
+// when empty), read as text.
+static double js_number(AxValue v) {
+  if (v.t != AX_ARR) return ax_to_num(v);
+  AxArr *a = (AxArr *)v.o;
+  if (a->len == 0) return 0;
+  if (a->len > 1) return NAN;
+  AxValue e = a->items[0];
+  if (e.t == AX_NULL) return 0;
+  if (e.t == AX_NUM || e.t == AX_STR || e.t == AX_ARR) return js_number(e);
+  return NAN;
+}
+
+// big(v): BigInt(v.trim()) for text, BigInt(Math.trunc(Number(v))) otherwise; 0 when that fails.
+NATIVE(n_big) {
+  AxValue v = ARG(0);
+  if (v.t == AX_STR) {
+    AxStr *s = (AxStr *)v.o;
+    AxBig *b = ax_big_parse(s->data, s->len);
+    return ax_bigv(b ? b : ax_big_from_int(0));
+  }
+  double d = argc ? js_number(v) : NAN;
+  return ax_bigv(isfinite(d) ? ax_big_from_double(d) : ax_big_from_int(0));
+}
+NATIVE(n_is_big) { return ax_bool(ARG(0).t == AX_BIG); }
+// parseInt(text, radix): leading white space and a sign, "0x" when the radix is 16 or not
+// given, then the longest run of digits; NaN when there are none. Exactly rounded.
+static double js_parse_int(const char *s, size_t len, int radix) {
+  size_t i = 0, w;
+  while (i < len && (w = ax_js_space(s, i, len))) i += w;
+  bool neg = false;
+  if (i < len && (s[i] == '+' || s[i] == '-')) { neg = s[i] == '-'; i++; }
+  bool strip = true;
+  if (radix != 0) {
+    if (radix < 2 || radix > 36) return NAN;
+    if (radix != 16) strip = false;
+  } else radix = 10;
+  if (strip && i + 1 < len && s[i] == '0' && (s[i + 1] == 'x' || s[i + 1] == 'X')) { i += 2; radix = 16; }
+  size_t start = i;
+  for (; i < len; i++) {
+    char c = s[i];
+    int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'z' ? c - 'a' + 10 : c >= 'A' && c <= 'Z' ? c - 'A' + 10 : 99;
+    if (d >= radix) break;
+  }
+  if (i == start) return NAN;
+  AxBig *b = ax_big_parse_digits(s + start, i - start, (unsigned)radix);
+  double v = ax_big_to_double(b);
+  free(b);
+  return neg ? -v : v;
+}
+
+// parseFloat(text): the longest prefix that is a decimal literal (or Infinity); NaN otherwise.
+static double js_parse_float(const char *s, size_t len) {
+  size_t i = 0, w;
+  while (i < len && (w = ax_js_space(s, i, len))) i += w;
+  size_t start = i;
+  if (i < len && (s[i] == '+' || s[i] == '-')) i++;
+  if (len - i >= 8 && !strncmp(s + i, "Infinity", 8)) return s[start] == '-' ? -INFINITY : INFINITY;
+  size_t digits = 0;
+  while (i < len && s[i] >= '0' && s[i] <= '9') { i++; digits++; }
+  if (i < len && s[i] == '.') {
+    size_t j = i + 1, frac = 0;
+    while (j < len && s[j] >= '0' && s[j] <= '9') { j++; frac++; }
+    if (digits || frac) { i = j; digits += frac; }
+  }
+  if (!digits) return NAN;
+  if (i < len && (s[i] == 'e' || s[i] == 'E')) {
+    size_t j = i + 1;
+    if (j < len && (s[j] == '+' || s[j] == '-')) j++;
+    size_t exp = 0;
+    while (j < len && s[j] >= '0' && s[j] <= '9') { j++; exp++; }
+    if (exp) i = j;
+  }
+  char *text = malloc(i - start + 1);
+  memcpy(text, s + start, i - start);
+  text[i - start] = '\0';
+  double v = strtod(text, NULL);
+  free(text);
+  return v;
+}
+
+// int(s) is parseInt(s, 10) and float(s) parseFloat(s): NaN when there is no number.
 NATIVE(n_int) {
-  AxStr *s = arg_str(ARG(0));
-  char *end = NULL;
-  long v = strtol(s->data, &end, 10);
-  bool ok = end != s->data;
+  AxStr *s = ax_js_string(ARG(0));
+  double v = js_parse_int(s->data, s->len, 10);
   ax_release(ax_strv(s));
-  return num_or_null((double)v, ok);
+  return ax_num(v);
 }
 NATIVE(n_float) {
-  AxStr *s = arg_str(ARG(0));
-  char *end = NULL;
-  double v = strtod(s->data, &end);
-  bool ok = end != s->data;
+  AxStr *s = ax_js_string(ARG(0));
+  double v = js_parse_float(s->data, s->len);
   ax_release(ax_strv(s));
-  return num_or_null(v, ok);
+  return ax_num(v);
 }
+// parse_int(s, radix): parseInt(String(s).trim(), radix || 10), null for NaN.
 NATIVE(n_parse_int) {
-  AxStr *s = arg_str(ARG(0));
-  int base = argc > 1 ? (int)NUM(1) : 10;
-  char *end = NULL;
-  long v = strtol(s->data, &end, base);
-  bool ok = end != s->data;
+  AxStr *s = ax_js_string(ARG(0));
+  double r = argc > 1 ? NUM(1) : 0;
+  int radix = (r == 0 || isnan(r)) ? 10 : ax_to_int32(r);
+  double v = js_parse_int(s->data, s->len, radix);
   ax_release(ax_strv(s));
-  return num_or_null((double)v, ok);
+  return num_or_null(v, !isnan(v));
 }
 
 NATIVE(n_is_null) { return ax_bool(ARG(0).t == AX_NULL); }
@@ -536,9 +630,10 @@ NATIVE(n_is_array) { return ax_bool(ARG(0).t == AX_ARR); }
 NATIVE(n_is_dict) { return ax_bool(ARG(0).t == AX_DICT); }
 NATIVE(n_is_bool) { return ax_bool(ARG(0).t == AX_BOOL); }
 NATIVE(n_is_fn) { return ax_bool(ARG(0).t == AX_FN); }
-NATIVE(n_is_int) { double d = NUM(0); return ax_bool(ARG(0).t == AX_NUM && d == floor(d) && isfinite(d)); }
-NATIVE(n_is_nan) { return ax_bool(isnan(NUM(0))); }
-NATIVE(n_is_finite) { return ax_bool(isfinite(NUM(0))); }
+// Number.isInteger / isNaN / isFinite: true only of numbers.
+NATIVE(n_is_int) { AxValue v = ARG(0); return ax_bool(v.t == AX_NUM && v.num == floor(v.num) && isfinite(v.num)); }
+NATIVE(n_is_nan) { AxValue v = ARG(0); return ax_bool(v.t == AX_NUM && isnan(v.num)); }
+NATIVE(n_is_finite) { AxValue v = ARG(0); return ax_bool(v.t == AX_NUM && isfinite(v.num)); }
 NATIVE(n_is_empty) {
   AxValue v = ARG(0);
   switch (v.t) {
@@ -575,8 +670,8 @@ MATH1(n_trunc, trunc(x))
 MATH1(n_sign, (x > 0) - (x < 0))
 MATH1(n_fract, x - floor(x))
 MATH1(n_clamp01, x < 0 ? 0 : (x > 1 ? 1 : x))
-MATH1(n_deg2rad, x * M_PI / 180.0)
-MATH1(n_rad2deg, x * 180.0 / M_PI)
+NATIVE(n_deg2rad) { no_big(vm, args, argc, 1); return ax_num(NUM(0) * M_PI / 180.0); }
+NATIVE(n_rad2deg) { no_big(vm, args, argc, 1); return ax_num(NUM(0) * 180.0 / M_PI); }
 MATH1(n_isqrt, floor(sqrt(x < 0 ? 0 : x)))
 
 NATIVE(n_round) {
@@ -598,24 +693,26 @@ NATIVE(n_min) {
   if (argc == 1 && args[0].t == AX_ARR) {
     AxArr *a = (AxArr *)args[0].o;
     if (!a->len) return ax_null();
+    for (uint32_t i = 0; i < a->len; i++) num_arg(vm, a->items[i]);   // Math.min(...xs)
     double best = ax_to_num(a->items[0]);
     for (uint32_t i = 1; i < a->len; i++) { double d = ax_to_num(a->items[i]); if (d < best) best = d; }
     return ax_num(best);
   }
   double best = INFINITY;
-  for (int i = 0; i < argc; i++) { double d = ax_to_num(args[i]); if (d < best) best = d; }
+  for (int i = 0; i < argc; i++) { double d = num_arg(vm, args[i]); if (d < best) best = d; }
   return ax_num(best);
 }
 NATIVE(n_max) {
   if (argc == 1 && args[0].t == AX_ARR) {
     AxArr *a = (AxArr *)args[0].o;
     if (!a->len) return ax_null();
+    for (uint32_t i = 0; i < a->len; i++) num_arg(vm, a->items[i]);
     double best = ax_to_num(a->items[0]);
     for (uint32_t i = 1; i < a->len; i++) { double d = ax_to_num(a->items[i]); if (d > best) best = d; }
     return ax_num(best);
   }
   double best = -INFINITY;
-  for (int i = 0; i < argc; i++) { double d = ax_to_num(args[i]); if (d > best) best = d; }
+  for (int i = 0; i < argc; i++) { double d = num_arg(vm, args[i]); if (d > best) best = d; }
   return ax_num(best);
 }
 NATIVE(n_clamp) { double x = NUM(0), lo = NUM(1), hi = NUM(2); return ax_num(x < lo ? lo : (x > hi ? hi : x)); }
@@ -640,8 +737,9 @@ NATIVE(n_wrap) {
   double r = hi - lo;
   return ax_num(lo + fmod(fmod(x - lo, r) + r, r));
 }
-NATIVE(n_mod) { double a = NUM(0), b = NUM(1); if (b == 0) return ax_num(0); return ax_num(fmod(fmod(a, b) + b, b)); }
+NATIVE(n_mod) { no_big(vm, args, argc, 2); double a = NUM(0), b = NUM(1); if (b == 0) return ax_num(0); return ax_num(fmod(fmod(a, b) + b, b)); }
 NATIVE(n_divmod) {
+  no_big(vm, args, argc, 2);
   double a = NUM(0), b = NUM(1);
   AxArr *out = ax_arr_new(2);
   if (b == 0) { ax_arr_push(out, ax_num(0)); ax_arr_push(out, ax_num(0)); return ax_arrv(out); }
@@ -650,11 +748,14 @@ NATIVE(n_divmod) {
   return ax_arrv(out);
 }
 NATIVE(n_gcd) {
-  long a = (long)fabs(NUM(0)), b = (long)fabs(NUM(1));
-  while (b) { long t = b; b = a % b; a = t; }
+  // Math.abs(a | 0): 32-bit, as in the reference.
+  no_big(vm, args, argc, 2);
+  int64_t a = llabs((int64_t)INT32(0)), b = llabs((int64_t)INT32(1));
+  while (b) { int64_t t = b; b = a % b; a = t; }
   return ax_num((double)a);
 }
 NATIVE(n_lcm) {
+  no_big(vm, args, argc, 2);
   long a = (long)fabs(NUM(0)), b = (long)fabs(NUM(1));
   if (!a || !b) return ax_num(0);
   long x = a, y = b;
@@ -704,20 +805,26 @@ NATIVE(n_primes) {
   return ax_arrv(out);
 }
 NATIVE(n_round_to) {
+  no_big(vm, args, argc, 2);
   double x = NUM(0), step = NUM(1);
   if (step == 0) return ax_num(x);
   return ax_num(floor(x / step + 0.5) * step);
 }
+// Number(x).toFixed(d): ties round up in magnitude, on the exact value, and 1e21 or more is
+// written as String(x) — the f-string `{x:.Nf}` code does exactly this.
 NATIVE(n_to_fixed) {
-  double x = NUM(0);
-  int digits = argc > 1 ? (int)NUM(1) : 2;
-  char buf[64];
-  snprintf(buf, sizeof buf, "%.*f", digits, x);
-  return ax_str_from(buf);
+  double x = ax_to_num(ARG(0));
+  double d = argc > 1 && args[1].t != AX_NULL ? NUM(1) : 2;
+  d = isnan(d) ? 0 : trunc(d);
+  if (d < 0 || d > 100) ax_throw(vm, "AX-RUNTIME-000", "toFixed() digits argument must be between 0 and 100");
+  char spec[16];
+  snprintf(spec, sizeof spec, ".%df", (int)d);
+  return ax_strv(ax_format_spec(ax_num(x), spec));
 }
-NATIVE(n_to_hex) { char b[32]; snprintf(b, sizeof b, "0x%x", (unsigned)(long)NUM(0)); return ax_str_from(b); }
+NATIVE(n_to_hex) { no_big(vm, args, argc, 1); char b[32]; snprintf(b, sizeof b, "0x%x", (unsigned)(uint32_t)INT32(0)); return ax_str_from(b); }
 NATIVE(n_to_bin) {
-  unsigned v = (unsigned)(long)NUM(0);
+  no_big(vm, args, argc, 1);
+  unsigned v = (unsigned)(uint32_t)INT32(0);   // n >>> 0
   char b[40];
   int j = 0;
   b[j++] = '0'; b[j++] = 'b';
@@ -727,6 +834,7 @@ NATIVE(n_to_bin) {
   return ax_str_from(b);
 }
 NATIVE(n_to_base) {
+  if (argc > 1 && args[1].t == AX_BIG) ax_throw(vm, "AX-RUNTIME-000", "%s", BIG_MIX);   // base | 0
   long v = (long)trunc(NUM(0));
   int base = (int)NUM(1);
   if (base < 2) base = 2;
@@ -742,12 +850,13 @@ NATIVE(n_to_base) {
   for (int i = 0, k = j - 1; i < k; i++, k--) { char t = b[i]; b[i] = b[k]; b[k] = t; }
   return ax_str_from(b);
 }
-NATIVE(n_band) { return ax_num((double)(((long)NUM(0)) & ((long)NUM(1)))); }
-NATIVE(n_bor) { return ax_num((double)(((long)NUM(0)) | ((long)NUM(1)))); }
-NATIVE(n_bxor) { return ax_num((double)(((long)NUM(0)) ^ ((long)NUM(1)))); }
-NATIVE(n_bnot) { return ax_num((double)(~(long)NUM(0))); }
-NATIVE(n_shl) { return ax_num((double)(((long)NUM(0)) << ((long)NUM(1)))); }
-NATIVE(n_shr) { return ax_num((double)(((long)NUM(0)) >> ((long)NUM(1)))); }
+// JavaScript's 32-bit operators: operands through ToInt32, shift counts taken mod 32.
+NATIVE(n_band) { no_big(vm, args, argc, 2); return ax_num((double)(INT32(0) & INT32(1))); }
+NATIVE(n_bor) { no_big(vm, args, argc, 2); return ax_num((double)(INT32(0) | INT32(1))); }
+NATIVE(n_bxor) { no_big(vm, args, argc, 2); return ax_num((double)(INT32(0) ^ INT32(1))); }
+NATIVE(n_bnot) { no_big(vm, args, argc, 1); return ax_num((double)(~INT32(0))); }
+NATIVE(n_shl) { no_big(vm, args, argc, 2); return ax_num((double)(int32_t)((uint32_t)INT32(0) << ((uint32_t)INT32(1) & 31))); }
+NATIVE(n_shr) { no_big(vm, args, argc, 2); return ax_num((double)(INT32(0) >> ((uint32_t)INT32(1) & 31))); }
 
 // --- statistics -------------------------------------------------------------------------------
 
@@ -981,18 +1090,32 @@ NATIVE(n_count) {
   ax_release(ax_arrv(a));
   return ax_num(n);
 }
+// uniq, union, intersect and difference tell values apart by how they display, as the
+// reference does (its sets are keyed by that text): 1 and "1" are the same element.
+static bool text_set_add(AxDict *set, AxValue v) {   // false when already present
+  AxStr *k = ax_to_str(v);
+  bool fresh = !ax_dict_has(set, k);
+  if (fresh) ax_dict_set(set, k, ax_null());
+  ax_release(ax_strv(k));
+  return fresh;
+}
+static bool text_set_has(AxDict *set, AxValue v) {
+  AxStr *k = ax_to_str(v);
+  bool has = ax_dict_has(set, k);
+  ax_release(ax_strv(k));
+  return has;
+}
+
 NATIVE(n_uniq) {
   AxArr *a = ax_to_seq(vm, ARG(0));
   AxArr *out = ax_arr_new(a->len);
-  AxArr *keys = ax_arr_new(a->len);
+  AxDict *seen = ax_dict_new();
   for (uint32_t i = 0; i < a->len; i++) {
     AxValue k = ax_key_apply(vm, ARG(1), a->items[i], i);
-    bool seen = false;
-    for (uint32_t j = 0; j < keys->len && !seen; j++) seen = ax_equals(keys->items[j], k);
-    if (!seen) { ax_arr_push(keys, ax_copy(k)); ax_arr_push(out, ax_copy(a->items[i])); }
+    if (text_set_add(seen, k)) ax_arr_push(out, ax_copy(a->items[i]));
     ax_release(k);
   }
-  ax_release(ax_arrv(keys));
+  ax_release(ax_dictv(seen));
   ax_release(ax_arrv(a));
   return ax_arrv(out);
 }
@@ -1162,18 +1285,13 @@ NATIVE(n_max_by) {
   return best;
 }
 NATIVE(n_union) {
+  // Every element of a (duplicates kept, as the reference copies it), then what b adds.
   AxArr *a = ax_to_seq(vm, ARG(0)), *b = ax_to_seq(vm, ARG(1));
   AxArr *out = ax_arr_new(a->len + b->len);
-  for (uint32_t i = 0; i < a->len; i++) {
-    bool seen = false;
-    for (uint32_t j = 0; j < out->len && !seen; j++) seen = ax_equals(out->items[j], a->items[i]);
-    if (!seen) ax_arr_push(out, ax_copy(a->items[i]));
-  }
-  for (uint32_t i = 0; i < b->len; i++) {
-    bool seen = false;
-    for (uint32_t j = 0; j < out->len && !seen; j++) seen = ax_equals(out->items[j], b->items[i]);
-    if (!seen) ax_arr_push(out, ax_copy(b->items[i]));
-  }
+  AxDict *seen = ax_dict_new();
+  for (uint32_t i = 0; i < a->len; i++) { text_set_add(seen, a->items[i]); ax_arr_push(out, ax_copy(a->items[i])); }
+  for (uint32_t i = 0; i < b->len; i++) if (text_set_add(seen, b->items[i])) ax_arr_push(out, ax_copy(b->items[i]));
+  ax_release(ax_dictv(seen));
   ax_release(ax_arrv(a));
   ax_release(ax_arrv(b));
   return ax_arrv(out);
@@ -1181,13 +1299,12 @@ NATIVE(n_union) {
 NATIVE(n_intersect) {
   AxArr *a = ax_to_seq(vm, ARG(0)), *b = ax_to_seq(vm, ARG(1));
   AxArr *out = ax_arr_new(4);
-  for (uint32_t i = 0; i < a->len; i++) {
-    bool inb = false;
-    for (uint32_t j = 0; j < b->len && !inb; j++) inb = ax_equals(a->items[i], b->items[j]);
-    bool dup = false;
-    for (uint32_t j = 0; j < out->len && !dup; j++) dup = ax_equals(out->items[j], a->items[i]);
-    if (inb && !dup) ax_arr_push(out, ax_copy(a->items[i]));
-  }
+  AxDict *inb = ax_dict_new(), *added = ax_dict_new();
+  for (uint32_t j = 0; j < b->len; j++) text_set_add(inb, b->items[j]);
+  for (uint32_t i = 0; i < a->len; i++)
+    if (text_set_has(inb, a->items[i]) && text_set_add(added, a->items[i])) ax_arr_push(out, ax_copy(a->items[i]));
+  ax_release(ax_dictv(inb));
+  ax_release(ax_dictv(added));
   ax_release(ax_arrv(a));
   ax_release(ax_arrv(b));
   return ax_arrv(out);
@@ -1195,17 +1312,16 @@ NATIVE(n_intersect) {
 NATIVE(n_difference) {
   AxArr *a = ax_to_seq(vm, ARG(0)), *b = ax_to_seq(vm, ARG(1));
   AxArr *out = ax_arr_new(4);
-  for (uint32_t i = 0; i < a->len; i++) {
-    bool inb = false;
-    for (uint32_t j = 0; j < b->len && !inb; j++) inb = ax_equals(a->items[i], b->items[j]);
-    if (!inb) ax_arr_push(out, ax_copy(a->items[i]));
-  }
+  AxDict *inb = ax_dict_new();
+  for (uint32_t j = 0; j < b->len; j++) text_set_add(inb, b->items[j]);
+  for (uint32_t i = 0; i < a->len; i++) if (!text_set_has(inb, a->items[i])) ax_arr_push(out, ax_copy(a->items[i]));
+  ax_release(ax_dictv(inb));
   ax_release(ax_arrv(a));
   ax_release(ax_arrv(b));
   return ax_arrv(out);
 }
 NATIVE(n_grid) {
-  int64_t rows = (int64_t)NUM(0), cols = (int64_t)NUM(1);
+  int64_t rows = (int64_t)ax_to_num(ARG(0)), cols = (int64_t)ax_to_num(ARG(1));   // Array.from({length})
   AxValue fill = ARG(2);
   AxArr *out = ax_arr_new(rows > 0 ? rows : 0);
   for (int64_t r = 0; r < rows; r++) {
@@ -1392,19 +1508,54 @@ static AxValue deep_clone(AxValue v) {
   }
 }
 NATIVE(n_clone) { return deep_clone(ARG(0)); }
-NATIVE(n_deep_eq) { return ax_bool(ax_equals(ARG(0), ARG(1))); }
+// JSON.stringify(a) === JSON.stringify(b); where that throws (a big inside), a === b.
+NATIVE(n_deep_eq) {
+  AxValue a = ARG(0), b = ARG(1);
+  char *ja = NULL, *jb = NULL;
+  bool oka = ax_json_write_checked(a, 0, &ja), okb = ax_json_write_checked(b, 0, &jb);
+  bool eq;
+  if (oka && okb) eq = strcmp(ja, jb) == 0;
+  else if (a.t != b.t) eq = false;
+  else if (a.t == AX_BIG) eq = ax_big_cmp((AxBig *)a.o, (AxBig *)b.o) == 0;
+  else if (a.t == AX_NUM) eq = a.num == b.num;
+  else if (a.t == AX_BOOL) eq = a.b == b.b;
+  else if (a.t == AX_STR) eq = ax_str_eq((AxStr *)a.o, (AxStr *)b.o);
+  else eq = a.o == b.o;
+  free(ja);
+  free(jb);
+  return ax_bool(eq);
+}
 
 // --- strings ----------------------------------------------------------------------------------
 
+// String(c).charCodeAt(0): the first UTF-16 code unit (NaN for ""), from UTF-8 text.
 NATIVE(n_ord) {
   AxStr *s = arg_str(ARG(0));
-  double v = s->len ? (unsigned char)s->data[0] : 0;
+  const unsigned char *p = (const unsigned char *)s->data;
+  double v = NAN;
+  if (s->len) {
+    uint32_t cp = p[0];
+    int extra = cp >= 0xF0 ? 3 : cp >= 0xE0 ? 2 : cp >= 0xC0 ? 1 : 0;
+    if (extra && (uint32_t)extra < s->len) {
+      cp &= 0x3F >> extra;
+      for (int i = 1; i <= extra; i++) cp = (cp << 6) | (p[i] & 0x3F);
+    }
+    v = cp > 0xFFFF ? 0xD800 + ((cp - 0x10000) >> 10) : cp;
+  }
   ax_release(ax_strv(s));
   return ax_num(v);
 }
+// String.fromCharCode(n): one UTF-16 code unit (ToUint16), written as UTF-8; a lone surrogate
+// comes out as U+FFFD, which is what printing it shows.
 NATIVE(n_chr) {
-  char c = (char)(int)NUM(0);
-  return ax_strv(ax_str_new(&c, 1));
+  uint32_t u = (uint32_t)ax_to_int32(NUM(0)) & 0xFFFF;
+  if (u >= 0xD800 && u <= 0xDFFF) u = 0xFFFD;
+  char b[4];
+  size_t n;
+  if (u < 0x80) { b[0] = (char)u; n = 1; }
+  else if (u < 0x800) { b[0] = (char)(0xC0 | (u >> 6)); b[1] = (char)(0x80 | (u & 0x3F)); n = 2; }
+  else { b[0] = (char)(0xE0 | (u >> 12)); b[1] = (char)(0x80 | ((u >> 6) & 0x3F)); b[2] = (char)(0x80 | (u & 0x3F)); n = 3; }
+  return ax_strv(ax_str_new(b, n));
 }
 NATIVE(n_lines) {
   AxStr *s = arg_str(ARG(0));
@@ -1520,7 +1671,8 @@ NATIVE(n_to_json) {
   SB sb = {0};
   sb_add(&sb, "", 0);
   json_write(&sb, ARG(0), (argc > 1 && ax_truthy(args[1])) ? 2 : 0, 0);
-  AxValue r = ax_strv(ax_str_new(sb.buf, sb.len));
+  // JSON.stringify throws on a big, and the reference returns this marker for any failure.
+  AxValue r = sb.bigint ? ax_str_from("<circular>") : ax_strv(ax_str_new(sb.buf, sb.len));
   free(sb.buf);
   return r;
 }
@@ -2558,6 +2710,7 @@ void ax_stdlib_install(AxVM *vm) {
   def(vm, "hash", n_hash, 1, 1);
   def(vm, "b64_encode", n_b64_encode, 1, 1);
   def(vm, "b64_decode", n_b64_decode, 1, 1);
+  def(vm, "big", n_big, 0, 1);            def(vm, "is_big", n_is_big, 1, 1);
   def(vm, "to_json", n_to_json, 1, 2);    def(vm, "from_json", n_from_json, 1, 1);
   def(vm, "json_stringify", n_to_json, 1, 2);
   def(vm, "json_parse", n_from_json, 1, 1);

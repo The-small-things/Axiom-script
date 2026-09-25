@@ -549,7 +549,7 @@ void ax_render_engine(AxValue v, char **buf, size_t *len, size_t *cap) {
 //   * the `--sim --json` state dump (main.js serializeForJson), where vectors become arrays.
 // ---------------------------------------------------------------------------------------------
 
-typedef struct { char *buf; size_t len, cap; } JB;
+typedef struct { char *buf; size_t len, cap; bool bigint; } JB;   // bigint: JSON.stringify would throw
 static void jb(JB *b, const char *s) { ax_str_append(&b->buf, &b->len, &b->cap, s, strlen(s)); }
 static void jbn(JB *b, const char *s, size_t n) { ax_str_append(&b->buf, &b->len, &b->cap, s, n); }
 static void jnum(JB *b, double d) {
@@ -772,6 +772,15 @@ static void json_value(JB *b, AxValue v, int indent, int depth, bool sim) {
       return;
     }
     case AX_FN: jb(b, sim ? "\"<fn>\"" : "null"); return;
+    case AX_BIG: {
+      // The state dump writes a big as its digits; JSON.stringify cannot write one at all,
+      // which the caller learns from the flag.
+      b->bigint = true;
+      char *digits = ax_big_to_cstr((AxBig *)v.o);
+      jstr(b, digits, strlen(digits));
+      free(digits);
+      return;
+    }
     case AX_HOST: {
       extern void ax_host_json(AxHost *h, void *jbp, int indent, int depth, bool sim);
       ax_host_json((AxHost *)v.o, b, indent, depth, sim);
@@ -781,13 +790,16 @@ static void json_value(JB *b, AxValue v, int indent, int depth, bool sim) {
   }
 }
 
-void ax_json_write(AxValue v, int indent, char **out) {
+bool ax_json_write_checked(AxValue v, int indent, char **out) {
   init_keys();
   JB b = { 0 };
   jb(&b, "");
   json_value(&b, v, indent, 0, false);
   *out = b.buf;
+  return !b.bigint;
 }
+
+void ax_json_write(AxValue v, int indent, char **out) { ax_json_write_checked(v, indent, out); }
 
 // ---------------------------------------------------------------------------------------------
 // Operators on engine values (interpreter.js binaryOp, first four blocks)
@@ -1183,11 +1195,19 @@ NATIVE(e_v3x) { return ax_vec3(N(0), 0, 0); }
 NATIVE(e_v3y) { return ax_vec3(0, N(0), 0); }
 NATIVE(e_v3z) { return ax_vec3(0, 0, N(0)); }
 NATIVE(e_v3xz) { return ax_vec3(N(0), 0, N(1)); }
-NATIVE(e_v2dir) { return ax_vec2(cos(N(0)), sin(N(0))); }
+// A big where the reference does arithmetic on the argument, or hands it to Math.*.
+static void big_arg(AxVM *vm, AxValue *args, int argc, bool mix) {
+  for (int i = 0; i < argc; i++)
+    if (args[i].t == AX_BIG)
+      ax_throw(vm, "AX-RUNTIME-000", mix ? "Cannot mix BigInt and other types, use explicit conversions" : "Cannot convert a BigInt value to a number");
+}
+
+NATIVE(e_v2dir) { big_arg(vm, args, argc < 1 ? argc : 1, false); return ax_vec2(cos(N(0)), sin(N(0))); }
 NATIVE(e_q) { return mkq(q_axis_angle(v3of(A(0)), N(1))); }
-NATIVE(e_euler) { return mkq(q_euler(N(0), N(1), N(2))); }
+NATIVE(e_euler) { big_arg(vm, args, argc, true); return mkq(q_euler(N(0), N(1), N(2))); }
 NATIVE(e_m4) { AxValue m = ax_mat4_new(NULL); m4_identity(((AxMat4 *)m.o)->d); return m; }
 NATIVE(e_persp) {
+  big_arg(vm, args, argc, true);
   AxValue m = ax_mat4_new(NULL);
   double *d = ((AxMat4 *)m.o)->d;
   double f = 1 / tan(N(0) * M_PI / 360), nf = 1 / (N(2) - N(3));
@@ -1195,6 +1215,7 @@ NATIVE(e_persp) {
   return m;
 }
 NATIVE(e_ortho) {
+  big_arg(vm, args, argc, true);
   AxValue m = ax_mat4_new(NULL);
   double *d = ((AxMat4 *)m.o)->d;
   double l = N(0), r = N(1), b = N(2), t = N(3), n = N(4), f = N(5);
@@ -1218,6 +1239,7 @@ NATIVE(e_aabb) {
 NATIVE(e_dist) {
   AxValue a = A(0), b = A(1);
   if (a.t == AX_NUM && b.t == AX_NUM) return ax_num(fabs(a.num - b.num));
+  if (a.t == AX_BIG || (a.t == AX_NUM && b.t == AX_BIG)) ax_throw(vm, "AX-RUNTIME-000", "a.sub is not a function");
   AxValue diff = ax_binary_op(vm, OP_SUB, a, b);
   AxValue m;
   if (!ax_engine_member(vm, diff, K_mag, &m)) m = ax_num(NAN);
@@ -1255,7 +1277,7 @@ NATIVE(e_bar) {
   }
   return ax_dictv(d);
 }
-NATIVE(e_hypot) { double v[2] = { N(0), N(1) }; return ax_num(js_hypot(2, v)); }
+NATIVE(e_hypot) { big_arg(vm, args, argc, false); double v[2] = { N(0), N(1) }; return ax_num(js_hypot(2, v)); }
 
 static void def(AxVM *vm, const char *name, AxNativeFn fn, int min_args, int max_args) {
   AxStr *key = ax_internz(name);

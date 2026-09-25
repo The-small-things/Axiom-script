@@ -1,0 +1,7 @@
+// A big result is written as its digits (a string); print sees the number.
+^main:
+  f = big(1)
+  *i in range(1, 30):
+    f = f * big(i)
+  print(f)
+  ^return f

@@ -944,7 +944,7 @@ static AxValue snapshot(AxVM *vm) {
 
 static bool contains_entity(AxValue v, int depth) {
   if (depth > 32) return false;
-  if (v.t == AX_ENTITY || v.t == AX_FN) return true;   // JSON.stringify would throw (circular) — skip the file
+  if (v.t == AX_ENTITY || v.t == AX_FN || v.t == AX_BIG) return true;   // JSON.stringify would throw — skip the file
   if (v.t == AX_ARR) { AxArr *a = (AxArr *)v.o; for (uint32_t i = 0; i < a->len; i++) if (contains_entity(a->items[i], depth + 1)) return true; }
   if (v.t == AX_DICT) { AxDict *d = (AxDict *)v.o; for (uint32_t i = 0; i < d->len; i++) if (!d->entries[i].dead && contains_entity(d->entries[i].val, depth + 1)) return true; }
   return false;
@@ -1035,14 +1035,17 @@ void ax_save_action(AxVM *vm, AxNode *n, AxScope *scope, bool load) {
   if (!load) {
     AxValue wrapped = snapshot(vm);
     ax_dict_set(slots, key, ax_copy(wrapped));
-    if (!vm->sandbox && !contains_entity(wrapped, 0)) {
-      // Best effort, like the reference: saves/<slot>.json, pretty-printed.
-      char *json = NULL;
-      ax_json_write(wrapped, 2, &json);
+    if (!vm->sandbox) {
+      // Best effort, like the reference: saves/<slot>.json, pretty-printed. The directory is
+      // made first, so it exists even when the state cannot be written as JSON.
       mkdir("saves", 0777);
-      FILE *f = fopen(path, "wb");
-      if (f) { fputs(json, f); fclose(f); }
-      free(json);
+      if (!contains_entity(wrapped, 0)) {
+        char *json = NULL;
+        ax_json_write(wrapped, 2, &json);
+        FILE *f = fopen(path, "wb");
+        if (f) { fputs(json, f); fclose(f); }
+        free(json);
+      }
     }
     ax_release(wrapped);
   } else {

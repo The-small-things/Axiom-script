@@ -835,5 +835,20 @@ section('21. --json for scripts, exit(), and the REPL (v0.9.3)');
   eq('21.10 --check --json prints {ok, diagnostics}', [chk.status, chkOut.ok, chkOut.diagnostics.map(d => d.error_code)], [0, true, ['AX-UNDEF-VAR-001']]);
 }
 
+// =========================================================================================
+section('22. Big integers and conversions (v0.9.3)');
+// =========================================================================================
+{
+  const err = (expr) => val(`t()`, `^fn t():\n  ^try:\n    ^return ${expr}\n  ^catch e:\n    ^return e.msg\n`);
+  eq('22.1 big ** big is exact', String(val('big(2) ** big(100)')), '1267650600228229401496703205376');
+  eq('22.2 a negative big exponent is an error', err('big(2) ** big(-1)'), 'Exponent must be non-negative');
+  eq('22.3 big ** number is the mixing error', err('big(2) ** 3'), 'Cannot mix BigInt and other types, use explicit conversions');
+  eq('22.4 number ** number is unchanged', val('2 ** 10'), 1024);
+  eq('22.5 a range shows as the source that makes it', val('[str(range(3)), str(range(1, 10, 2)), f"{0..4}"]'), ['0..3', 'range(1, 10, 2)', '0..4']);
+  eq('22.6 type() names a range', val('type(range(2))'), 'range');
+  eq('22.7 big division truncates, remainder takes the sign', val('[str(big(-7) / big(2)), str(big(-7) % big(2))]'), ['-3', '-1']);
+  eq('22.8 int() and float() are parseInt and parseFloat', val('[int("  -7abc"), float("3.5kg"), is_nan(int("x"))]'), [-7, 3.5, true]);
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed === 0 ? 0 : 1);
