@@ -600,6 +600,8 @@ double js_exp(double x) {
   }
   if (hx > 0x3fd62e42) {
     if (hx < 0x3FF0A2B2) {
+      // V8 returns E for exp(1): the reduction below gets its last bit wrong (ieee754.cc).
+      if (x == 1.0) return 2.718281828459045;
       hi = x - ln2HI[xsb];
       lo = ln2LO[xsb];
       k = 1 - xsb - xsb;

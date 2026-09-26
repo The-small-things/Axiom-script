@@ -977,6 +977,14 @@ bool ax_engine_binary(AxVM *vm, int op, AxValue l, AxValue r, AxValue *out) {
 bool ax_engine_member(AxVM *vm, AxValue obj, AxStr *prop, AxValue *out) {
   init_keys();
   *out = ax_null();
+  if (!prop->interned) {
+    // Property keys compare by pointer; a name built at run time (a field-name selector,
+    // `v[name]`) is interned first so it finds the same members as `v.name`.
+    AxStr *k = ax_intern(prop->data, prop->len);
+    bool r = ax_engine_member(vm, obj, k, out);
+    ax_release(ax_strv(k));
+    return r;
+  }
   switch (obj.t) {
     case AX_VEC2: {
       AxVec *p = ax_vecp(obj);
@@ -1203,7 +1211,12 @@ static void big_arg(AxVM *vm, AxValue *args, int argc, bool mix) {
 }
 
 NATIVE(e_v2dir) { big_arg(vm, args, argc < 1 ? argc : 1, false); return ax_vec2(cos(N(0)), sin(N(0))); }
-NATIVE(e_q) { return mkq(q_axis_angle(v3of(A(0)), N(1))); }
+// An argument that must be a vector: the same error the reference raises.
+static void need_vec3(AxVM *vm, const char *fn, const char *what, AxValue v) {
+  if (v.t != AX_VEC3) ax_throw(vm, "AX-RUNTIME-000", "%s() needs %s, got %s", fn, what, ax_type_name(v));
+}
+
+NATIVE(e_q) { need_vec3(vm, "q", "a vec3 axis", A(0)); return mkq(q_axis_angle(v3of(A(0)), N(1))); }
 NATIVE(e_euler) { big_arg(vm, args, argc, true); return mkq(q_euler(N(0), N(1), N(2))); }
 NATIVE(e_m4) { AxValue m = ax_mat4_new(NULL); m4_identity(((AxMat4 *)m.o)->d); return m; }
 NATIVE(e_persp) {
@@ -1224,6 +1237,9 @@ NATIVE(e_ortho) {
   return m;
 }
 NATIVE(e_lookat) {
+  need_vec3(vm, "lookat", "vec3 points", A(0));
+  need_vec3(vm, "lookat", "vec3 points", A(1));
+  if (argc > 2 && args[2].t != AX_NULL) need_vec3(vm, "lookat", "vec3 points", args[2]);
   AxValue m = ax_mat4_new(NULL);
   V3 up = (argc > 2 && ax_truthy(args[2])) ? v3of(args[2]) : v3(0, 1, 0);
   m4_look_at(v3of(A(0)), v3of(A(1)), up, ((AxMat4 *)m.o)->d);
@@ -1239,7 +1255,8 @@ NATIVE(e_aabb) {
 NATIVE(e_dist) {
   AxValue a = A(0), b = A(1);
   if (a.t == AX_NUM && b.t == AX_NUM) return ax_num(fabs(a.num - b.num));
-  if (a.t == AX_BIG || (a.t == AX_NUM && b.t == AX_BIG)) ax_throw(vm, "AX-RUNTIME-000", "a.sub is not a function");
+  bool av = a.t == AX_VEC2 || a.t == AX_VEC3, bv = b.t == AX_VEC2 || b.t == AX_VEC3;
+  if (!av || !bv) ax_throw(vm, "AX-RUNTIME-000", "dist() needs two numbers or two vectors, got %s and %s", ax_type_name(a), ax_type_name(b));
   AxValue diff = ax_binary_op(vm, OP_SUB, a, b);
   AxValue m;
   if (!ax_engine_member(vm, diff, K_mag, &m)) m = ax_num(NAN);
@@ -1260,17 +1277,22 @@ NATIVE(e_sphere) { return shape("sphere", args, argc, 1); }
 NATIVE(e_box) { return shape("box", args, argc, 1); }
 NATIVE(e_capsule) { return shape("capsule", args, argc, 2); }
 NATIVE(e_cell_to_world) {
-  AxValue cx = ax_null(), cy = ax_null();
-  if (A(0).t == AX_DICT) { ax_dict_get((AxDict *)A(0).o, K_x, &cx); ax_dict_get((AxDict *)A(0).o, K_y, &cy); }
-  AxValue r = ax_vec3(ax_to_num(cx) + 0.5, 0, ax_to_num(cy) + 0.5);
-  ax_release(cx); ax_release(cy);
-  return r;
+  // cell.x and cell.y of a dict or vector; a missing one is NaN (undefined), not 0.
+  double xy[2] = { NAN, NAN };
+  AxStr *keys[2] = { K_x, K_y };
+  for (int i = 0; i < 2; i++) {
+    AxValue v;
+    bool have = A(0).t == AX_DICT ? ax_dict_get((AxDict *)A(0).o, keys[i], &v) : (A(0).t >= AX_VEC2 && ax_engine_member(vm, A(0), keys[i], &v));
+    if (have) { xy[i] = ax_to_num(v); ax_release(v); }
+  }
+  return ax_vec3(xy[0] + 0.5, 0, xy[1] + 0.5);
 }
 NATIVE(e_bar) {
   AxDict *d = ax_dict_new();
   const char *keys[] = { "__hud", "kind", "pos", "w", "h", "fg" };
   for (int i = 0; i < 6; i++) {
     AxStr *k = ax_internz(keys[i]);
+    if (i >= 2 && i - 2 >= argc) { ax_release(ax_strv(k)); continue; }   // an absent part is left out
     AxValue v = i == 0 ? ax_bool(true) : i == 1 ? ax_str_from("bar") : ax_copy(A(i - 2));
     ax_dict_set(d, k, v);
     ax_release(ax_strv(k));
@@ -1287,18 +1309,18 @@ static void def(AxVM *vm, const char *name, AxNativeFn fn, int min_args, int max
 
 void ax_engine_install(AxVM *vm) {
   init_keys();
-  def(vm, "v2", e_v2, 0, 2);       def(vm, "v3", e_v3, 0, 3);
-  def(vm, "v3x", e_v3x, 0, 1);     def(vm, "v3y", e_v3y, 0, 1);
-  def(vm, "v3z", e_v3z, 0, 1);     def(vm, "v3xz", e_v3xz, 0, 2);
-  def(vm, "v2dir", e_v2dir, 0, 1); def(vm, "q", e_q, 0, 2);
-  def(vm, "euler", e_euler, 0, 3); def(vm, "m4", e_m4, 0, 0);
-  def(vm, "persp", e_persp, 0, 4); def(vm, "ortho", e_ortho, 0, 6);
-  def(vm, "lookat", e_lookat, 0, 3); def(vm, "aabb", e_aabb, 0, 2);
-  def(vm, "dist", e_dist, 0, 2);
-  def(vm, "sphere", e_sphere, 0, 1); def(vm, "box", e_box, 0, 1); def(vm, "capsule", e_capsule, 0, 2);
-  def(vm, "cell_to_world", e_cell_to_world, 0, 1);
-  def(vm, "bar", e_bar, 0, 4);
-  def(vm, "hypot", e_hypot, 0, 2);   // V8's rounding, so both runtimes agree to the bit
+  def(vm, "v2", e_v2, 1, 2);       def(vm, "v3", e_v3, 1, 3);
+  def(vm, "v3x", e_v3x, 1, 1);     def(vm, "v3y", e_v3y, 1, 1);
+  def(vm, "v3z", e_v3z, 1, 1);     def(vm, "v3xz", e_v3xz, 2, 2);
+  def(vm, "v2dir", e_v2dir, 1, 1); def(vm, "q", e_q, 2, 2);
+  def(vm, "euler", e_euler, 3, 3); def(vm, "m4", e_m4, 0, 0);
+  def(vm, "persp", e_persp, 4, 4); def(vm, "ortho", e_ortho, 6, 6);
+  def(vm, "lookat", e_lookat, 2, 3); def(vm, "aabb", e_aabb, 2, 2);
+  def(vm, "dist", e_dist, 2, 2);
+  def(vm, "sphere", e_sphere, 1, 1); def(vm, "box", e_box, 1, 1); def(vm, "capsule", e_capsule, 2, 2);
+  def(vm, "cell_to_world", e_cell_to_world, 1, 1);
+  def(vm, "bar", e_bar, 1, 4);
+  def(vm, "hypot", e_hypot, 2, 2);   // V8's rounding, so both runtimes agree to the bit
   extern void ax_engine_install_more(AxVM *vm);
   ax_engine_install_more(vm);
 }
@@ -3421,7 +3443,7 @@ NATIVE(e_patrol_point) {
 }
 
 void ax_engine_install_more(AxVM *vm) {
-  def(vm, "vision_cells", e_vision_cells, 0, 5);
+  def(vm, "vision_cells", e_vision_cells, 5, 5);
   def(vm, "patrol_point", e_patrol_point, 0, 0);
 }
 

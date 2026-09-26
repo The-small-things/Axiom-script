@@ -497,6 +497,13 @@ bool ax_run_program(AxVM *vm, AxNode *program, AxArr *argv, AxValue *result);
 void ax_program_declare(AxVM *vm, AxNode *program);   // functions, types, globals
 bool ax_run_main(AxVM *vm, AxNode *program, AxArr *argv, AxValue *result);   // false: ^main faulted (recorded)
 int ax_to_int32(double x);                            // JavaScript's ToInt32 (`x | 0`)
+// JavaScript's ToIntegerOrInfinity, bounded to ±2^53 so it always fits: NaN is 0.
+static inline int64_t ax_js_int(double x) {
+  if (x != x) return 0;
+  if (x > 9007199254740992.0) return INT64_C(9007199254740992);
+  if (x < -9007199254740992.0) return -INT64_C(9007199254740992);
+  return (int64_t)x;
+}
 
 enum { AX_FLOW_NORMAL = 0, AX_FLOW_BREAK, AX_FLOW_CONTINUE, AX_FLOW_RETURN };
 

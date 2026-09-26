@@ -15,6 +15,13 @@ Conventions:
 * **any function is also a method** on its first argument (v0.9.3): where a value has no method
   of that name, `x.f(a)` is `f(x, a)` — `xs.sorted().uniq()`, `text.lines().len()`,
   `p.norm1()` for a `^fn norm1(p)`. Ranges take every array method: `(0..n).map(f)`
+* **arguments** (v0.9.3), the same in both runtimes: too few is an error naming the minimum
+  (`AX-ARITY-001`); extra ones are ignored. A number argument is read as `Number()` reads it
+  (`"12"` → 12, NaN propagates); a text argument that is not text is read as its displayed form.
+  A selector is `null` (the value itself), a field name (a dict's entry, a vector's or entity's
+  member, else `null`) or a callable — anything else is `AX-CALL-001 value of type … is not
+  callable`. Sorting orders numbers numerically, a boolean by truthiness, anything else by its
+  displayed text, and is stable
 
 ---
 

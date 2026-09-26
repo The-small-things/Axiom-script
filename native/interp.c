@@ -336,6 +336,16 @@ AxArr *ax_to_seq(AxVM *vm, AxValue v) {
     }
     case AX_NULL: return ax_arr_new(0);
     case AX_HOST: return ax_host_seq(v);
+    case AX_VEC2: case AX_VEC3: case AX_QUAT: {
+      // A vector's items are its components.
+      AxVec *p = ax_vecp(v);
+      AxArr *a = ax_arr_new(4);
+      ax_arr_push(a, ax_num(p->x));
+      ax_arr_push(a, ax_num(p->y));
+      if (v.t != AX_VEC2) ax_arr_push(a, ax_num(p->z));
+      if (v.t == AX_QUAT) ax_arr_push(a, ax_num(p->w));
+      return a;
+    }
     default: {
       AxArr *a = ax_arr_new(1);
       ax_arr_push(a, ax_copy(v));
@@ -356,7 +366,7 @@ AxValue ax_index_get(AxVM *vm, AxValue obj, AxValue idx) {
     case AX_STR: {
       AxStr *s = (AxStr *)obj.o;
       if (idx.t == AX_BIG) ax_throw(vm, "AX-RUNTIME-000", "Cannot convert a BigInt value to a number");
-      int64_t i = (int64_t)ax_to_num(idx);
+      int64_t i = ax_js_int(ax_to_num(idx));
       if (i < 0) i += s->len;
       if (i < 0 || (uint64_t)i >= s->len) return ax_null();
       return ax_strv(ax_str_new(s->data + i, 1));
@@ -418,7 +428,18 @@ AxValue ax_call(AxVM *vm, AxValue fnv, AxValue *args, int argc) {
     return r;
   }
   if (fnv.t != AX_FN) {
-    ax_throw(vm, "AX-CALL-001", "%s is not callable", ax_type_name(fnv));
+    // As the reference's callValue: text or an atom names a function; null is its own mistake.
+    if (fnv.t == AX_STR || fnv.t == AX_ATOM) {
+      AxStr *nm = (AxStr *)fnv.o;
+      AxValue fv;
+      if (ax_scope_lookup(vm->builtins, nm, &fv)) {
+        if (fv.t == AX_FN) { AxValue r = ax_call(vm, fv, args, argc); ax_release(fv); return r; }
+        ax_release(fv);
+      }
+      ax_throw(vm, "AX-CALL-001", "'%s' is not a function", nm->data);
+    }
+    if (fnv.t == AX_NULL) ax_throw(vm, "AX-CALL-001", "tried to call a value that is null");
+    ax_throw(vm, "AX-CALL-001", "value of type %s is not callable", ax_type_name(fnv));
     return ax_null();
   }
   AxFn *f = (AxFn *)fnv.o;
@@ -490,14 +511,15 @@ AxValue ax_key_apply(AxVM *vm, AxValue sel, AxValue item, double index) {
     return r;
   }
   if (sel.t == AX_STR || sel.t == AX_ATOM) {
-    if (item.t == AX_DICT) {
-      AxValue out;
-      if (ax_dict_get((AxDict *)item.o, (AxStr *)sel.o, &out)) return out;
-      return ax_null();
-    }
+    // A field name: a dict's entry, a vector's component, an entity's field; else null.
+    AxValue out;
+    if (item.t == AX_DICT) return ax_dict_get((AxDict *)item.o, (AxStr *)sel.o, &out) ? out : ax_null();
+    if (item.t >= AX_VEC2 && ax_engine_member(vm, item, (AxStr *)sel.o, &out)) return out;
     return ax_null();
   }
-  return ax_copy(sel);
+  // Anything else is not a selector (a constant used to map every element to itself).
+  ax_throw(vm, "AX-CALL-001", "value of type %s is not callable", ax_type_name(sel));
+  return ax_null();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -997,7 +1019,48 @@ static bool lookup_callable(AxScope *scope, AxStr *name, AxValue *out, bool *fou
   return false;
 }
 
+// `observe(name: value, …)`: the evidence record `~=` reads, {__observe: true, obs: {…}}. A value
+// that names a channel (`sensor.range`) is that channel's latest message.
+static AxValue eval_observe(AxVM *vm, AxNode *n, AxScope *scope) {
+  AxDict *obs = ax_dict_new();
+  AxDict *channels = ax_world_channels(vm);
+  for (int i = 0; i < n->nlist; i++) {
+    AxNode *arg = n->list[i];
+    if (!arg->str) continue;
+    AxValue v = ax_null();
+    bool have = false;
+    char path[256];
+    size_t len = 0;
+    AxNode *e = arg->b;
+    // Flatten `a.b.c` (member chain on an identifier) to text.
+    AxNode *chain[16];
+    int depth = 0;
+    while (e && e->kind == N_MEMBER && depth < 16) { chain[depth++] = e; e = e->a; }
+    if (channels && e && e->kind == N_IDENT && e->str) {
+      len = (size_t)snprintf(path, sizeof path, "%s", e->str->data);
+      for (int d = depth - 1; d >= 0 && len < sizeof path; d--) len += (size_t)snprintf(path + len, sizeof path - len, ".%s", chain[d]->str->data);
+      AxStr *key = ax_str_new(path, len < sizeof path ? len : sizeof path - 1);
+      have = ax_dict_get(channels, key, &v);
+      ax_release(ax_strv(key));
+    }
+    if (!have) v = eval_node(vm, arg->b, scope);
+    ax_dict_set(obs, arg->str, v);
+  }
+  AxDict *d = ax_dict_new();
+  AxStr *k = ax_internz("__observe"); ax_dict_set(d, k, ax_bool(true)); ax_release(ax_strv(k));
+  k = ax_internz("obs"); ax_dict_set(d, k, ax_dictv(obs)); ax_release(ax_strv(k));
+  return ax_dictv(d);
+}
+
+static bool is_easing_name(const char *s) {
+  static const char *names[] = { "linear", "in", "out", "inout", "bounce", "elastic" };
+  for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) if (!strcmp(s, names[i])) return true;
+  return false;
+}
+
 static AxValue eval_call_named(AxVM *vm, AxNode *n, AxScope *scope) {
+  // The reference reads observe(...) before any other name.
+  if (!strcmp(n->str->data, "observe")) return eval_observe(vm, n, scope);
   AxValue fn;
   bool found_any = false;
   if (lookup_callable(scope, n->str, &fn, &found_any)) {
@@ -1065,6 +1128,8 @@ static AxValue eval_call_named(AxVM *vm, AxNode *n, AxScope *scope) {
     ax_release(v);
     ax_throw(vm, "AX-CALL-001", "'%s' holds %s, which is not callable", n->str->data, tn);
   }
+  // An easing name is a value (`ease: bounce`), not something to call.
+  if (is_easing_name(n->str->data)) ax_throw(vm, "AX-CALL-001", "'%s' is not a function", n->str->data);
   ax_throw(vm, "AX-RUNTIME-FUNC", "unknown function '%s(...)'", n->str->data);
   return ax_null();
 }

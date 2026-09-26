@@ -35,13 +35,60 @@ function withCtx(fn) { fn.__ctx = true; return fn; }
 // Internal helpers (not exposed to AxiomScript).
 // ---------------------------------------------------------------------------------------
 
+// The interpreter's value classes, handed over by stdlibIntrinsics (this module cannot require
+// the interpreter without a cycle).
+let CLS = {};
+
+// v0.9.3: what the library treats as "the items of v", the same in both runtimes. A dict or a
+// record gives its values (a record's __type tag is not one), a vector its components, a range
+// or container its elements, a string its characters. A function, atom, entity or any other
+// single thing is one item — it used to be taken apart into its internals.
+function isPlainObject(v) {
+  if (v === null || typeof v !== 'object' || Array.isArray(v)) return false;
+  const proto = Object.getPrototypeOf(v);
+  return proto === Object.prototype || proto === null;
+}
+function vectorParts(v) {
+  if (CLS.Vec3 && v instanceof CLS.Vec3) return [['x', v.x], ['y', v.y], ['z', v.z]];
+  if (CLS.Vec2 && v instanceof CLS.Vec2) return [['x', v.x], ['y', v.y]];
+  if (CLS.Quat && v instanceof CLS.Quat) return [['x', v.x], ['y', v.y], ['z', v.z], ['w', v.w]];
+  return null;
+}
 function toArray(v) {
   if (v == null) return [];
   if (Array.isArray(v)) return v;
   if (typeof v === 'string') return v.split('');
-  if (typeof v[Symbol.iterator] === 'function') return Array.from(v);
-  if (typeof v === 'object') return Object.values(v);
+  const parts = vectorParts(v);
+  if (parts) return parts.map((p) => p[1]);
+  if (isPlainObject(v)) return Object.keys(v).filter((k) => k !== '__type').map((k) => v[k]);
+  if (CLS.Closure && v instanceof CLS.Closure) return [v];
+  if (typeof v === 'object' && typeof v[Symbol.iterator] === 'function') return Array.from(v);
   return [v];
+}
+// The key/value view of v for keys/values/items/merge/…: a dict or record (without __type), an
+// array by index, a vector by component; nothing else has keys.
+function dictEntries(v) {
+  if (Array.isArray(v) || ArrayBuffer.isView(v)) return Array.from(v, (x, i) => [String(i), x]);
+  const parts = vectorParts(v);
+  if (parts) return parts;
+  if (isPlainObject(v)) return Object.keys(v).filter((k) => k !== '__type').map((k) => [k, v[k]]);
+  return [];
+}
+// A number from an argument of arithmetic: a big is the mixing error, as the operators give.
+function cloneValue(v, depth) {
+  if (v === null || typeof v !== 'object' || depth > 64) return v;
+  if (Array.isArray(v)) return v.map((x) => cloneValue(x, depth + 1));
+  const parts = vectorParts(v);
+  if (parts) return new v.constructor(...parts.map((p) => p[1]));
+  if (isPlainObject(v)) { const o = {}; for (const k of Object.keys(v)) o[k] = cloneValue(v[k], depth + 1); return o; }
+  return v;
+}
+// A function the library returns is named for what made it: <fn compose>, not <fn fn>.
+function named(fn, name) { Object.defineProperty(fn, 'name', { value: name }); return fn; }
+function num(x) {
+  if (typeof x === 'number') return x;
+  if (typeof x === 'bigint') throw new TypeError('Cannot mix BigInt and other types, use explicit conversions');
+  return Number(x);
 }
 
 // mulberry32 — a small, fast, well-distributed PRNG. Seeded randomness matters for a language
@@ -57,7 +104,10 @@ function makeRng(seed) {
   };
 }
 
+// v0.9.3: the same ordering as the `.sort()` method (numbers numerically, booleans as 0/1,
+// anything else by its display form); JS String() put vectors after null and every dict level.
 function cmpValues(a, b) {
+  if (CLS && CLS.compare) return CLS.compare(a, b);
   if (typeof a === 'number' && typeof b === 'number') return a - b;
   const sa = String(a), sb = String(b);
   return sa < sb ? -1 : sa > sb ? 1 : 0;
@@ -66,14 +116,21 @@ function cmpValues(a, b) {
 function buildRegex(pattern, flags) {
   if (pattern instanceof RegExp) return pattern;
   try { return new RegExp(pattern, flags === undefined || flags === null ? '' : String(flags)); }
-  catch (e) { throw new Error(`bad regular expression /${pattern}/: ${e.message}`); }
+  catch (e) {
+    const msg = `bad regular expression /${pattern}/: ${e.message.replace(/^Invalid regular expression: \/.*\/[a-z]*: /, '')}`;
+    throw CLS.AxiomError ? new CLS.AxiomError(msg, 'AX-REGEX') : new Error(msg);
+  }
 }
 
 function stdlibIntrinsics(world, rt) {
   // rt is the runtime bridge supplied by interpreter.js: { callValue, truthy, equalsVal,
   // stringify, AxiomError, Vec3, Atom }. Passing it in (rather than requiring the interpreter)
   // keeps this module free of a circular dependency.
+  CLS = rt;
   const call = (fn, args, ctx) => rt.callValue(fn, args, ctx);
+  // Text from an argument that should be text: a string as it is, anything else as it displays
+  // (the rule `"text" + v` follows), so upper([1, 2]) is "[1,2]", not "1,2".
+  const text = (v) => (typeof v === 'string' ? v : rt.stringify(v));
   const truthy = rt.truthy;
   const fail = (msg, code) => { throw new rt.AxiomError(msg, code || 'AX-STDLIB'); };
 
@@ -101,10 +158,10 @@ function stdlibIntrinsics(world, rt) {
   // and is what an LLM reaches for first.
   const keyOf = (sel, ctx) => {
     if (sel == null) return (v) => v;
-    if (typeof sel === 'string') return (v) => (v == null ? null : v[sel]);
+    if (typeof sel === 'string') return (v) => rt.fieldOf(v, sel);
     // v0.9.2: a bare library-function name reads as an atom; when it names a function it is
     // that function (`map(xs, abs)`), as it already was for the method form `xs.map(abs)`.
-    if (sel instanceof rt.Atom && !(world && (world.fns.has(sel.name) || world.procs.has(sel.name) || typeof world.intrinsics[sel.name] === 'function'))) return (v) => (v == null ? null : v[sel.name]);
+    if (sel instanceof rt.Atom && !(world && (world.fns.has(sel.name) || world.procs.has(sel.name) || typeof world.intrinsics[sel.name] === 'function'))) return (v) => rt.fieldOf(v, sel.name);
     return (v, i) => call(sel, [v, i], ctx);
   };
   const predOf = (sel, ctx) => {
@@ -125,18 +182,18 @@ function stdlibIntrinsics(world, rt) {
     stdev: (xs) => { const a = toArray(xs).map(Number); if (a.length < 2) return 0; const m = a.reduce((p, c) => p + c, 0) / a.length; return Math.sqrt(a.reduce((p, c) => p + (c - m) * (c - m), 0) / a.length); },
     // Integer maths. `mod` is the mathematical modulo (always non-negative for a positive
     // divisor) — distinct from `%`, which follows JS and keeps the dividend's sign.
-    mod: (a, b) => b === 0 ? 0 : ((a % b) + b) % b,
-    divmod: (a, b) => b === 0 ? [0, 0] : [Math.floor(a / b), ((a % b) + b) % b],
+    mod: (a, b) => { a = num(a); b = num(b); return b === 0 ? 0 : ((a % b) + b) % b; },
+    divmod: (a, b) => { a = num(a); b = num(b); return b === 0 ? [0, 0] : [Math.floor(a / b), ((a % b) + b) % b]; },
     gcd: (a, b) => { a = Math.abs(a | 0); b = Math.abs(b | 0); while (b) { const t = b; b = a % b; a = t; } return a; },
     lcm: (a, b) => { a = Math.abs(a | 0); b = Math.abs(b | 0); if (!a || !b) return 0; let x = a, y = b; while (y) { const t = y; y = x % y; x = t; } return (a / x) * b; },
-    fact: (n) => { n = Math.floor(n); if (n < 0) return 0; let r = 1; for (let i = 2; i <= n; i++) r *= i; return r; },
-    comb: (n, k) => { n = Math.floor(n); k = Math.floor(k); if (k < 0 || k > n) return 0; k = Math.min(k, n - k); let r = 1; for (let i = 0; i < k; i++) r = r * (n - i) / (i + 1); return Math.round(r); },
-    perm: (n, k) => { n = Math.floor(n); k = Math.floor(k); if (k < 0 || k > n) return 0; let r = 1; for (let i = 0; i < k; i++) r *= (n - i); return r; },
-    is_prime: (n) => { n = Math.floor(n); if (n < 2) return false; if (n % 2 === 0) return n === 2; for (let i = 3; i * i <= n; i += 2) if (n % i === 0) return false; return true; },
+    fact: (n) => { n = Math.floor(n); if (Number.isNaN(n)) return NaN; if (n < 0) return 0; if (n > 170) return Infinity; let r = 1; for (let i = 2; i <= n; i++) r *= i; return r; },
+    comb: (n, k) => { n = Math.floor(n); k = Math.floor(k); if (Number.isNaN(n) || Number.isNaN(k)) return NaN; if (k < 0 || k > n) return 0; k = Math.min(k, n - k); let r = 1; for (let i = 0; i < k; i++) r = r * (n - i) / (i + 1); return Math.round(r); },
+    perm: (n, k) => { n = Math.floor(n); k = Math.floor(k); if (Number.isNaN(n) || Number.isNaN(k)) return NaN; if (k < 0 || k > n) return 0; let r = 1; for (let i = 0; i < k; i++) r *= (n - i); return r; },
+    is_prime: (n) => { n = Math.floor(n); if (!(n >= 2) || !Number.isFinite(n)) return false; if (n % 2 === 0) return n === 2; for (let i = 3; i * i <= n; i += 2) if (n % i === 0) return false; return true; },
     primes: (limit) => { limit = Math.floor(limit); if (limit < 2) return []; const sieve = new Uint8Array(limit + 1); const out = []; for (let i = 2; i <= limit; i++) { if (sieve[i]) continue; out.push(i); for (let j = i * i; j <= limit; j += i) sieve[j] = 1; } return out; },
     isqrt: (n) => Math.floor(Math.sqrt(Math.max(0, n))),
-    inv_lerp: (a, b, v) => a === b ? 0 : (v - a) / (b - a),
-    round_to: (x, step) => step === 0 ? x : Math.round(x / step) * step,
+    inv_lerp: (a, b, v) => { a = num(a); b = num(b); v = num(v); return a === b ? 0 : (v - a) / (b - a); },
+    round_to: (x, step) => { x = num(x); step = num(step); return step === 0 ? x : Math.round(x / step) * step; },
     clamp01: (x) => Math.max(0, Math.min(1, x)),
     sinh: (x) => Math.sinh(x), cosh: (x) => Math.cosh(x), tanh: (x) => Math.tanh(x),
     ln: (x) => Math.log(x),
@@ -150,7 +207,7 @@ function stdlibIntrinsics(world, rt) {
     nan: () => NaN,
     num: (v) => { const n = Number(v); return Number.isNaN(n) ? 0 : n; },
     to_fixed: (x, digits) => Number(x).toFixed(digits === undefined ? 2 : digits),
-    parse_int: (s, radix) => { const n = parseInt(String(s).trim(), radix || 10); return Number.isNaN(n) ? null : n; },
+    parse_int: (s, radix) => { const n = parseInt(text(s).trim(), radix || 10); return Number.isNaN(n) ? null : n; },
     to_hex: (n) => '0x' + (n >>> 0).toString(16),
     to_bin: (n) => '0b' + (n >>> 0).toString(2),
     to_base: (n, base) => Math.trunc(n).toString(Math.max(2, Math.min(36, base | 0))),
@@ -213,16 +270,18 @@ function stdlibIntrinsics(world, rt) {
     intersect: (a, b) => { const seen = new Set(toArray(b).map(rt.stringify)); const out = []; const added = new Set(); for (const v of toArray(a)) { const k = rt.stringify(v); if (seen.has(k) && !added.has(k)) { added.add(k); out.push(v); } } return out; },
     difference: (a, b) => { const seen = new Set(toArray(b).map(rt.stringify)); return toArray(a).filter(v => !seen.has(rt.stringify(v))); },
     // Dict helpers. `items` pairs with the multi-variable loop: `*k, v in items(d):`
-    keys: (d) => (d && typeof d === 'object') ? Object.keys(d).filter(k => k !== '__type') : [],
-    values: (d) => (d && typeof d === 'object') ? Object.keys(d).filter(k => k !== '__type').map(k => d[k]) : [],
-    items: (d) => (d && typeof d === 'object') ? Object.keys(d).filter(k => k !== '__type').map(k => [k, d[k]]) : [],
-    dict: (pairs) => { const out = {}; for (const p of toArray(pairs)) { const a = toArray(p); out[rt.stringify(a[0])] = a[1]; } return out; },
-    merge: (...ds) => Object.assign({}, ...ds.filter(d => d && typeof d === 'object')),
-    pick_keys: (d, ks) => { const out = {}; for (const k of toArray(ks)) if (d && k in d) out[k] = d[k]; return out; },
-    omit_keys: (d, ks) => { const drop = new Set(toArray(ks).map(String)); const out = {}; for (const k of Object.keys(d || {})) if (!drop.has(k)) out[k] = d[k]; return out; },
-    invert: (d) => { const out = {}; for (const k of Object.keys(d || {})) out[rt.stringify(d[k])] = k; return out; },
-    has_key: (d, k) => !!d && typeof d === 'object' && Object.prototype.hasOwnProperty.call(d, k),
-    clone: (v) => { if (v == null || typeof v !== 'object') return v; if (Array.isArray(v)) return v.map(x => (x && typeof x === 'object') ? JSON.parse(JSON.stringify(x)) : x); try { return JSON.parse(JSON.stringify(v)); } catch (e) { return Object.assign({}, v); } },
+    keys: (d) => dictEntries(d).map((e) => e[0]),
+    values: (d) => dictEntries(d).map((e) => e[1]),
+    items: (d) => dictEntries(d).map((e) => [e[0], e[1]]),
+    dict: (pairs) => { const out = {}; for (const p of toArray(pairs)) { const a = toArray(p); out[rt.stringify(a[0])] = a.length > 1 ? a[1] : null; } return out; },
+    merge: (...ds) => { const out = {}; for (const d of ds) for (const [k, v] of dictEntries(d)) out[k] = v; return out; },
+    pick_keys: (d, ks) => { const src = new Map(dictEntries(d)); const out = {}; for (const k of toArray(ks)) { const key = text(k); if (src.has(key)) out[key] = src.get(key); } return out; },
+    omit_keys: (d, ks) => { const drop = new Set(toArray(ks).map(text)); const out = {}; for (const [k, v] of dictEntries(d)) if (!drop.has(k)) out[k] = v; return out; },
+    invert: (d) => { const out = {}; for (const [k, v] of dictEntries(d)) out[rt.stringify(v)] = k; return out; },
+    has_key: (d, k) => dictEntries(d).some((e) => e[0] === text(k)),
+    // v0.9.3: a deep copy that keeps what things are — a vector stays a vector, a record its
+    // type; functions, atoms and entities are shared, not copied. (It went through JSON.)
+    clone: (v) => cloneValue(v, 0),
     deep_eq: (a, b) => { try { return JSON.stringify(a) === JSON.stringify(b); } catch (e) { return a === b; } },
     // Matrix-shaped helpers — enough linear algebra for grids, games of life, dynamic
     // programming tables and small solvers without reaching for a Mat4.
@@ -232,28 +291,28 @@ function stdlibIntrinsics(world, rt) {
     // =====================================================================================
     // STRINGS, ENCODING, REGEX
     // =====================================================================================
-    ord: (c) => String(c).charCodeAt(0),
+    ord: (c) => text(c).charCodeAt(0),
     chr: (n) => String.fromCharCode(n),
-    lines: (s) => String(s === null || s === undefined ? '' : s).split(/\r?\n/),
-    words: (s) => String(s === null || s === undefined ? '' : s).trim().split(/\s+/).filter(Boolean),
-    chars: (s) => String(s === null || s === undefined ? '' : s).split(''),
-    capitalize: (s) => { const t = String(s); return t ? t[0].toUpperCase() + t.slice(1) : t; },
-    title: (s) => String(s).replace(/\w\S*/g, (w) => w[0].toUpperCase() + w.slice(1).toLowerCase()),
-    reverse_str: (s) => String(s).split('').reverse().join(''),
+    lines: (s) => (s == null ? '' : text(s)).split(/\r?\n/),
+    words: (s) => (s == null ? '' : text(s)).trim().split(/\s+/).filter(Boolean),
+    chars: (s) => (s == null ? '' : text(s)).split(''),
+    capitalize: (s) => { const t = text(s); return t ? t[0].toUpperCase() + t.slice(1) : t; },
+    title: (s) => text(s).replace(/\w\S*/g, (w) => w[0].toUpperCase() + w.slice(1).toLowerCase()),
+    reverse_str: (s) => text(s).split('').reverse().join(''),
     // Regular expressions. `re_*` take the pattern as a plain string, so no regex literal
     // syntax has to be added to the lexer (and no escaping rules have to be learned twice).
-    re_test: (s, pat, flags) => buildRegex(pat, flags).test(String(s)),
-    re_match: (s, pat, flags) => { const m = String(s).match(buildRegex(pat, flags)); if (!m) return null; return { match: m[0], index: m.index, groups: Array.from(m).slice(1) }; },
-    re_all: (s, pat, flags) => { const re = buildRegex(pat, (flags || '') + (String(flags || '').includes('g') ? '' : 'g')); const out = []; let m; while ((m = re.exec(String(s))) !== null) { out.push({ match: m[0], index: m.index, groups: Array.from(m).slice(1) }); if (m.index === re.lastIndex) re.lastIndex++; } return out; },
-    re_sub: (s, pat, repl, flags) => String(s).replace(buildRegex(pat, (flags || '') + (String(flags || '').includes('g') ? '' : 'g')), String(repl)),
-    re_split: (s, pat, flags) => String(s).split(buildRegex(pat, flags)),
-    b64_encode: (s) => Buffer.from(String(s), 'utf8').toString('base64'),
-    b64_decode: (s) => Buffer.from(String(s), 'base64').toString('utf8'),
+    re_test: (s, pat, flags) => buildRegex(text(pat), flags).test(text(s)),
+    re_match: (s, pat, flags) => { const m = text(s).match(buildRegex(text(pat), flags)); if (!m) return null; return { match: m[0], index: m.index, groups: Array.from(m).slice(1) }; },
+    re_all: (s, pat, flags) => { const re = buildRegex(text(pat), (flags || '') + (String(flags || '').includes('g') ? '' : 'g')); const out = []; let m; while ((m = re.exec(text(s))) !== null) { out.push({ match: m[0], index: m.index, groups: Array.from(m).slice(1) }); if (m.index === re.lastIndex) re.lastIndex++; } return out; },
+    re_sub: (s, pat, repl, flags) => text(s).replace(buildRegex(text(pat), (flags || '') + (String(flags || '').includes('g') ? '' : 'g')), text(repl)),
+    re_split: (s, pat, flags) => text(s).split(buildRegex(text(pat), flags)),
+    b64_encode: (s) => Buffer.from(text(s), 'utf8').toString('base64'),
+    b64_decode: (s) => Buffer.from(text(s), 'base64').toString('utf8'),
     // FNV-1a — a stable 32-bit hash. Stable across runs (unlike a JS object's ordering), which
     // makes it usable for bucketing, caching, and deterministic colour/name pickers.
-    hash: (s) => { let h = 0x811c9dc5; const t = String(s); for (let i = 0; i < t.length; i++) { h ^= t.charCodeAt(i); h = Math.imul(h, 0x01000193); } return h >>> 0; },
-    to_json: (v, pretty) => { try { return pretty ? JSON.stringify(v, null, 2) : JSON.stringify(v); } catch (e) { return '<circular>'; } },
-    from_json: (s) => { try { return JSON.parse(s); } catch (e) { return null; } },
+    hash: (s) => { let h = 0x811c9dc5; const t = text(s); for (let i = 0; i < t.length; i++) { h ^= t.charCodeAt(i); h = Math.imul(h, 0x01000193); } return h >>> 0; },
+    to_json: (v, pretty) => { try { return truthy(pretty) ? JSON.stringify(v, null, 2) : JSON.stringify(v); } catch (e) { return '<circular>'; } },
+    from_json: (s) => { try { return JSON.parse(text(s)); } catch (e) { return null; } },
 
     // =====================================================================================
     // TIME
@@ -280,7 +339,7 @@ function stdlibIntrinsics(world, rt) {
     mkdir: (p) => { const abs = writable(p); fs.mkdirSync(abs, { recursive: true }); return true; },
     rm: (p) => { const abs = writable(p); try { fs.rmSync(abs, { recursive: true, force: true }); return true; } catch (e) { return false; } },
     is_dir: (p) => { try { return fs.statSync(path.resolve(p)).isDirectory(); } catch (e) { return false; } },
-    path_join: (...parts) => path.join(...parts.map(String)),
+    path_join: (...parts) => path.join(...parts.map(text)),
     // stdin, for interactive CLIs and for programs fed by a pipe. Returns null at EOF.
     input: (prompt) => {
       if (prompt !== undefined && prompt !== null) process.stdout.write(String(prompt));
@@ -319,11 +378,11 @@ function stdlibIntrinsics(world, rt) {
     apply: withCtx((fn, argList, ctx) => call(fn, toArray(argList), ctx)),
     // Function composition and partial application — the two combinators that pay for
     // themselves immediately in a pipeline.
-    compose: withCtx((...rest) => { const ctx = rest.pop(); const fns = rest; return (...xs) => fns.reduceRight((acc, f, i) => i === fns.length - 1 ? call(f, xs, ctx) : call(f, [acc], ctx), null); }),
-    partial: withCtx((...rest) => { const ctx = rest.pop(); const fn = rest.shift(); const bound = rest; return (...xs) => call(fn, [...bound, ...xs], ctx); }),
+    compose: withCtx((...rest) => { const ctx = rest.pop(); const fns = rest; return named((...xs) => fns.reduceRight((acc, f, i) => i === fns.length - 1 ? call(f, xs, ctx) : call(f, [acc], ctx), null), 'compose'); }),
+    partial: withCtx((...rest) => { const ctx = rest.pop(); const fn = rest.shift(); const bound = rest; return named((...xs) => call(fn, [...bound, ...xs], ctx), 'partial'); }),
     // `memo` makes exponential recursion linear — the single most valuable four tokens in a
     // language LLMs use for dynamic programming.
-    memo: withCtx((fn, ctx) => { const cache = new Map(); return (...xs) => { const k = xs.map(rt.stringify).join('\u0001'); if (cache.has(k)) return cache.get(k); const v = call(fn, xs, ctx); cache.set(k, v); return v; }; }),
+    memo: withCtx((fn, ctx) => { const cache = new Map(); return named((...xs) => { const k = xs.map(rt.stringify).join('\u0001'); if (cache.has(k)) return cache.get(k); const v = call(fn, xs, ctx); cache.set(k, v); return v; }, 'memo'); }),
     // Assertions that throw (so ^try can catch them) rather than logging — what a test needs.
     check: withCtx((cond, msg, ctx) => { if (!truthy(cond)) fail(msg === undefined ? 'check failed' : rt.stringify(msg), 'AX-CHECK'); return true; }),
     check_eq: withCtx((a, b, msg, ctx) => { if (!rt.equalsVal(a, b) && rt.stringify(a) !== rt.stringify(b)) fail(`${msg === undefined ? 'check_eq failed' : rt.stringify(msg)}: ${rt.stringify(a)} != ${rt.stringify(b)}`, 'AX-CHECK'); return true; }),

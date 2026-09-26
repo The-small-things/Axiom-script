@@ -240,6 +240,19 @@ else
 fi
 rm -rf "$RDIR"
 
+# The library sweep: every library function and common method called with every argument
+# shape, sensible or not (tests/libsweep/gen.js); each call's result or error must match.
+SDIR=$(mktemp -d)
+node "$ROOT/native/tests/libsweep/gen.js" "$SDIR/sweep.ax"
+(cd "$SDIR" && $NODE_RUN sweep.ax > js.txt 2>&1; "$NATIVE" sweep.ax > c.txt 2>&1)
+calls=$(grep -c '^  t("' "$SDIR/sweep.ax")
+if node "$ROOT/native/tests/libsweep/compare.js" "$SDIR/js.txt" "$SDIR/c.txt" --expect "$calls" > /tmp/ax_sweep.txt 2>&1; then
+  pass=$((pass + 1)); printf 'OK   library sweep: %s\n' "$(tail -1 /tmp/ax_sweep.txt)"
+else
+  fail=$((fail + 1)); printf 'FAIL library sweep\n'; head -24 /tmp/ax_sweep.txt; tail -2 /tmp/ax_sweep.txt
+fi
+rm -rf "$SDIR"
+
 # The embedding API: a C host driving every entry point (tests/api/apitest.c).
 if make -s -C "$ROOT/native" tests/api/apitest > /dev/null 2>&1 && "$ROOT/native/tests/api/apitest" > /tmp/ax_api.txt 2>&1; then
   pass=$((pass + 1)); printf 'OK   embedding API: %s\n' "$(tail -1 /tmp/ax_api.txt)"

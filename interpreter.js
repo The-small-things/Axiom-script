@@ -368,6 +368,9 @@ class Scope {
 // native intrinsic. Closures capture the scope, entity, and world they were created in, so a
 // lambda returned from a function keeps working after that function returns.
 class Closure {
+  // v0.9.3: JSON.stringify leaves a function out, as it does a host function; a closure used to
+  // be written out as its syntax tree.
+  toJSON() { return undefined; }
   constructor({ params, body, isExpr, scope, entity, name, defaults }) {
     this.params = params || [];
     this.defaults = defaults || null;   // parameter defaults, when wrapping a declared ^fn
@@ -428,7 +431,7 @@ function callValue(fnVal, argVals, ctx, nameHint) {
     const decl = ctx.world.fns.get(nm) || ctx.world.procs.get(nm);
     if (decl) return callUserFn(decl, argVals, ctx);
     const intr = ctx.world.intrinsics[nm];
-    if (intr) return invokeIntrinsic(intr, argVals, ctx);
+    if (intr) return invokeIntrinsic(intr, argVals, ctx, nm);
     throw new AxiomError(`'${nm}' is not a function`, 'AX-CALL-001');
   }
   if (fnVal instanceof Closure) {
@@ -475,18 +478,64 @@ function callValue(fnVal, argVals, ctx, nameHint) {
   }
   // A raw FnDecl/ProcDecl node (e.g. handed over by older code paths).
   if (fnVal && Array.isArray(fnVal.body) && Array.isArray(fnVal.params)) return callUserFn(fnVal, argVals, ctx);
-  throw new AxiomError(`value of type ${typeof fnVal} is not callable`, 'AX-CALL-001');
+  throw new AxiomError(`value of type ${valueTypeName(fnVal)} is not callable`, 'AX-CALL-001');
 }
 
 // v0.9.0: some stdlib intrinsics need to call back into the language (anything taking a
 // lambda). Those are tagged `__ctx` and receive the evaluation context as their final
 // argument; missing optional arguments are padded so the context always lands in the right
 // slot regardless of how many arguments the call site supplied.
-function invokeIntrinsic(fn, args, ctx) {
+// v0.9.3: the fewest arguments each library function takes. A call with fewer is an error,
+// the same one in both runtimes, rather than a computation on `undefined` (lerp(1) was NaN,
+// comb(5) was 1). native/difftest.sh checks this table against the native registrations.
+const LIBRARY_MIN_ARGS = Object.freeze({
+  abs: 1, acos: 1, all: 1, any: 1, asin: 1, atan: 1, b64_decode: 1, b64_encode: 1, bar: 1, big: 1,
+  bnot: 1, box: 1, capitalize: 1, cbrt: 1, ceil: 1, cell_to_world: 1, chars: 1, check: 1, chr: 1,
+  clamp01: 1, clone: 1, compose: 1, cos: 1, cosh: 1, count: 1, deg2rad: 1, dict: 1, enumerate: 1,
+  env: 1, exists: 1, exp: 1, fact: 1, file_exists: 1, first: 1, flatten: 1, float: 1, floor: 1,
+  fract: 1, from_json: 1, hash: 1, int: 1, invert: 1, is_array: 1, is_big: 1, is_bool: 1,
+  is_dict: 1, is_dir: 1, is_empty: 1, is_finite: 1, is_fn: 1, is_int: 1, is_nan: 1, is_null: 1,
+  is_number: 1, is_prime: 1, is_string: 1, isqrt: 1, items: 1, json_parse: 1, json_stringify: 1,
+  keys: 1, last: 1, len: 1, lines: 1, ln: 1, log: 1, log10: 1, log1p: 1, log2: 1, max: 1, mean: 1,
+  median: 1, memo: 1, merge: 1, min: 1, mkdir: 1, mode: 1, num: 1, ord: 1, parse_int: 1,
+  partial: 1, path_join: 1, pick: 1, primes: 1, prod: 1, rad2deg: 1, range: 1, read: 1,
+  read_json: 1, read_lines: 1, reverse_str: 1, reversed: 1, rm: 1, round: 1, seed: 1, sh: 1,
+  shuffle: 1, sign: 1, sin: 1, sinh: 1, sleep: 1, sort: 1, sorted: 1, sphere: 1, sqrt: 1, stdev: 1,
+  str: 1, sum: 1, tan: 1, tanh: 1, title: 1, to_bin: 1, to_fixed: 1, to_hex: 1, to_json: 1,
+  transpose: 1, trunc: 1, type: 1, uniq: 1, unzip: 1, v2: 1, v2dir: 1, v3: 1, v3x: 1, v3y: 1,
+  v3z: 1, values: 1, variance: 1, words: 1, zip: 1,
+  aabb: 2, append: 2, apply: 2, atan2: 2, band: 2, bor: 2, bxor: 2, capsule: 2, check_eq: 2,
+  chunk: 2, comb: 2, count_by: 2, deep_eq: 2, difference: 2, dist: 2, divmod: 2, drop: 2, each: 2,
+  filter: 2, find: 2, find_index: 2, gcd: 2, grid: 2, group_by: 2, has_key: 2, hypot: 2,
+  intersect: 2, lcm: 2, lookat: 2, map: 2, max_by: 2, min_by: 2, mod: 2, omit_keys: 2,
+  partition: 2, perm: 2, pick_keys: 2, pow: 2, q: 2, randomInt: 2, randomRange: 2, random_int: 2,
+  random_range: 2, re_all: 2, re_match: 2, re_split: 2, re_test: 2, reduce: 2, round_to: 2, shl: 2,
+  shr: 2, sort_by: 2, take: 2, to_base: 2, union: 2, v3xz: 2, windows: 2, write: 2, write_json: 2,
+  clamp: 3, euler: 3, inv_lerp: 3, lerp: 3, re_sub: 3, smoothstep: 3, wrap: 3,
+  persp: 4,
+  map_range: 5, vision_cells: 5,
+  ortho: 6,
+});
+
+function checkArity(name, got) {
+  const min = LIBRARY_MIN_ARGS[name];
+  if (min !== undefined && got < min) {
+    throw new AxiomError(`${name}() needs at least ${min} argument${min === 1 ? '' : 's'}, got ${got}`, 'AX-ARITY-001');
+  }
+}
+
+// `name` is the library name the call used, when there is one (aliases share a function).
+function invokeIntrinsic(fn, args, ctx, name) {
+  if (name !== undefined) {
+    checkArity(name, args.length);
+    if (typeof fn !== 'function') throw new AxiomError(`'${name}' is not a function`, 'AX-CALL-001');
+  }
   if (!fn.__ctx) return fn(...args);
   const want = Math.max(0, fn.length - 1);
   const a = args.slice();
   while (a.length < want) a.push(undefined);
+  // Extra arguments are ignored, as for any function — they must not land where ctx goes.
+  if (fn.length > 0 && a.length > want) a.length = want;
   return fn(...a, ctx);
 }
 
@@ -579,6 +628,12 @@ function compareOp(op, a, b) {
     case '==': return equalsVal(a, b); case '!=': return !equalsVal(a, b);
     default: throw new Error(`unknown comparison '${op}'`);
   }
+}
+// v0.9.3: a number from a library argument; a big is the operators' mixing error.
+function numArg(x) {
+  if (typeof x === 'number') return x;
+  if (typeof x === 'bigint') throw new TypeError('Cannot mix BigInt and other types, use explicit conversions');
+  return Number(x);
 }
 function clampNum(x, lo, hi) { return Math.max(lo, Math.min(hi, x)); }
 
@@ -2774,7 +2829,7 @@ class World {
     // is bound to this World so its I/O respects the sandbox settings, and it receives a small
     // runtime bridge so its higher-order functions can invoke AxiomScript lambdas.
     this.intrinsics = Object.assign(defaultIntrinsics(), stdlibIntrinsics(this, {
-      callValue, truthy, equalsVal, stringify: stringifyFStringVal, AxiomError, Atom, Vec3, Vec2,
+      callValue, truthy, equalsVal, stringify: stringifyFStringVal, AxiomError, Atom, Vec3, Vec2, Quat, Closure, fieldOf, compare: defaultCompare,
     }));
     this._tickAcc = new Map();
     this._physicsAcc = 0;
@@ -3308,14 +3363,45 @@ function loadRendererModule(world) {
   return _rendererModule;
 }
 
+// print(), len() and range() are read before other names (callFunction), and are also values
+// in the library — so `xs.len()` and `5.range()` reach them by uniform call syntax.
+function printValues(values, ctx) {
+  const msg = values.map(v => (typeof v === 'string') ? v : stringifyFStringVal(v)).join(' ');
+  ctx.world.log.push({ type: 'log', msg, level: 'info', entity: ctx.entity ? ctx.entity.decl.name : '<fn>' });
+  if (!ctx.world._suppressConsole) console.log(msg);
+  return null;
+}
+function lengthOf(v) {
+  if (typeof v === 'string') return v.length;
+  if (Array.isArray(v) || ArrayBuffer.isView(v)) return v.length;   // typed arrays: a mesh's vertices
+  if (v instanceof BVec || v instanceof BMap) return v.len;
+  if (v instanceof Pool) return v.liveCount;
+  // v0.9.3: a range's length counts its step (range(0, 10, 2) has 5, not 10).
+  if (v instanceof Range) return v.length;
+  if (v instanceof Vec2) return 2;
+  if (v instanceof Vec3) return 3;
+  if (v instanceof Quat) return 4;
+  // A dict or record (without its `__type` tag); a function, atom or entity has no length.
+  if (v && typeof v === 'object' && (Object.getPrototypeOf(v) === Object.prototype || Object.getPrototypeOf(v) === null)) return Object.keys(v).filter(k => k !== '__type').length;
+  return 0;
+}
+function makeRange(args) {
+  // v0.9.0: `range(lo, hi, step)`, including a negative step for a countdown.
+  if (args.length === 1) return new Range(0, Number(args[0]));
+  if (args.length >= 3) return new Range(Number(args[0]), Number(args[1]), Number(args[2]));
+  return new Range(Number(args[0]), Number(args[1]));
+}
+
 function defaultIntrinsics() {
   return {
     // v0.8.9: v2 with 1 arg = uniform Vec2(v, v).
-    v2: (x, y) => y === undefined ? new Vec2(x, x) : new Vec2(x, y),
+    // v0.9.3: components are numbers (Number(x)), as in the native runtime; v2("a") held text.
+    v2: (x, y) => y === undefined ? new Vec2(Number(x), Number(x)) : new Vec2(Number(x), Number(y)),
     // v0.8.8: v3 with 2 args = horizontal plane vec (x, 0, z). Saves 3 tokens vs v3(x,0,z).
     // 1-arg form is allowed (treats as uniform v3(v,v,v) — but `3v` literal is preferred for that).
     // 3-arg form unchanged.
     v3: (x, y, z) => {
+      x = Number(x); if (y !== undefined) y = Number(y); if (z !== undefined) z = Number(z);
       if (z === undefined) {
         if (y === undefined) return new Vec3(x, x, x);  // 1-arg: uniform
         return new Vec3(x, 0, y);  // 2-arg: (x, 0, z) — horizontal plane
@@ -3323,21 +3409,36 @@ function defaultIntrinsics() {
       return new Vec3(x, y, z);  // 3-arg: full
     },
     // v0.8.8: Vec3 axis-aligned shorthands. Common in game code (e.g. gravity = v3y(-9.8)).
-    v3x: (v) => new Vec3(v, 0, 0),
-    v3y: (v) => new Vec3(0, v, 0),
-    v3z: (v) => new Vec3(0, 0, v),
-    v3xz: (x, z) => new Vec3(x, 0, z),
+    v3x: (v) => new Vec3(Number(v), 0, 0),
+    v3y: (v) => new Vec3(0, Number(v), 0),
+    v3z: (v) => new Vec3(0, 0, Number(v)),
+    v3xz: (x, z) => new Vec3(Number(x), 0, Number(z)),
     // v0.8.10: 2D direction from angle — v2dir(0) = v2(1,0), v2dir(PI/2) = v2(0,1).
     v2dir: (a) => new Vec2(Math.cos(a), Math.sin(a)),
-    q: (axis, angle) => Quat.fromAxisAngle(axis, angle),
+    q: (axis, angle) => {
+      if (!(axis instanceof Vec3)) throw new AxiomError(`q() needs a vec3 axis, got ${valueTypeName(axis)}`, 'AX-RUNTIME-000');
+      return Quat.fromAxisAngle(axis, Number(angle));
+    },
     euler: (p, y, r) => Quat.fromEuler(p, y, r),
     m4: () => Mat4.identity(),
+    len: (v) => lengthOf(v),
+    range: (...args) => makeRange(args),
+    print: Object.assign((...rest) => printValues(rest.slice(0, -1), rest[rest.length - 1]), { __ctx: true }),
     persp: (fov, aspect, n, f) => Mat4.perspective(fov, aspect, n, f),
     ortho: (l, r, b, t, n, f) => Mat4.ortho(l, r, b, t, n, f),
-    lookat: (eye, tgt, up) => Mat4.lookAt(eye, tgt, up || new Vec3(0, 1, 0)),
+    lookat: (eye, tgt, up) => {
+      for (const p of up == null ? [eye, tgt] : [eye, tgt, up]) {
+        if (!(p instanceof Vec3)) throw new AxiomError(`lookat() needs vec3 points, got ${valueTypeName(p)}`, 'AX-RUNTIME-000');
+      }
+      return Mat4.lookAt(eye, tgt, up || new Vec3(0, 1, 0));
+    },
     aabb: (min, max) => ({ __aabb: true, min, max }),
     clamp: (x, lo, hi) => clampNum(x, lo, hi),
-    dist: (a, b) => (typeof a === 'number' && typeof b === 'number') ? Math.abs(a - b) : a.sub(b).mag,
+    dist: (a, b) => {
+      if (typeof a === 'number' && typeof b === 'number') return Math.abs(a - b);
+      if ((a instanceof Vec3 || a instanceof Vec2) && (b instanceof Vec3 || b instanceof Vec2)) return a.sub(b).mag;
+      throw new AxiomError(`dist() needs two numbers or two vectors, got ${valueTypeName(a)} and ${valueTypeName(b)}`, 'AX-RUNTIME-000');
+    },
     sphere: (r) => new ColliderShape('sphere', [r]),
     box: (v) => new ColliderShape('box', [v]),
     capsule: (r, h) => new ColliderShape('capsule', [r, h]),
@@ -3381,10 +3482,10 @@ function defaultIntrinsics() {
     rad2deg: (rad) => rad * 180 / Math.PI,
     // v0.8.8: lerp intrinsic — `lerp(a, b, t)` returns a + (b - a) * t. Saves 5 tokens vs the
     // manual `a + (b - a) * t` form. Works on numbers; for Vec3 use .lerp() method.
-    lerp: (a, b, t) => a + (b - a) * t,
+    lerp: (a, b, t) => { a = numArg(a); b = numArg(b); t = numArg(t); return a + (b - a) * t; },
     // v0.8.8: map_range — remap a value from one range to another. Common in shader/game code.
     // map_range(v, in_lo, in_hi, out_lo, out_hi) → out_lo + (v - in_lo) / (in_hi - in_lo) * (out_hi - out_lo)
-    map_range: (v, inLo, inHi, outLo, outHi) => { if (inHi === inLo) return outLo; return outLo + (v - inLo) / (inHi - inLo) * (outHi - outLo); },
+    map_range: (v, inLo, inHi, outLo, outHi) => { [v, inLo, inHi, outLo, outHi] = [v, inLo, inHi, outLo, outHi].map(numArg); if (inHi === inLo) return outLo; return outLo + (v - inLo) / (inHi - inLo) * (outHi - outLo); },
     vision_cells: (origin, facing, playerPos, range, halfAngleDeg) => {
       const W = 10, H = 10;
       const visibleCells = [];
@@ -3405,7 +3506,10 @@ function defaultIntrinsics() {
       if (visibleCells.some(c => c.x === pc.x && c.y === pc.y)) seenCell = pc;
       return { visibleCells, seenCell };
     },
-    cell_to_world: (cell) => new Vec3(cell.x + 0.5, 0, cell.y + 0.5),
+    cell_to_world: (cell) => {
+      const part = (k) => (cell !== null && typeof cell === 'object' && cell[k] !== undefined) ? Number(cell[k]) : NaN;
+      return new Vec3(part('x') + 0.5, 0, part('y') + 0.5);
+    },
     linear: atom('linear'),
     in: atom('in'),
     out: atom('out'),
@@ -3417,14 +3521,15 @@ function defaultIntrinsics() {
     bar: (pos, w, h, fg) => ({ __hud: true, kind: 'bar', pos, w, h, fg }),
     // v0.8.11: general-purpose intrinsics
     // v0.8.12: wrap json_parse/json_stringify in try/catch to prevent crashes
-    json_parse: (s) => { try { return JSON.parse(s); } catch(e) { return null; } },
-    json_stringify: (v, pretty) => { try { return pretty ? JSON.stringify(v, null, 2) : JSON.stringify(v); } catch(e) { return '<circular>'; } },
-    int: (s) => parseInt(s, 10),
-    float: (s) => parseFloat(s),
+    json_parse: (s) => { try { return JSON.parse(typeof s === 'string' ? s : stringifyFStringVal(s)); } catch(e) { return null; } },
+    json_stringify: (v, pretty) => { try { return truthy(pretty) ? JSON.stringify(v, null, 2) : JSON.stringify(v); } catch(e) { return '<circular>'; } },
+    // Text arguments read as they display (a non-string is str(v)), as in every text function.
+    int: (s) => parseInt(typeof s === 'string' ? s : stringifyFStringVal(s), 10),
+    float: (s) => parseFloat(typeof s === 'string' ? s : stringifyFStringVal(s)),
     // v0.9.2: str(v) is exactly what f"{v}" shows.
     str: (v) => stringifyFStringVal(v),
     // v0.9.0: `type()` reports a record's declared ^type name and recognizes functions.
-    type: (v) => v == null ? 'null' : typeof v === 'function' ? 'fn' : Array.isArray(v) ? 'array' : typeof v === 'object' ? (v.__callable ? 'fn' : v.__type ? v.__type : v instanceof Atom ? 'atom' : v instanceof Vec3 ? 'vec3' : v instanceof Vec2 ? 'vec2' : v instanceof Quat ? 'quat' : v instanceof EntityInstance ? 'entity' : v instanceof Transform ? 'transform' : v instanceof Mat4 ? 'mat4' : v instanceof Range ? 'range' : 'dict') : typeof v,
+    type: (v) => valueTypeName(v),
     is_null: (v) => v == null,
     is_number: (v) => typeof v === 'number',
     is_string: (v) => typeof v === 'string',
@@ -3432,9 +3537,9 @@ function defaultIntrinsics() {
     clock: () => (typeof performance !== 'undefined' ? performance.now() : Date.now()) / 1000,
     // v0.8.11: additional math intrinsics
     // v0.8.12: fix NaN on zero-width ranges
-    wrap: (x, lo, hi) => { if (hi === lo) return lo; const r = hi - lo; return lo + (((x - lo) % r + r) % r); },
+    wrap: (x, lo, hi) => { x = numArg(x); lo = numArg(lo); hi = numArg(hi); if (hi === lo) return lo; const r = hi - lo; return lo + (((x - lo) % r + r) % r); },
     fract: (x) => x - Math.floor(x),
-    smoothstep: (lo, hi, x) => { if (hi === lo) return x >= hi ? 1 : 0; const t = Math.max(0, Math.min(1, (x - lo) / (hi - lo))); return t * t * (3 - 2 * t); },
+    smoothstep: (lo, hi, x) => { lo = numArg(lo); hi = numArg(hi); x = numArg(x); if (hi === lo) return x >= hi ? 1 : 0; const t = Math.max(0, Math.min(1, (x - lo) / (hi - lo))); return t * t * (3 - 2 * t); },
     hypot: (a, b) => Math.hypot(a, b),
     trunc: (x) => Math.trunc(x),
     cbrt: (x) => Math.cbrt(x),
@@ -3587,17 +3692,15 @@ function formatSpec(v, spec) {
 // v0.9.0: the name to show a model in an error message. `typeof null` is "object" and
 // `constructor.name` is absent on a null — both produce messages that point at the wrong
 // thing, and a wrong hint is worse than none because it sends the next attempt sideways.
+// What type(v) says — also the name "not callable" errors use.
+function valueTypeName(v) {
+  return v == null ? 'null' : typeof v === 'function' ? 'fn' : Array.isArray(v) ? 'array' : typeof v === 'object' ? (v.__callable ? 'fn' : v.__type ? v.__type : v instanceof Atom ? 'atom' : v instanceof Vec3 ? 'vec3' : v instanceof Vec2 ? 'vec2' : v instanceof Quat ? 'quat' : v instanceof EntityInstance ? 'entity' : v instanceof Transform ? 'transform' : v instanceof Mat4 ? 'mat4' : v instanceof Range ? 'range' : 'dict') : typeof v;
+}
+
 function typeNameOf(v) {
-  if (v === null || v === undefined) return 'null';
-  if (Array.isArray(v)) return 'array';
-  if (typeof v === 'object') {
-    if (v.__callable) return 'function';
-    if (v.__type) return `record ${v.__type}`;
-    if (v.constructor && v.constructor.name && v.constructor.name !== 'Object') return v.constructor.name;
-    return 'dict';
-  }
-  if (typeof v === 'function') return 'function';
-  return typeof v;
+  // v0.9.3: messages name a type the way type() does — "vec3", "fn", a record's own type — so
+  // both runtimes say the same thing ("Vec3", "function" and "record P" before).
+  return valueTypeName(v);
 }
 
 // v0.9.0: dict keys are strings. A computed key is coerced the same way an f-string would
@@ -4050,12 +4153,29 @@ function binaryOpRest(op, l, r) {
 // nothing — into a JS function. Accepting a field name (`xs.sort_by("hp")`) matters: it is the
 // shortest possible spelling of the most common callback, and it cannot be mistyped into
 // silence the way a missing lambda could.
+// v0.9.3: what a field-name selector reads — a dict's own entry, a vector's, quaternion's or
+// entity's member, and null for everything else (it used to read JS properties: a string's
+// `length`, an array's indices, and `undefined`, which a dict then silently dropped).
+function fieldOf(v, name) {
+  if (v === null || typeof v !== 'object') return null;
+  if (Array.isArray(v) || ArrayBuffer.isView(v) || v instanceof BVec || v instanceof BMap) return null;
+  if (v instanceof Vec2 || v instanceof Vec3 || v instanceof Quat || v instanceof EntityInstance || v instanceof Transform || v instanceof Mat4) {
+    let r;
+    try { r = memberOf(v, name); } catch { r = undefined; }
+    return r === undefined || typeof r === 'function' ? null : r;
+  }
+  if (Object.getPrototypeOf(v) !== Object.prototype && Object.getPrototypeOf(v) !== null) return null;
+  return Object.prototype.hasOwnProperty.call(v, name) && v[name] !== undefined ? v[name] : null;
+}
+
 function keySelector(sel, ctx) {
   if (sel === undefined || sel === null) return (v) => v;
-  if (typeof sel === 'string') return (v) => (v == null ? null : v[sel]);
+  if (typeof sel === 'string') return (v) => fieldOf(v, sel);
   if (isCallable(sel, ctx.world)) return (v, i) => callValue(sel, [v, i], ctx);
-  if (sel instanceof Atom) return (v) => (v == null ? null : v[sel.name]);
-  return () => sel;
+  if (sel instanceof Atom) return (v) => fieldOf(v, sel.name);
+  // v0.9.3: anything else is a mistake, reported as the library functions report it (a
+  // constant selector used to map every element to itself).
+  throw new AxiomError(`value of type ${valueTypeName(sel)} is not callable`, 'AX-CALL-001');
 }
 
 // Natural ordering: numeric for numbers, lexicographic otherwise. JS's default array sort
@@ -4076,6 +4196,13 @@ function arityOf(fn) {
   return 0;
 }
 
+// v0.9.3: a string method's text argument as it displays; a missing one is JavaScript's
+// "undefined", which is what the builtin methods have always searched for.
+function argText(v) {
+  if (v === undefined) return 'undefined';
+  return typeof v === 'string' ? v : stringifyFStringVal(v);
+}
+
 function callMethod(obj, method, argNodes, ctx) {
   // v0.9.3: a range takes the array methods, as the array it stands for: range(0, n).map(f).
   if (obj instanceof Range) obj = Array.from(obj);
@@ -4083,23 +4210,29 @@ function callMethod(obj, method, argNodes, ctx) {
   if (typeof obj === 'string') {
     const args = argNodes.map(a => a.value ? evalExpr(a.value, ctx) : undefined);
     switch (method) {
-      case 'split': return obj.split(args[0]);
-      case 'replace': return obj.replace(args[0], String(args[1] ?? ''));
+      case 'split': return args[0] === undefined ? [obj] : obj.split(argText(args[0]));
+      // The first occurrence, replaced literally ($& and friends are not special).
+      case 'replace': return obj.replace(argText(args[0]), () => (args[1] == null ? '' : argText(args[1])));
       case 'trim': return obj.trim();
       case 'upper': return obj.toUpperCase();
       case 'lower': return obj.toLowerCase();
-      case 'startsWith': return obj.startsWith(args[0]);
-      case 'endsWith': return obj.endsWith(args[0]);
-      case 'includes': return obj.includes(args[0]);
-      case 'contains': return obj.includes(args[0]); // v0.8.12: alias for Python familiarity
-      case 'indexOf': return obj.indexOf(args[0]);
+      case 'startsWith': return obj.startsWith(argText(args[0]));
+      case 'endsWith': return obj.endsWith(argText(args[0]));
+      case 'includes': return obj.includes(argText(args[0]));
+      case 'contains': return obj.includes(argText(args[0])); // v0.8.12: alias for Python familiarity
+      case 'indexOf': return obj.indexOf(argText(args[0]));
       case 'repeat': return obj.repeat(args[0] || 0);
       case 'slice': return args[1] !== undefined ? obj.slice(args[0], args[1]) : obj.slice(args[0]);
-      case 'padStart': return obj.padStart(args[0] || 0, args[1] || ' ');
-      case 'padEnd': return obj.padEnd(args[0] || 0, args[1] || ' ');
+      // v0.9.3: the fill is text as it displays (a space when absent or empty); the target is a
+      // length, so NaN and a non-number are 0.
+      case 'padStart': case 'padEnd': {
+        const fill = args[1] == null || args[1] === '' ? ' ' : (typeof args[1] === 'string' ? args[1] : stringifyFStringVal(args[1]));
+        const want = Number(args[0]) || 0;
+        return method === 'padStart' ? obj.padStart(want, fill) : obj.padEnd(want, fill);
+      }
       case 'charAt': return obj.charAt(args[0]);
       case 'charCodeAt': return obj.charCodeAt(args[0]);
-      case 'match': { const m = obj.match(args[0]); if (!m) return null; if (args[0] instanceof RegExp && args[0].global) return { matches: Array.from(m), count: m.length }; return { match: m[0], index: m.index, groups: Array.from(m.slice(1)) }; }
+      case 'match': { const m = obj.match(args[0] === undefined ? undefined : argText(args[0])); if (!m) return null; if (args[0] instanceof RegExp && args[0].global) return { matches: Array.from(m), count: m.length }; return { match: m[0], index: m.index, groups: Array.from(m.slice(1)) }; }
       // v0.9.0: the string methods a text-processing program actually reaches for. `lines`,
       // `words` and `chars` are the three shapes almost every parsing task starts from.
       case 'lines': return obj.split(/\r?\n/);
@@ -4107,9 +4240,9 @@ function callMethod(obj, method, argNodes, ctx) {
       case 'chars': return obj.split('');
       case 'len': return obj.length;
       case 'reverse': return obj.split('').reverse().join('');
-      case 'replace_all': return obj.split(String(args[0])).join(String(args[1] ?? ''));
+      case 'replace_all': return obj.split(argText(args[0])).join(args[1] == null ? '' : argText(args[1]));
       case 'capitalize': return obj ? obj[0].toUpperCase() + obj.slice(1) : obj;
-      case 'count': { const needle = String(args[0]); if (!needle) return 0; return obj.split(needle).length - 1; }
+      case 'count': { const needle = argText(args[0]); if (!needle) return 0; return obj.split(needle).length - 1; }
       case 'to_int': { const n = parseInt(obj.trim(), args[0] || 10); return Number.isNaN(n) ? null : n; }
       case 'to_num': { const n = Number(obj.trim()); return Number.isNaN(n) ? null : n; }
       case 'trim_start': return obj.replace(/^\s+/, '');
@@ -4121,13 +4254,16 @@ function callMethod(obj, method, argNodes, ctx) {
   if (obj && typeof obj === 'object' && !Array.isArray(obj) && !(obj instanceof Vec2) && !(obj instanceof Vec3) && !(obj instanceof Quat) && !(obj instanceof EntityInstance) && !(obj instanceof BVec) && !(obj instanceof BMap) && !(obj instanceof Transform) && !(obj instanceof Mat4) && !(obj instanceof Pool) && !(obj instanceof ColliderShape)) {
     const args = argNodes.map(a => a.value ? evalExpr(a.value, ctx) : undefined);
     switch (method) {
-      case 'keys': return Object.keys(obj);
-      case 'values': return Object.values(obj);
-      case 'entries': return Object.entries(obj);
-      case 'has': return Object.prototype.hasOwnProperty.call(obj, args[0]);
-      case 'delete': delete obj[args[0]]; return undefined;
-      case 'get': return (args[0] in obj) ? obj[args[0]] : (args[1] === undefined ? null : args[1]);
-      case 'set': obj[args[0]] = args[1]; return args[1];
+      // A record's __type tag is not a key, as for keys()/values()/items().
+      case 'keys': return Object.keys(obj).filter(k => k !== '__type');
+      case 'values': return Object.keys(obj).filter(k => k !== '__type').map(k => obj[k]);
+      case 'entries': return Object.keys(obj).filter(k => k !== '__type').map(k => [k, obj[k]]);
+      // v0.9.3: keys as `d[k]` reads them (stringifyKey), so d.set([1, 2], x) and d[[1, 2]] agree;
+      // a missing key is null, and a missing value too.
+      case 'has': return Object.prototype.hasOwnProperty.call(obj, stringifyKey(args[0] ?? null));
+      case 'delete': delete obj[stringifyKey(args[0] ?? null)]; return null;
+      case 'get': { const k = stringifyKey(args[0] ?? null); return Object.prototype.hasOwnProperty.call(obj, k) ? obj[k] : (args[1] === undefined ? null : args[1]); }
+      case 'set': { const v = args[1] === undefined ? null : args[1]; obj[stringifyKey(args[0] ?? null)] = v; return v; }
       // v0.9.0: dicts get the same higher-order surface as arrays, so a record or a lookup
       // table can be transformed without converting it to pairs and back.
       case 'items': return Object.keys(obj).filter(k => k !== '__type').map(k => [k, obj[k]]);
@@ -4135,8 +4271,8 @@ function callMethod(obj, method, argNodes, ctx) {
       case 'map_values': { const f = keySelector(args[0], ctx); const out = {}; for (const k of Object.keys(obj)) { if (k === '__type') continue; out[k] = f(obj[k], k); } return out; }
       case 'filter': { const f = keySelector(args[0], ctx); const out = {}; for (const k of Object.keys(obj)) { if (k === '__type') continue; if (truthy(f(obj[k], k))) out[k] = obj[k]; } return out; }
       case 'each': case 'forEach': { const f = keySelector(args[0], ctx); for (const k of Object.keys(obj)) { if (k === '__type') continue; f(obj[k], k); } return null; }
-      case 'merge': return Object.assign({}, obj, ...args.filter(a => a && typeof a === 'object'));
-      case 'clone': { try { return JSON.parse(JSON.stringify(obj)); } catch (e) { return Object.assign({}, obj); } }
+      case 'merge': return ctx.world.intrinsics.merge(obj, ...args);
+      case 'clone': return ctx.world.intrinsics.clone(obj);
       case 'is_empty': return Object.keys(obj).filter(k => k !== '__type').length === 0;
     }
   }
@@ -4187,8 +4323,10 @@ function callMethod(obj, method, argNodes, ctx) {
         return out;
       }
       case 'join': {
-        const sep = args[0] !== undefined ? String(args[0]) : ',';
-        return obj.map(v => (v === null || v === undefined) ? '' : String(v)).join(sep);
+        // Elements as they display (a nested array is [1,2], a function <fn f>).
+        const text = (v) => (typeof v === 'string' ? v : stringifyFStringVal(v));
+        const sep = args[0] !== undefined ? text(args[0]) : ',';
+        return obj.map(v => (v === null || v === undefined) ? '' : text(v)).join(sep);
       }
       case 'sort': {
         // v0.9.0: the comparator can be a lambda, a ^fn name, a closure in a variable, or a
@@ -4197,7 +4335,7 @@ function callMethod(obj, method, argNodes, ctx) {
         const sel = args[0];
         if (sel != null) {
           if (isCallable(sel, ctx.world) && arityOf(sel) >= 2) {
-            obj.sort((a, b) => { const r = callValue(sel, [a, b], ctx); return typeof r === 'number' ? r : 0; });
+            obj.sort((a, b) => Number(callValue(sel, [a, b], ctx)) || 0); // v0.9.3: read as a number, as sorted() does
             return obj;
           }
           const key = keySelector(sel, ctx);
@@ -4239,8 +4377,8 @@ function callMethod(obj, method, argNodes, ctx) {
         let n = 0; for (const v of obj) if (equalsVal(v, args[0])) n++; return n;
       }
       case 'sum': { const f = keySelector(args[0], ctx); let t = 0; for (let i = 0; i < obj.length; i++) { const v = args[0] === undefined ? obj[i] : f(obj[i], i); t += typeof v === 'number' ? v : Number(v) || 0; } return t; }
-      case 'min': { if (!obj.length) return null; const f = keySelector(args[0], ctx); let best = obj[0], bk = args[0] === undefined ? obj[0] : f(obj[0], 0); for (let i = 1; i < obj.length; i++) { const k = args[0] === undefined ? obj[i] : f(obj[i], i); if (defaultCompare(k, bk) < 0) { bk = k; best = obj[i]; } } return best; }
-      case 'max': { if (!obj.length) return null; const f = keySelector(args[0], ctx); let best = obj[0], bk = args[0] === undefined ? obj[0] : f(obj[0], 0); for (let i = 1; i < obj.length; i++) { const k = args[0] === undefined ? obj[i] : f(obj[i], i); if (defaultCompare(k, bk) > 0) { bk = k; best = obj[i]; } } return best; }
+      case 'min': { const f = keySelector(args[0], ctx); if (!obj.length) return null; let best = obj[0], bk = args[0] === undefined ? obj[0] : f(obj[0], 0); for (let i = 1; i < obj.length; i++) { const k = args[0] === undefined ? obj[i] : f(obj[i], i); if (defaultCompare(k, bk) < 0) { bk = k; best = obj[i]; } } return best; }
+      case 'max': { const f = keySelector(args[0], ctx); if (!obj.length) return null; let best = obj[0], bk = args[0] === undefined ? obj[0] : f(obj[0], 0); for (let i = 1; i < obj.length; i++) { const k = args[0] === undefined ? obj[i] : f(obj[i], i); if (defaultCompare(k, bk) > 0) { bk = k; best = obj[i]; } } return best; }
       case 'sort_by': { const f = keySelector(args[0], ctx); return obj.slice().sort((a, b) => defaultCompare(f(a), f(b))); }
       case 'group_by': { const f = keySelector(args[0], ctx); const out = {}; for (let i = 0; i < obj.length; i++) { const g = stringifyKey(f(obj[i], i)); (out[g] = out[g] || []).push(obj[i]); } return out; }
       case 'uniq': { const f = keySelector(args[0], ctx); const seen = new Set(); const out = []; for (let i = 0; i < obj.length; i++) { const k = stringifyKey(args[0] === undefined ? obj[i] : f(obj[i], i)); if (seen.has(k)) continue; seen.add(k); out.push(obj[i]); } return out; }
@@ -4259,45 +4397,17 @@ function callMethod(obj, method, argNodes, ctx) {
         obj.fill(value, start, end);
         return obj;
       }
-      case 'keys': return obj.keys();
-      case 'values': return obj.values();
-      case 'entries': return obj.entries();
-      // v0.8.11: additional array methods
-      case 'some': {
-        const fnNode = argNodes[0] && argNodes[0].value;
-        if (fnNode && fnNode.type === 'Ident') {
-          const fnDecl = ctx.world.fns.get(fnNode.name) || ctx.world.procs.get(fnNode.name);
-          if (fnDecl) return obj.some(item => truthy(callUserFn(fnDecl, [item], ctx)));
-        }
-        return false;
-      }
-      case 'every': {
-        const fnNode = argNodes[0] && argNodes[0].value;
-        if (fnNode && fnNode.type === 'Ident') {
-          const fnDecl = ctx.world.fns.get(fnNode.name) || ctx.world.procs.get(fnNode.name);
-          if (fnDecl) return obj.every(item => truthy(callUserFn(fnDecl, [item], ctx)));
-        }
-        return true;
-      }
-      case 'findIndex': {
-        const fnNode = argNodes[0] && argNodes[0].value;
-        if (fnNode && fnNode.type === 'Ident') {
-          const fnDecl = ctx.world.fns.get(fnNode.name) || ctx.world.procs.get(fnNode.name);
-          if (fnDecl) return obj.findIndex(item => truthy(callUserFn(fnDecl, [item], ctx)));
-        }
-        return -1;
-      }
-      case 'flatMap': {
-        const fnNode = argNodes[0] && argNodes[0].value;
-        if (fnNode && fnNode.type === 'Ident') {
-          const fnDecl = ctx.world.fns.get(fnNode.name) || ctx.world.procs.get(fnNode.name);
-          if (fnDecl) return obj.flatMap(item => { const r = callUserFn(fnDecl, [item], ctx); return Array.isArray(r) ? r : [r]; });
-        }
-        return obj;
-      }
+      // v0.9.3: an array's views, as keys()/values()/items() give them (JS iterators before).
+      case 'keys': return obj.map((_, i) => String(i));
+      case 'values': return obj.slice();
+      case 'entries': return obj.map((v, i) => [String(i), v]);
+      // findIndex is find_index (it took only a named ^fn, and a lambda silently gave -1).
+      case 'findIndex': { const f = keySelector(args[0], ctx); for (let i = 0; i < obj.length; i++) if (truthy(f(obj[i], i))) return i; return -1; }
     }
     // Fall through to the error below if no method matched.
   }
+  // v0.9.3: a vector or quaternion copies itself like any other value (it used to crash).
+  if (method === 'clone' && (obj instanceof Vec2 || obj instanceof Vec3 || obj instanceof Quat)) return ctx.world.intrinsics.clone(obj);
   if (obj instanceof Vec2) {
     if (method === 'to') {
       const target = evalExpr(argNodes[0].value, ctx);
@@ -4578,33 +4688,19 @@ function callFunction(name, argNodes, ctx) {
     // depend on side effects between arguments (`print(xs, xs.pop())` showed the pre-pop array),
     // which no reader would predict and the native runtime does not reproduce.
     const values = argNodes.map(a => (a && a.value) ? evalExpr(a.value, ctx) : '');
-    const parts = values.map(v => (typeof v === 'string') ? v : stringifyFStringVal(v));
-    const msg = parts.join(' ');
-    ctx.world.log.push({ type: 'log', msg, level: 'info', entity: ctx.entity ? ctx.entity.decl.name : '<fn>' });
-    if (!ctx.world._suppressConsole) console.log(msg);
-    return null;
+    return printValues(values, ctx);
   }
   // v0.8.13: len() — universal length for arrays, strings, dicts, BVec, BMap, Pool
   if (name === 'len') {
-    const v = argNodes[0] ? evalExpr(argNodes[0].value, ctx) : null;
-    if (typeof v === 'string') return v.length;
-    if (Array.isArray(v)) return v.length;
-    if (v instanceof BVec || v instanceof BMap) return v.len;
-    if (v instanceof Pool) return v.liveCount;
-    // v0.9.0: a Range knows its own length, and a record's `__type` tag is not a field.
-    if (v instanceof Range) return Math.max(0, Math.round(v.hi) - Math.round(v.lo));
-    if (v && typeof v === 'object') return Object.keys(v).filter(k => k !== '__type').length;
-    return 0;
+    checkArity('len', argNodes.length);
+    return lengthOf(argNodes[0] ? evalExpr(argNodes[0].value, ctx) : null);
   }
   // v0.8.13: range() — Python-style range(n) and range(lo, hi)
   if (name === 'range') {
-    const args = argNodes.map(a => evalExpr(a.value, ctx));
-    if (args.length === 1) return new Range(0, args[0]);
-    // v0.9.0: `range(lo, hi, step)`, including a negative step for a countdown. Without a
-    // step, counting down needed a manual while loop (≈12 tokens) for no reason.
-    if (args.length >= 3) return new Range(args[0], args[1], args[2]);
-    return new Range(args[0], args[1]);
+    checkArity('range', argNodes.length);
+    return makeRange(argNodes.map(a => evalExpr(a.value, ctx)));
   }
+
   // v0.9.0: innermost binding wins. A local or parameter holding a callable — `f = \x: x + 1`
   // then `f(2)`, or a callback passed in by name — shadows a same-named function or intrinsic,
   // which is what lexical scope means and what makes a parameter called `map` or `sum` safe.
@@ -4624,7 +4720,7 @@ function callFunction(name, argNodes, ctx) {
   const intr = ctx.world.intrinsics[name];
   if (intr) {
     const args = argNodes.map(a => evalExpr(a.value, ctx));
-    return invokeIntrinsic(intr, args, ctx);
+    return invokeIntrinsic(intr, args, ctx, name);
   }
   // v0.9.0: `^type` names are constructors — `^type P: x, y` then `P(1, 2)` or `P(x: 1, y: 2)`
   // builds {x: 1, y: 2, __type: "P"}. Records were declarable but not constructible before.
@@ -5895,7 +5991,7 @@ function execAction(name, argNodes, ctx) {
   }
   const intrinsic = ctx.world.intrinsics[name];
   if (typeof intrinsic === 'function') {
-    return invokeIntrinsic(intrinsic, argNodes.map(a => evalExpr(a.value, ctx)), ctx);
+    return invokeIntrinsic(intrinsic, argNodes.map(a => evalExpr(a.value, ctx)), ctx, name);
   }
   throw new Error(`unknown action '!${name}(...)'`);
 }

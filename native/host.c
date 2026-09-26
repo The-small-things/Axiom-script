@@ -160,7 +160,7 @@ void ax_pool_release_action(AxVM *vm, AxNode *n, AxScope *scope) {
     if (ax_dict_get((AxDict *)hv.o, K__handle, &flag)) {
       if (ax_truthy(flag) && ax_dict_get((AxDict *)hv.o, K_index, &idx)) {
         Pool *p = h->data;
-        int i = (int)ax_to_num(idx);
+        int64_t i = ax_js_int(ax_to_num(idx));
         if (i >= 0 && i < p->capacity) { p->used[i] = false; ax_release(p->data[i]); p->data[i] = ax_null(); }
         ax_release(idx);
       }

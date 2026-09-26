@@ -56,8 +56,7 @@ static int cmp_values_asc(const void *a, const void *b) {
   return ax_compare(*(const AxValue *)a, *(const AxValue *)b);
 }
 
-// Sorting with a key or comparator needs the VM, which qsort cannot carry, so the sort is a
-// simple merge sort over the array instead. Stable, which also matches the reference.
+// Sorting with a key or comparator needs the VM, which qsort cannot carry.
 typedef struct { AxVM *vm; AxValue sel; bool comparator; } SortCtx;
 
 static int sort_cmp(SortCtx *c, AxValue a, AxValue b) {
@@ -77,17 +76,322 @@ static int sort_cmp(SortCtx *c, AxValue a, AxValue b) {
   return r;
 }
 
-static void merge_sort(SortCtx *c, AxValue *items, uint32_t n, AxValue *tmp) {
-  if (n < 2) return;
-  uint32_t mid = n / 2;
-  merge_sort(c, items, mid, tmp);
-  merge_sort(c, items + mid, n - mid, tmp);
-  uint32_t i = 0, j = mid, k = 0;
-  while (i < mid && j < n) tmp[k++] = (sort_cmp(c, items[j], items[i]) < 0) ? items[j++] : items[i++];
-  while (i < mid) tmp[k++] = items[i++];
-  while (j < n) tmp[k++] = items[j++];
-  memcpy(items, tmp, sizeof(AxValue) * n);
+// V8's Array.prototype.sort, step for step (third_party/v8/builtins/array-sort.tq: TimSort with
+// binary insertion for short runs and galloping merges). Any stable sort agrees with it for a
+// consistent ordering, but mixed-type keys (booleans among numbers) and hand-written comparators
+// need not be consistent, and then only the same comparisons in the same order give the same
+// result — and call a side-effecting key or comparator the same number of times.
+typedef struct {
+  SortCtx *c;
+  AxValue *a;
+  AxValue *tmp;
+  int min_gallop;
+  int nruns;
+  int32_t base[85], len[85];
+} TimSort;
+
+#define TS_CMP(x, y) sort_cmp(ts->c, (x), (y))
+
+static int32_t ts_gallop_left(TimSort *ts, AxValue *arr, AxValue key, int32_t base, int32_t length, int32_t hint) {
+  int32_t last = 0, ofs = 1;
+  if (TS_CMP(arr[base + hint], key) < 0) {
+    int32_t max = length - hint;
+    while (ofs < max) {
+      if (TS_CMP(arr[base + hint + ofs], key) >= 0) break;
+      last = ofs;
+      ofs = (ofs << 1) + 1;
+      if (ofs <= 0) ofs = max;
+    }
+    if (ofs > max) ofs = max;
+    last += hint;
+    ofs += hint;
+  } else {
+    int32_t max = hint + 1;
+    while (ofs < max) {
+      if (TS_CMP(arr[base + hint - ofs], key) < 0) break;
+      last = ofs;
+      ofs = (ofs << 1) + 1;
+      if (ofs <= 0) ofs = max;
+    }
+    if (ofs > max) ofs = max;
+    int32_t t = last;
+    last = hint - ofs;
+    ofs = hint - t;
+  }
+  last++;
+  while (last < ofs) {
+    int32_t m = last + ((ofs - last) >> 1);
+    if (TS_CMP(arr[base + m], key) < 0) last = m + 1;
+    else ofs = m;
+  }
+  return ofs;
 }
+
+static int32_t ts_gallop_right(TimSort *ts, AxValue *arr, AxValue key, int32_t base, int32_t length, int32_t hint) {
+  int32_t last = 0, ofs = 1;
+  if (TS_CMP(key, arr[base + hint]) < 0) {
+    int32_t max = hint + 1;
+    while (ofs < max) {
+      if (TS_CMP(key, arr[base + hint - ofs]) >= 0) break;
+      last = ofs;
+      ofs = (ofs << 1) + 1;
+      if (ofs <= 0) ofs = max;
+    }
+    if (ofs > max) ofs = max;
+    int32_t t = last;
+    last = hint - ofs;
+    ofs = hint - t;
+  } else {
+    int32_t max = length - hint;
+    while (ofs < max) {
+      if (TS_CMP(key, arr[base + hint + ofs]) < 0) break;
+      last = ofs;
+      ofs = (ofs << 1) + 1;
+      if (ofs <= 0) ofs = max;
+    }
+    if (ofs > max) ofs = max;
+    last += hint;
+    ofs += hint;
+  }
+  last++;
+  while (last < ofs) {
+    int32_t m = last + ((ofs - last) >> 1);
+    if (TS_CMP(key, arr[base + m]) < 0) ofs = m;
+    else last = m + 1;
+  }
+  return ofs;
+}
+
+#define TS_COPY(src, si, dst, di, n) memmove(&(dst)[di], &(src)[si], sizeof(AxValue) * (size_t)(n))
+
+static void ts_merge_low(TimSort *ts, int32_t base_a, int32_t len_a, int32_t base_b, int32_t len_b) {
+  AxValue *a = ts->a, *t = ts->tmp;
+  TS_COPY(a, base_a, t, 0, len_a);
+  int32_t dest = base_a, ct = 0, cb = base_b;
+  a[dest++] = a[cb++];
+  if (--len_b == 0) goto succeed;
+  if (len_a == 1) goto copy_b;
+  int min_gallop = ts->min_gallop;
+  for (;;) {
+    int32_t wins_a = 0, wins_b = 0;
+    for (;;) {
+      if (TS_CMP(a[cb], t[ct]) < 0) {
+        a[dest++] = a[cb++];
+        ++wins_b; --len_b; wins_a = 0;
+        if (len_b == 0) goto succeed;
+        if (wins_b >= min_gallop) break;
+      } else {
+        a[dest++] = t[ct++];
+        ++wins_a; --len_a; wins_b = 0;
+        if (len_a == 1) goto copy_b;
+        if (wins_a >= min_gallop) break;
+      }
+    }
+    ++min_gallop;
+    bool first = true;
+    while (wins_a >= 7 || wins_b >= 7 || first) {
+      first = false;
+      min_gallop = min_gallop - 1 > 1 ? min_gallop - 1 : 1;
+      ts->min_gallop = min_gallop;
+      wins_a = ts_gallop_right(ts, t, a[cb], ct, len_a, 0);
+      if (wins_a > 0) {
+        TS_COPY(t, ct, a, dest, wins_a);
+        dest += wins_a; ct += wins_a; len_a -= wins_a;
+        if (len_a == 1) goto copy_b;
+        if (len_a == 0) goto succeed;
+      }
+      a[dest++] = a[cb++];
+      if (--len_b == 0) goto succeed;
+      wins_b = ts_gallop_left(ts, a, t[ct], cb, len_b, 0);
+      if (wins_b > 0) {
+        TS_COPY(a, cb, a, dest, wins_b);
+        dest += wins_b; cb += wins_b; len_b -= wins_b;
+        if (len_b == 0) goto succeed;
+      }
+      a[dest++] = t[ct++];
+      if (--len_a == 1) goto copy_b;
+    }
+    ++min_gallop;
+    ts->min_gallop = min_gallop;
+  }
+succeed:
+  if (len_a > 0) TS_COPY(t, ct, a, dest, len_a);
+  return;
+copy_b:
+  // The last element of run A belongs at the end of the merge.
+  TS_COPY(a, cb, a, dest, len_b);
+  a[dest + len_b] = t[ct];
+}
+
+static void ts_merge_high(TimSort *ts, int32_t base_a, int32_t len_a, int32_t base_b, int32_t len_b) {
+  AxValue *a = ts->a, *t = ts->tmp;
+  TS_COPY(a, base_b, t, 0, len_b);
+  int32_t dest = base_b + len_b - 1, ct = len_b - 1, ca = base_a + len_a - 1;
+  a[dest--] = a[ca--];
+  if (--len_a == 0) goto succeed;
+  if (len_b == 1) goto copy_a;
+  int min_gallop = ts->min_gallop;
+  for (;;) {
+    int32_t wins_a = 0, wins_b = 0;
+    for (;;) {
+      if (TS_CMP(t[ct], a[ca]) < 0) {
+        a[dest--] = a[ca--];
+        ++wins_a; --len_a; wins_b = 0;
+        if (len_a == 0) goto succeed;
+        if (wins_a >= min_gallop) break;
+      } else {
+        a[dest--] = t[ct--];
+        ++wins_b; --len_b; wins_a = 0;
+        if (len_b == 1) goto copy_a;
+        if (wins_b >= min_gallop) break;
+      }
+    }
+    ++min_gallop;
+    bool first = true;
+    while (wins_a >= 7 || wins_b >= 7 || first) {
+      first = false;
+      min_gallop = min_gallop - 1 > 1 ? min_gallop - 1 : 1;
+      ts->min_gallop = min_gallop;
+      int32_t k = ts_gallop_right(ts, a, t[ct], base_a, len_a, len_a - 1);
+      wins_a = len_a - k;
+      if (wins_a > 0) {
+        dest -= wins_a; ca -= wins_a;
+        TS_COPY(a, ca + 1, a, dest + 1, wins_a);
+        len_a -= wins_a;
+        if (len_a == 0) goto succeed;
+      }
+      a[dest--] = t[ct--];
+      if (--len_b == 1) goto copy_a;
+      k = ts_gallop_left(ts, t, a[ca], 0, len_b, len_b - 1);
+      wins_b = len_b - k;
+      if (wins_b > 0) {
+        dest -= wins_b; ct -= wins_b;
+        TS_COPY(t, ct + 1, a, dest + 1, wins_b);
+        len_b -= wins_b;
+        if (len_b == 1) goto copy_a;
+        if (len_b == 0) goto succeed;
+      }
+      a[dest--] = a[ca--];
+      if (--len_a == 0) goto succeed;
+    }
+    ++min_gallop;
+    ts->min_gallop = min_gallop;
+  }
+succeed:
+  if (len_b > 0) TS_COPY(t, 0, a, dest - (len_b - 1), len_b);
+  return;
+copy_a:
+  dest -= len_a; ca -= len_a;
+  TS_COPY(a, ca + 1, a, dest + 1, len_a);
+  a[dest] = t[ct];
+}
+
+static void ts_merge_at(TimSort *ts, int i) {
+  int32_t base_a = ts->base[i], len_a = ts->len[i], base_b = ts->base[i + 1], len_b = ts->len[i + 1];
+  ts->len[i] = len_a + len_b;
+  if (i == ts->nruns - 3) { ts->base[i + 1] = ts->base[i + 2]; ts->len[i + 1] = ts->len[i + 2]; }
+  ts->nruns--;
+  int32_t k = ts_gallop_right(ts, ts->a, ts->a[base_b], base_a, len_a, 0);
+  base_a += k;
+  len_a -= k;
+  if (len_a == 0) return;
+  len_b = ts_gallop_left(ts, ts->a, ts->a[base_a + len_a - 1], base_b, len_b, len_b - 1);
+  if (len_b == 0) return;
+  if (len_a <= len_b) ts_merge_low(ts, base_a, len_a, base_b, len_b);
+  else ts_merge_high(ts, base_a, len_a, base_b, len_b);
+}
+
+static bool ts_invariant(TimSort *ts, int n) {
+  if (n < 2) return true;
+  return ts->len[n - 2] > ts->len[n - 1] + ts->len[n];
+}
+
+static void ts_merge_collapse(TimSort *ts) {
+  while (ts->nruns > 1) {
+    int n = ts->nruns - 2;
+    if (!ts_invariant(ts, n + 1) || !ts_invariant(ts, n)) {
+      if (n > 0 && ts->len[n - 1] < ts->len[n + 1]) --n;
+      ts_merge_at(ts, n);
+    } else if (ts->len[n] <= ts->len[n + 1]) {
+      ts_merge_at(ts, n);
+    } else {
+      break;
+    }
+  }
+}
+
+static int32_t ts_count_run(TimSort *ts, int32_t low_arg, int32_t high) {
+  AxValue *a = ts->a;
+  int32_t low = low_arg + 1;
+  if (low == high) return 1;
+  int32_t run = 2;
+  bool descending = TS_CMP(a[low], a[low - 1]) < 0;
+  AxValue prev = a[low];
+  for (int32_t i = low + 1; i < high; ++i) {
+    int order = TS_CMP(a[i], prev);
+    if (descending ? order >= 0 : order < 0) break;
+    prev = a[i];
+    ++run;
+  }
+  if (descending) {
+    for (int32_t i = low_arg, j = low_arg + run - 1; i < j; i++, j--) { AxValue x = a[i]; a[i] = a[j]; a[j] = x; }
+  }
+  return run;
+}
+
+static void ts_binary_insertion(TimSort *ts, int32_t low, int32_t start, int32_t high) {
+  AxValue *a = ts->a;
+  if (low == start) start++;
+  for (; start < high; ++start) {
+    int32_t left = low, right = start;
+    AxValue pivot = a[start];
+    while (left < right) {
+      int32_t mid = left + ((right - left) >> 1);
+      if (TS_CMP(pivot, a[mid]) < 0) right = mid;
+      else left = mid + 1;
+    }
+    for (int32_t p = start; p > left; --p) a[p] = a[p - 1];
+    a[left] = pivot;
+  }
+}
+
+static void timsort(SortCtx *c, AxValue *items, uint32_t n) {
+  if (n < 2) return;
+  // As in V8, the sort runs on a work copy that is written back only when it finishes, so a key
+  // or comparator that throws leaves the array as it was (and never with a slot twice).
+  AxValue *work = malloc(sizeof(AxValue) * n * 2);
+  memcpy(work, items, sizeof(AxValue) * n);
+  TimSort ts = { c, work, work + n, 7, 0, {0}, {0} };
+  int32_t remaining = (int32_t)n, low = 0, min_run;
+  {
+    int32_t m = remaining, r = 0;
+    while (m >= 64) { r |= m & 1; m >>= 1; }
+    min_run = m + r;
+  }
+  while (remaining != 0) {
+    int32_t run = ts_count_run(&ts, low, low + remaining);
+    if (run < min_run) {
+      int32_t forced = min_run < remaining ? min_run : remaining;
+      ts_binary_insertion(&ts, low, low + run, low + forced);
+      run = forced;
+    }
+    ts.base[ts.nruns] = low;
+    ts.len[ts.nruns] = run;
+    ts.nruns++;
+    ts_merge_collapse(&ts);
+    low += run;
+    remaining -= run;
+  }
+  while (ts.nruns > 1) {
+    int k = ts.nruns - 2;
+    if (k > 0 && ts.len[k - 1] < ts.len[k + 1]) --k;
+    ts_merge_at(&ts, k);
+  }
+  memcpy(items, work, sizeof(AxValue) * n);
+  free(work);
+}
+#undef TS_CMP
+#undef TS_COPY
 
 static AxArr *sorted_copy(AxVM *vm, AxValue seqv, AxValue sel) {
   AxArr *src = ax_to_seq(vm, seqv);
@@ -100,9 +404,7 @@ static AxArr *sorted_copy(AxVM *vm, AxValue seqv, AxValue sel) {
       AxFn *f = (AxFn *)sel.o;
       c.comparator = (!f->native && f->nparams >= 2) || (f->native && f->min_args >= 2);
     }
-    AxValue *tmp = malloc(sizeof(AxValue) * out->len);
-    merge_sort(&c, out->items, out->len, tmp);
-    free(tmp);
+    timsort(&c, out->items, out->len);
   }
   return out;
 }
@@ -142,61 +444,6 @@ static void json_quote(SB *sb, AxStr *s) {
   sb_addz(sb, "\"");
 }
 
-static void json_write(SB *sb, AxValue v, int indent, int depth) {
-  char pad[64];
-  switch (v.t) {
-    case AX_NULL: sb_addz(sb, "null"); return;
-    case AX_BOOL: sb_addz(sb, v.b ? "true" : "false"); return;
-    case AX_NUM: {
-      AxStr *s = ax_to_str(v);
-      if (isnan(v.num) || isinf(v.num)) sb_addz(sb, "null");
-      else sb_add(sb, s->data, s->len);
-      ax_release(ax_strv(s));
-      return;
-    }
-    case AX_STR: case AX_ATOM: json_quote(sb, (AxStr *)v.o); return;
-    case AX_BIG: sb->bigint = true; return;
-    case AX_ARR: {
-      AxArr *a = (AxArr *)v.o;
-      if (!a->len) { sb_addz(sb, "[]"); return; }
-      sb_addz(sb, "[");
-      for (uint32_t i = 0; i < a->len; i++) {
-        if (i) sb_addz(sb, ",");
-        if (indent) { sb_addz(sb, "\n"); snprintf(pad, sizeof pad, "%*s", indent * (depth + 1), ""); sb_addz(sb, pad); }
-        json_write(sb, a->items[i], indent, depth + 1);
-      }
-      if (indent) { sb_addz(sb, "\n"); snprintf(pad, sizeof pad, "%*s", indent * depth, ""); sb_addz(sb, pad); }
-      sb_addz(sb, "]");
-      return;
-    }
-    case AX_DICT: {
-      AxDict *d = (AxDict *)v.o;
-      if (!d->live && !d->type_tag) { sb_addz(sb, "{}"); return; }
-      sb_addz(sb, "{");
-      bool first = true;
-      if (d->type_tag) {
-        // A record writes its type first, as JSON.stringify does with the reference's `__type`.
-        if (indent) { sb_addz(sb, "\n"); snprintf(pad, sizeof pad, "%*s", indent * (depth + 1), ""); sb_addz(sb, pad); }
-        sb_addz(sb, indent ? "\"__type\": " : "\"__type\":");
-        json_quote(sb, d->type_tag);
-        first = false;
-      }
-      for (uint32_t i = 0; i < d->len; i++) {
-        if (d->entries[i].dead) continue;
-        if (!first) sb_addz(sb, ",");
-        first = false;
-        if (indent) { sb_addz(sb, "\n"); snprintf(pad, sizeof pad, "%*s", indent * (depth + 1), ""); sb_addz(sb, pad); }
-        json_quote(sb, d->entries[i].key);
-        sb_addz(sb, indent ? ": " : ":");
-        json_write(sb, d->entries[i].val, indent, depth + 1);
-      }
-      if (indent) { sb_addz(sb, "\n"); snprintf(pad, sizeof pad, "%*s", indent * depth, ""); sb_addz(sb, pad); }
-      sb_addz(sb, "}");
-      return;
-    }
-    default: sb_addz(sb, "null"); return;
-  }
-}
 
 typedef struct { const char *p; bool ok; } JP;
 
@@ -352,8 +599,24 @@ static char *re_translate(const char *pat) {
   bool in_class = false;
   for (size_t i = 0; i < n; i++) {
     char c = pat[i];
+    // JavaScript's [] matches nothing and [^] anything; POSIX has neither (a C string holds
+    // no NUL byte, so a class of every other byte stands in).
+    if (c == '[' && !in_class && (i == 0 || pat[i - 1] != '\\')) {
+      const char *cls = pat[i + 1] == ']' ? "[^\x01-\xff]" : (pat[i + 1] == '^' && pat[i + 2] == ']') ? "[\x01-\xff]" : NULL;
+      if (cls) { size_t cl = strlen(cls); memcpy(out + j, cls, cl); j += cl; i += pat[i + 1] == ']' ? 1 : 2; continue; }
+    }
     if (c == '[' && (i == 0 || pat[i - 1] != '\\')) in_class = true;
     else if (c == ']' && in_class) in_class = false;
+    // A brace that does not make a quantifier ({n}, {n,}, {n,m} after something to repeat) is
+    // a literal in JavaScript; POSIX would reject it.
+    if (c == '{' && !in_class) {
+      size_t k = i + 1;
+      bool digits = false;
+      while (pat[k] >= '0' && pat[k] <= '9') { k++; digits = true; }
+      if (digits && pat[k] == ',') { k++; while (pat[k] >= '0' && pat[k] <= '9') k++; }
+      bool quant = digits && pat[k] == '}' && j > 0 && out[j - 1] != '(' && out[j - 1] != '|';
+      if (!quant) { out[j++] = '\\'; out[j++] = '{'; continue; }
+    }
     if (c == '\\' && i + 1 < n) {
       char e = pat[++i];
       const char *rep = NULL;
@@ -377,6 +640,28 @@ static char *re_translate(const char *pat) {
   }
   out[j] = '\0';
   return out;
+}
+
+// A regex's flags, as new RegExp checks them: letters from "dgimsuyv", none twice (re_all and
+// re_sub add "g" first). Only "i" changes what POSIX matching does.
+static bool re_flags(AxVM *vm, AxValue patv, AxValue flagsv, bool add_g) {
+  AxStr *f = flagsv.t == AX_NULL ? ax_str_newz("") : ax_to_str(flagsv);
+  char buf[64];
+  snprintf(buf, sizeof buf, "%s%s", f->data, add_g && !strchr(f->data, 'g') ? "g" : "");
+  bool seen[128] = { 0 }, ok = strlen(f->data) < 60;
+  for (const char *c = buf; *c && ok; c++) {
+    ok = strchr("dgimsuyv", *c) && !seen[(unsigned char)*c];
+    if (ok) seen[(unsigned char)*c] = true;
+  }
+  ax_release(ax_strv(f));
+  if (!ok) {
+    AxStr *p = ax_to_str(patv);
+    char patbuf[256];
+    snprintf(patbuf, sizeof patbuf, "%s", p->data);
+    ax_release(ax_strv(p));
+    ax_throw(vm, "AX-REGEX", "bad regular expression /%s/: Invalid flags supplied to RegExp constructor '%s'", patbuf, buf);
+  }
+  return seen['i'];
 }
 
 static bool re_build(AxVM *vm, AxValue patv, regex_t *re, bool icase) {
@@ -484,9 +769,14 @@ NATIVE(n_eprint) {
 }
 
 NATIVE(n_len) {
+  // Strings, arrays, dicts (a record's fields), ranges, containers and vectors (components);
+  // anything else — a number, an atom, a function — has no length.
   AxValue v = ARG(0);
   switch (v.t) {
-    case AX_STR: case AX_ATOM: return ax_num(((AxStr *)v.o)->len);
+    case AX_STR: return ax_num(((AxStr *)v.o)->len);
+    case AX_VEC2: return ax_num(2);
+    case AX_VEC3: return ax_num(3);
+    case AX_QUAT: return ax_num(4);
     case AX_ARR: return ax_num(((AxArr *)v.o)->len);
     case AX_DICT: return ax_num(ax_dict_count((AxDict *)v.o));
     case AX_HOST: return ax_num(ax_host_len(v));
@@ -600,22 +890,23 @@ static double js_parse_float(const char *s, size_t len) {
   return v;
 }
 
-// int(s) is parseInt(s, 10) and float(s) parseFloat(s): NaN when there is no number.
+// int(s) is parseInt(s, 10) and float(s) parseFloat(s) of the text (a non-string as it
+// displays): NaN when there is no number.
 NATIVE(n_int) {
-  AxStr *s = ax_js_string(ARG(0));
+  AxStr *s = ax_to_str(ARG(0));
   double v = js_parse_int(s->data, s->len, 10);
   ax_release(ax_strv(s));
   return ax_num(v);
 }
 NATIVE(n_float) {
-  AxStr *s = ax_js_string(ARG(0));
+  AxStr *s = ax_to_str(ARG(0));
   double v = js_parse_float(s->data, s->len);
   ax_release(ax_strv(s));
   return ax_num(v);
 }
 // parse_int(s, radix): parseInt(String(s).trim(), radix || 10), null for NaN.
 NATIVE(n_parse_int) {
-  AxStr *s = ax_js_string(ARG(0));
+  AxStr *s = ax_to_str(ARG(0));
   double r = argc > 1 ? NUM(1) : 0;
   int radix = (r == 0 || isnan(r)) ? 10 : ax_to_int32(r);
   double v = js_parse_int(s->data, s->len, radix);
@@ -667,7 +958,7 @@ MATH1(n_log2, log2(x))
 MATH1(n_log10, log10(x))
 MATH1(n_log1p, log1p(x))
 MATH1(n_trunc, trunc(x))
-MATH1(n_sign, (x > 0) - (x < 0))
+MATH1(n_sign, isnan(x) ? NAN : x == 0 ? x : (x > 0) - (x < 0))   // Math.sign: NaN and -0 kept
 MATH1(n_fract, x - floor(x))
 MATH1(n_clamp01, x < 0 ? 0 : (x > 1 ? 1 : x))
 NATIVE(n_deg2rad) { no_big(vm, args, argc, 1); return ax_num(NUM(0) * M_PI / 180.0); }
@@ -689,33 +980,36 @@ NATIVE(n_e) { return ax_num(M_E); }
 NATIVE(n_inf) { return ax_num(INFINITY); }
 NATIVE(n_nan) { return ax_num(NAN); }
 
-NATIVE(n_min) {
+// Math.min / Math.max: NaN if any argument is NaN, and -0 below +0.
+static double js_min2(double a, double b) {
+  if (isnan(a) || isnan(b)) return NAN;
+  if (a == 0 && b == 0) return signbit(a) ? a : b;
+  return a < b ? a : b;
+}
+static double js_max2(double a, double b) {
+  if (isnan(a) || isnan(b)) return NAN;
+  if (a == 0 && b == 0) return signbit(a) ? b : a;
+  return a > b ? a : b;
+}
+static AxValue min_max(AxVM *vm, AxValue *args, int argc, bool max) {
+  AxValue *xs = args;
+  int n = argc;
   if (argc == 1 && args[0].t == AX_ARR) {
     AxArr *a = (AxArr *)args[0].o;
     if (!a->len) return ax_null();
-    for (uint32_t i = 0; i < a->len; i++) num_arg(vm, a->items[i]);   // Math.min(...xs)
-    double best = ax_to_num(a->items[0]);
-    for (uint32_t i = 1; i < a->len; i++) { double d = ax_to_num(a->items[i]); if (d < best) best = d; }
-    return ax_num(best);
+    xs = a->items;
+    n = (int)a->len;
   }
-  double best = INFINITY;
-  for (int i = 0; i < argc; i++) { double d = num_arg(vm, args[i]); if (d < best) best = d; }
+  double best = max ? -INFINITY : INFINITY;
+  for (int i = 0; i < n; i++) {
+    double d = num_arg(vm, xs[i]);
+    best = max ? js_max2(best, d) : js_min2(best, d);
+  }
   return ax_num(best);
 }
-NATIVE(n_max) {
-  if (argc == 1 && args[0].t == AX_ARR) {
-    AxArr *a = (AxArr *)args[0].o;
-    if (!a->len) return ax_null();
-    for (uint32_t i = 0; i < a->len; i++) num_arg(vm, a->items[i]);
-    double best = ax_to_num(a->items[0]);
-    for (uint32_t i = 1; i < a->len; i++) { double d = ax_to_num(a->items[i]); if (d > best) best = d; }
-    return ax_num(best);
-  }
-  double best = -INFINITY;
-  for (int i = 0; i < argc; i++) { double d = num_arg(vm, args[i]); if (d > best) best = d; }
-  return ax_num(best);
-}
-NATIVE(n_clamp) { double x = NUM(0), lo = NUM(1), hi = NUM(2); return ax_num(x < lo ? lo : (x > hi ? hi : x)); }
+NATIVE(n_min) { return min_max(vm, args, argc, false); }
+NATIVE(n_max) { return min_max(vm, args, argc, true); }
+NATIVE(n_clamp) { return ax_num(js_max2(NUM(1), js_min2(NUM(2), NUM(0)))); }   // Math.max(lo, Math.min(hi, x))
 NATIVE(n_lerp) { double a = NUM(0), b = NUM(1), t = NUM(2); return ax_num(a + (b - a) * t); }
 NATIVE(n_inv_lerp) { double a = NUM(0), b = NUM(1), v = NUM(2); return ax_num(a == b ? 0 : (v - a) / (b - a)); }
 NATIVE(n_map_range) {
@@ -755,46 +1049,57 @@ NATIVE(n_gcd) {
   return ax_num((double)a);
 }
 NATIVE(n_lcm) {
+  // Math.abs(a | 0) and the same for b, as the reference: NaN and fractions go through ToInt32.
   no_big(vm, args, argc, 2);
-  long a = (long)fabs(NUM(0)), b = (long)fabs(NUM(1));
+  int64_t a = llabs((int64_t)INT32(0)), b = llabs((int64_t)INT32(1));
   if (!a || !b) return ax_num(0);
-  long x = a, y = b;
-  while (y) { long t = y; y = x % y; x = t; }
-  return ax_num((double)((a / x) * b));
+  int64_t x = a, y = b;
+  while (y) { int64_t t = y; y = x % y; x = t; }
+  return ax_num((double)(a / x) * (double)b);
 }
 NATIVE(n_fact) {
-  long n = (long)floor(NUM(0));
-  if (n < 0) return ax_num(0);
+  double x = floor(NUM(0));
+  if (isnan(x)) return ax_num(NAN);
+  if (x < 0) return ax_num(0);
+  if (x > 170) return ax_num(INFINITY);   // past 170! a double is Infinity anyway
+  long n = (long)x;
   double r = 1;
   for (long i = 2; i <= n; i++) r *= (double)i;
   return ax_num(r);
 }
 NATIVE(n_comb) {
-  long n = (long)floor(NUM(0)), k = (long)floor(NUM(1));
-  if (k < 0 || k > n) return ax_num(0);
+  double nx = floor(NUM(0)), kx = floor(NUM(1));
+  if (isnan(nx) || isnan(kx)) return ax_num(NAN);
+  if (kx < 0 || kx > nx) return ax_num(0);
+  long n = (long)fmin(nx, 1e15), k = (long)kx;
   if (k > n - k) k = n - k;
   double r = 1;
   for (long i = 0; i < k; i++) r = r * (double)(n - i) / (double)(i + 1);
   return ax_num(floor(r + 0.5));
 }
 NATIVE(n_perm) {
-  long n = (long)floor(NUM(0)), k = (long)floor(NUM(1));
-  if (k < 0 || k > n) return ax_num(0);
+  double nx = floor(NUM(0)), kx = floor(NUM(1));
+  if (isnan(nx) || isnan(kx)) return ax_num(NAN);
+  if (kx < 0 || kx > nx) return ax_num(0);
+  long n = (long)fmin(nx, 1e15), k = (long)kx;
   double r = 1;
   for (long i = 0; i < k; i++) r *= (double)(n - i);
   return ax_num(r);
 }
 NATIVE(n_is_prime) {
-  long n = (long)floor(NUM(0));
-  if (n < 2) return ax_bool(false);
+  double x = floor(NUM(0));
+  if (!(x >= 2) || !isfinite(x)) return ax_bool(false);
+  long n = (long)x;
   if (n % 2 == 0) return ax_bool(n == 2);
   for (long i = 3; i * i <= n; i += 2) if (n % i == 0) return ax_bool(false);
   return ax_bool(true);
 }
 NATIVE(n_primes) {
-  long limit = (long)floor(NUM(0));
+  double lx = floor(NUM(0));
   AxArr *out = ax_arr_new(16);
-  if (limit < 2) return ax_arrv(out);
+  if (!(lx >= 2)) return ax_arrv(out);
+  if (lx > 1e8) ax_throw(vm, "AX-RUNTIME-000", "primes() limit %g is too large", lx);
+  long limit = (long)lx;
   char *sieve = calloc(limit + 1, 1);
   for (long i = 2; i <= limit; i++) {
     if (sieve[i]) continue;
@@ -814,7 +1119,7 @@ NATIVE(n_round_to) {
 // written as String(x) — the f-string `{x:.Nf}` code does exactly this.
 NATIVE(n_to_fixed) {
   double x = ax_to_num(ARG(0));
-  double d = argc > 1 && args[1].t != AX_NULL ? NUM(1) : 2;
+  double d = argc > 1 ? NUM(1) : 2;   // digits === undefined ? 2 : digits (null is 0)
   d = isnan(d) ? 0 : trunc(d);
   if (d < 0 || d > 100) ax_throw(vm, "AX-RUNTIME-000", "toFixed() digits argument must be between 0 and 100");
   char spec[16];
@@ -833,22 +1138,38 @@ NATIVE(n_to_bin) {
   b[j] = '\0';
   return ax_str_from(b);
 }
+// Math.trunc(n).toString(radix): exact digits for any double, "NaN"/"Infinity" as JavaScript
+// writes them, and radix 10 in Number's own notation (1e21 is "1e+21").
 NATIVE(n_to_base) {
   if (argc > 1 && args[1].t == AX_BIG) ax_throw(vm, "AX-RUNTIME-000", "%s", BIG_MIX);   // base | 0
-  long v = (long)trunc(NUM(0));
-  int base = (int)NUM(1);
+  double x = trunc(NUM(0));
+  int base = INT32(1);
   if (base < 2) base = 2;
   if (base > 36) base = 36;
-  char b[80];
-  int j = 0;
-  bool neg = v < 0;
-  unsigned long uv = neg ? (unsigned long)(-v) : (unsigned long)v;
-  if (!uv) b[j++] = '0';
-  while (uv) { int d = (int)(uv % base); b[j++] = (char)(d < 10 ? '0' + d : 'a' + d - 10); uv /= base; }
-  if (neg) b[j++] = '-';
-  b[j] = '\0';
-  for (int i = 0, k = j - 1; i < k; i++, k--) { char t = b[i]; b[i] = b[k]; b[k] = t; }
-  return ax_str_from(b);
+  if (!isfinite(x) || base == 10) return ax_strv(ax_to_str(ax_num(x)));
+  AxBig *b = ax_big_from_double(x);
+  bool neg = b->neg;
+  size_t cap = (size_t)b->n * 32 + 3, j = 0;
+  char *buf = malloc(cap);
+  AxBig *radix = ax_big_from_int(base);
+  b->neg = false;
+  while (!ax_big_is_zero(b)) {
+    AxBig *q, *r;
+    ax_big_divmod(b, radix, &q, &r);
+    int d = r->n ? (int)r->d[0] : 0;
+    buf[j++] = (char)(d < 10 ? '0' + d : 'a' + d - 10);
+    free(r);
+    free(b);
+    b = q;
+  }
+  free(b);
+  free(radix);
+  if (!j) buf[j++] = '0';
+  if (neg) buf[j++] = '-';
+  for (size_t a = 0, z = j - 1; a < z; a++, z--) { char t = buf[a]; buf[a] = buf[z]; buf[z] = t; }
+  AxValue out = ax_strv(ax_str_new(buf, j));
+  free(buf);
+  return out;
 }
 // JavaScript's 32-bit operators: operands through ToInt32, shift counts taken mod 32.
 NATIVE(n_band) { no_big(vm, args, argc, 2); return ax_num((double)(INT32(0) & INT32(1))); }
@@ -879,7 +1200,8 @@ NATIVE(n_prod) {
   double t = 1;
   for (uint32_t i = 0; i < a->len; i++) {
     AxValue k = ax_key_apply(vm, sel, a->items[i], i);
-    t *= ax_to_num(k);
+    double d = ax_to_num(k);
+    t *= isnan(d) ? 0 : d;   // Number(v) || 0
     ax_release(k);
   }
   ax_release(ax_arrv(a));
@@ -892,7 +1214,8 @@ NATIVE(n_mean) {
   double t = 0;
   for (uint32_t i = 0; i < a->len; i++) {
     AxValue k = ax_key_apply(vm, sel, a->items[i], i);
-    t += ax_to_num(k);
+    double d = ax_to_num(k);
+    t += isnan(d) ? 0 : d;   // Number(v) || 0
     ax_release(k);
   }
   double r = t / a->len;
@@ -959,7 +1282,7 @@ NATIVE(n_reversed) {
 }
 NATIVE(n_take) {
   AxArr *a = ax_to_seq(vm, ARG(0));
-  int64_t n = (int64_t)NUM(1);
+  int64_t n = ax_js_int(NUM(1));
   AxArr *out = ax_arr_new(n > 0 ? (uint32_t)n : 0);
   for (int64_t i = 0; i < n && i < (int64_t)a->len; i++) ax_arr_push(out, ax_copy(a->items[i]));
   ax_release(ax_arrv(a));
@@ -967,7 +1290,7 @@ NATIVE(n_take) {
 }
 NATIVE(n_drop) {
   AxArr *a = ax_to_seq(vm, ARG(0));
-  int64_t n = (int64_t)NUM(1);
+  int64_t n = ax_js_int(NUM(1));
   AxArr *out = ax_arr_new(4);
   for (int64_t i = n < 0 ? 0 : n; i < (int64_t)a->len; i++) ax_arr_push(out, ax_copy(a->items[i]));
   ax_release(ax_arrv(a));
@@ -1020,9 +1343,11 @@ NATIVE(n_reduce) {
   return acc;
 }
 NATIVE(n_each) {
+  // A callback, called as any function value is (a string names a function).
   AxArr *a = ax_to_seq(vm, ARG(0));
   for (uint32_t i = 0; i < a->len; i++) {
-    AxValue r = ax_key_apply(vm, ARG(1), a->items[i], i);
+    AxValue cargs[2] = { a->items[i], ax_num(i) };
+    AxValue r = ax_call(vm, ARG(1), cargs, 2);
     ax_release(r);
   }
   ax_release(ax_arrv(a));
@@ -1077,7 +1402,7 @@ NATIVE(n_all) {
 NATIVE(n_count) {
   AxArr *a = ax_to_seq(vm, ARG(0));
   double n = 0;
-  if (argc < 2) n = a->len;
+  if (argc < 2 || args[1].t == AX_NULL) n = a->len;
   else if (args[1].t == AX_FN) {
     for (uint32_t i = 0; i < a->len; i++) {
       AxValue k = ax_key_apply(vm, args[1], a->items[i], i);
@@ -1169,7 +1494,7 @@ NATIVE(n_enumerate) {
 }
 NATIVE(n_chunk) {
   AxArr *a = ax_to_seq(vm, ARG(0));
-  int64_t size = (int64_t)NUM(1);
+  int64_t size = ax_js_int(NUM(1));
   if (size < 1) size = 1;
   AxArr *out = ax_arr_new(4);
   for (uint32_t i = 0; i < a->len; i += size) {
@@ -1182,7 +1507,7 @@ NATIVE(n_chunk) {
 }
 NATIVE(n_windows) {
   AxArr *a = ax_to_seq(vm, ARG(0));
-  int64_t size = (int64_t)NUM(1);
+  int64_t size = ax_js_int(NUM(1));
   if (size < 1) size = 1;
   AxArr *out = ax_arr_new(4);
   for (int64_t i = 0; i + size <= (int64_t)a->len; i++) {
@@ -1203,7 +1528,7 @@ static void flatten_into(AxVM *vm, AxArr *out, AxValue v, int depth) {
 }
 NATIVE(n_flatten) {
   AxArr *out = ax_arr_new(8);
-  int depth = argc > 1 ? (int)NUM(1) : -1;
+  int depth = argc > 1 ? (int)fmin(ax_js_int(NUM(1)), 1 << 20) : -1;
   AxArr *a = ax_to_seq(vm, ARG(0));
   for (uint32_t i = 0; i < a->len; i++) flatten_into(vm, out, a->items[i], depth);
   ax_release(ax_arrv(a));
@@ -1321,7 +1646,7 @@ NATIVE(n_difference) {
   return ax_arrv(out);
 }
 NATIVE(n_grid) {
-  int64_t rows = (int64_t)ax_to_num(ARG(0)), cols = (int64_t)ax_to_num(ARG(1));   // Array.from({length})
+  int64_t rows = ax_js_int(ax_to_num(ARG(0))), cols = ax_js_int(ax_to_num(ARG(1)));   // Array.from({length})
   AxValue fill = ARG(2);
   AxArr *out = ax_arr_new(rows > 0 ? rows : 0);
   for (int64_t r = 0; r < rows; r++) {
@@ -1339,64 +1664,79 @@ NATIVE(n_grid) {
   return ax_arrv(out);
 }
 NATIVE(n_transpose) {
+  // Rows are whatever the library iterates (a number is a row of one); short rows pad with null.
   AxArr *m = ax_to_seq(vm, ARG(0));
+  AxArr **rows = malloc(sizeof(AxArr *) * (m->len ? m->len : 1));
   uint32_t cols = 0;
-  for (uint32_t i = 0; i < m->len; i++) if (m->items[i].t == AX_ARR && ((AxArr *)m->items[i].o)->len > cols) cols = ((AxArr *)m->items[i].o)->len;
+  for (uint32_t i = 0; i < m->len; i++) { rows[i] = ax_to_seq(vm, m->items[i]); if (rows[i]->len > cols) cols = rows[i]->len; }
   AxArr *out = ax_arr_new(cols);
   for (uint32_t c = 0; c < cols; c++) {
     AxArr *row = ax_arr_new(m->len);
-    for (uint32_t r = 0; r < m->len; r++) {
-      AxValue cell = ax_null();
-      if (m->items[r].t == AX_ARR) cell = ax_arr_get((AxArr *)m->items[r].o, c);
-      ax_arr_push(row, cell);
-    }
+    for (uint32_t r = 0; r < m->len; r++) ax_arr_push(row, ax_arr_get(rows[r], c));
     ax_arr_push(out, ax_arrv(row));
   }
+  for (uint32_t i = 0; i < m->len; i++) ax_release(ax_arrv(rows[i]));
+  free(rows);
   ax_release(ax_arrv(m));
   return ax_arrv(out);
 }
 
 // --- dicts ------------------------------------------------------------------------------------
 
-NATIVE(n_keys) {
-  AxValue v = ARG(0);
-  AxArr *out = ax_arr_new(4);
-  if (v.t == AX_DICT) {
-    AxDict *d = (AxDict *)v.o;
-    for (uint32_t i = 0; i < d->len; i++) {
-      if (d->entries[i].dead) continue;
-      ax_retain(ax_strv(d->entries[i].key));
-      ax_arr_push(out, ax_strv(d->entries[i].key));
+// The key/value view of a value, for the dict functions: a dict or record as it is, an array by
+// index ("0", "1", …), a vector by component; anything else is empty. Returns +1.
+static AxDict *dict_view(AxValue v) {
+  if (v.t == AX_DICT) { ax_retain(v); return (AxDict *)v.o; }
+  AxDict *d = ax_dict_new();
+  if (v.t == AX_ARR) {
+    AxArr *a = (AxArr *)v.o;
+    for (uint32_t i = 0; i < a->len; i++) {
+      char k[16];
+      snprintf(k, sizeof k, "%u", i);
+      AxStr *key = ax_internz(k);
+      ax_dict_set(d, key, ax_copy(a->items[i]));
+      ax_release(ax_strv(key));
+    }
+  } else if (v.t == AX_VEC2 || v.t == AX_VEC3 || v.t == AX_QUAT) {
+    AxVec *p = ax_vecp(v);
+    const char *names[4] = { "x", "y", "z", "w" };
+    double parts[4] = { p->x, p->y, p->z, p->w };
+    int n = v.t == AX_VEC2 ? 2 : v.t == AX_VEC3 ? 3 : 4;
+    for (int i = 0; i < n; i++) {
+      AxStr *key = ax_internz(names[i]);
+      ax_dict_set(d, key, ax_num(parts[i]));
+      ax_release(ax_strv(key));
     }
   }
+  return d;
+}
+#define DICT_EACH(d, i) for (uint32_t i = 0; i < (d)->len; i++) if (!(d)->entries[i].dead)
+
+NATIVE(n_keys) {
+  AxDict *d = dict_view(ARG(0));
+  AxArr *out = ax_arr_new(4);
+  DICT_EACH(d, i) { ax_retain(ax_strv(d->entries[i].key)); ax_arr_push(out, ax_strv(d->entries[i].key)); }
+  ax_release(ax_dictv(d));
   return ax_arrv(out);
 }
 NATIVE(n_values) {
-  AxValue v = ARG(0);
+  AxDict *d = dict_view(ARG(0));
   AxArr *out = ax_arr_new(4);
-  if (v.t == AX_DICT) {
-    AxDict *d = (AxDict *)v.o;
-    for (uint32_t i = 0; i < d->len; i++) {
-      if (d->entries[i].dead) continue;
-      ax_arr_push(out, ax_copy(d->entries[i].val));
-    }
-  }
+  DICT_EACH(d, i) ax_arr_push(out, ax_copy(d->entries[i].val));
+  ax_release(ax_dictv(d));
   return ax_arrv(out);
 }
 NATIVE(n_items) {
-  AxValue v = ARG(0);
+  AxDict *d = dict_view(ARG(0));
   AxArr *out = ax_arr_new(4);
-  if (v.t == AX_DICT) {
-    AxDict *d = (AxDict *)v.o;
-    for (uint32_t i = 0; i < d->len; i++) {
-      if (d->entries[i].dead) continue;
-      AxArr *pair = ax_arr_new(2);
-      ax_retain(ax_strv(d->entries[i].key));
-      ax_arr_push(pair, ax_strv(d->entries[i].key));
-      ax_arr_push(pair, ax_copy(d->entries[i].val));
-      ax_arr_push(out, ax_arrv(pair));
-    }
+  DICT_EACH(d, i) {
+    AxArr *pair = ax_arr_new(2);
+    ax_retain(ax_strv(d->entries[i].key));
+    ax_arr_push(pair, ax_strv(d->entries[i].key));
+    ax_arr_push(pair, ax_copy(d->entries[i].val));
+    ax_arr_push(out, ax_arrv(pair));
   }
+  ax_release(ax_dictv(d));
   return ax_arrv(out);
 }
 NATIVE(n_dict) {
@@ -1404,86 +1744,78 @@ NATIVE(n_dict) {
   AxDict *d = ax_dict_new();
   for (uint32_t i = 0; i < pairs->len; i++) {
     AxArr *p = ax_to_seq(vm, pairs->items[i]);
-    if (p->len >= 1) {
-      AxStr *ks = ax_to_str(p->items[0]);
-      AxStr *key = ax_intern(ks->data, ks->len);
-      ax_dict_set(d, key, p->len > 1 ? ax_copy(p->items[1]) : ax_null());
-      ax_release(ax_strv(key));
-      ax_release(ax_strv(ks));
-    }
+    AxStr *ks = ax_to_str(p->len ? p->items[0] : ax_null());
+    AxStr *key = ax_intern(ks->data, ks->len);
+    ax_dict_set(d, key, p->len > 1 ? ax_copy(p->items[1]) : ax_null());
+    ax_release(ax_strv(key));
+    ax_release(ax_strv(ks));
     ax_release(ax_arrv(p));
   }
   ax_release(ax_arrv(pairs));
   return ax_dictv(d);
 }
 NATIVE(n_merge) {
+  // A plain dict: records merge their fields, not their type.
   AxDict *out = ax_dict_new();
-  for (int i = 0; i < argc; i++) {
-    if (args[i].t != AX_DICT) continue;
-    AxDict *d = (AxDict *)args[i].o;
-    for (uint32_t e = 0; e < d->len; e++) {
-      if (d->entries[e].dead) continue;
-      ax_dict_set(out, d->entries[e].key, ax_copy(d->entries[e].val));
-    }
+  for (int a = 0; a < argc; a++) {
+    AxDict *d = dict_view(args[a]);
+    DICT_EACH(d, e) ax_dict_set(out, d->entries[e].key, ax_copy(d->entries[e].val));
+    ax_release(ax_dictv(d));
   }
   return ax_dictv(out);
 }
 NATIVE(n_has_key) {
-  if (ARG(0).t != AX_DICT) return ax_bool(false);
+  AxDict *d = dict_view(ARG(0));
   AxStr *k = ax_to_str(ARG(1));
-  bool has = ax_dict_has((AxDict *)args[0].o, k);
+  bool has = ax_dict_has(d, k);
   ax_release(ax_strv(k));
+  ax_release(ax_dictv(d));
   return ax_bool(has);
 }
 NATIVE(n_pick_keys) {
+  AxDict *src = dict_view(ARG(0));
   AxDict *out = ax_dict_new();
-  if (ARG(0).t == AX_DICT) {
-    AxArr *ks = ax_to_seq(vm, ARG(1));
-    for (uint32_t i = 0; i < ks->len; i++) {
-      AxStr *k = ax_to_str(ks->items[i]);
-      AxStr *key = ax_intern(k->data, k->len);
-      AxValue v;
-      if (ax_dict_get((AxDict *)args[0].o, key, &v)) ax_dict_set(out, key, v);
-      ax_release(ax_strv(key));
-      ax_release(ax_strv(k));
-    }
-    ax_release(ax_arrv(ks));
+  AxArr *ks = ax_to_seq(vm, ARG(1));
+  for (uint32_t i = 0; i < ks->len; i++) {
+    AxStr *k = ax_to_str(ks->items[i]);
+    AxStr *key = ax_intern(k->data, k->len);
+    AxValue v;
+    if (ax_dict_get(src, key, &v)) ax_dict_set(out, key, v);
+    ax_release(ax_strv(key));
+    ax_release(ax_strv(k));
   }
+  ax_release(ax_arrv(ks));
+  ax_release(ax_dictv(src));
   return ax_dictv(out);
 }
 NATIVE(n_omit_keys) {
+  AxDict *d = dict_view(ARG(0));
   AxDict *out = ax_dict_new();
-  if (ARG(0).t == AX_DICT) {
-    AxDict *d = (AxDict *)args[0].o;
-    AxArr *ks = ax_to_seq(vm, ARG(1));
-    for (uint32_t e = 0; e < d->len; e++) {
-      if (d->entries[e].dead) continue;
-      bool drop = false;
-      for (uint32_t i = 0; i < ks->len && !drop; i++) {
-        AxStr *k = ax_to_str(ks->items[i]);
-        drop = ax_str_eq(k, d->entries[e].key);
-        ax_release(ax_strv(k));
-      }
-      if (!drop) ax_dict_set(out, d->entries[e].key, ax_copy(d->entries[e].val));
-    }
-    ax_release(ax_arrv(ks));
+  AxDict *drop = ax_dict_new();
+  AxArr *ks = ax_to_seq(vm, ARG(1));
+  for (uint32_t i = 0; i < ks->len; i++) {
+    AxStr *k = ax_to_str(ks->items[i]);
+    ax_dict_set(drop, k, ax_null());
+    ax_release(ax_strv(k));
   }
+  DICT_EACH(d, e) if (!ax_dict_has(drop, d->entries[e].key)) ax_dict_set(out, d->entries[e].key, ax_copy(d->entries[e].val));
+  ax_release(ax_arrv(ks));
+  ax_release(ax_dictv(drop));
+  ax_release(ax_dictv(d));
   return ax_dictv(out);
 }
 NATIVE(n_invert) {
+  AxDict *d = dict_view(ARG(0));
   AxDict *out = ax_dict_new();
-  if (ARG(0).t == AX_DICT) {
-    AxDict *d = (AxDict *)args[0].o;
-    for (uint32_t e = 0; e < d->len; e++) {
-      if (d->entries[e].dead) continue;
-      AxStr *vs = ax_to_str(d->entries[e].val);
-      AxStr *key = ax_intern(vs->data, vs->len);
-      ax_retain(ax_strv(d->entries[e].key));
-      ax_dict_set(out, key, ax_strv(d->entries[e].key));
-      ax_release(ax_strv(key));
-      ax_release(ax_strv(vs));
-    }
+  DICT_EACH(d, e) {
+    AxStr *vs = ax_to_str(d->entries[e].val);
+    AxStr *key = ax_intern(vs->data, vs->len);
+    ax_retain(ax_strv(d->entries[e].key));
+    ax_dict_set(out, key, ax_strv(d->entries[e].key));
+    ax_release(ax_strv(key));
+    ax_release(ax_strv(vs));
   }
+  ax_release(ax_dictv(d));
   return ax_dictv(out);
 }
 static AxValue deep_clone(AxValue v) {
@@ -1511,6 +1843,9 @@ NATIVE(n_clone) { return deep_clone(ARG(0)); }
 // JSON.stringify(a) === JSON.stringify(b); where that throws (a big inside), a === b.
 NATIVE(n_deep_eq) {
   AxValue a = ARG(0), b = ARG(1);
+  // A function has no JSON at all (undefined), so two functions compare equal and a function
+  // equals nothing else.
+  if (a.t == AX_FN || b.t == AX_FN) return ax_bool(a.t == b.t);
   char *ja = NULL, *jb = NULL;
   bool oka = ax_json_write_checked(a, 0, &ja), okb = ax_json_write_checked(b, 0, &jb);
   bool eq;
@@ -1558,7 +1893,7 @@ NATIVE(n_chr) {
   return ax_strv(ax_str_new(b, n));
 }
 NATIVE(n_lines) {
-  AxStr *s = arg_str(ARG(0));
+  AxStr *s = ARG(0).t == AX_NULL ? ax_str_newz("") : arg_str(ARG(0));
   AxArr *out = ax_arr_new(4);
   uint32_t start = 0;
   for (uint32_t i = 0; i <= s->len; i++) {
@@ -1573,7 +1908,7 @@ NATIVE(n_lines) {
   return ax_arrv(out);
 }
 NATIVE(n_words) {
-  AxStr *s = arg_str(ARG(0));
+  AxStr *s = ARG(0).t == AX_NULL ? ax_str_newz("") : arg_str(ARG(0));
   AxArr *out = ax_arr_new(4);
   uint32_t i = 0;
   while (i < s->len) {
@@ -1586,7 +1921,7 @@ NATIVE(n_words) {
   return ax_arrv(out);
 }
 NATIVE(n_chars) {
-  AxStr *s = arg_str(ARG(0));
+  AxStr *s = ARG(0).t == AX_NULL ? ax_str_newz("") : arg_str(ARG(0));
   AxArr *out = ax_arr_new(s->len);
   for (uint32_t i = 0; i < s->len; i++) ax_arr_push(out, ax_strv(ax_str_new(s->data + i, 1)));
   ax_release(ax_strv(s));
@@ -1601,12 +1936,14 @@ NATIVE(n_capitalize) {
 }
 NATIVE(n_title) {
   AxStr *s = arg_str(ARG(0));
+  // The reference's s.replace(/\w\S*/g, …): each run from a word character to the next white
+  // space is capitalized — the first character up, the rest down.
   AxStr *out = ax_str_new(s->data, s->len);
-  bool boundary = true;
-  for (uint32_t i = 0; i < out->len; i++) {
-    if (isspace((unsigned char)out->data[i])) { boundary = true; continue; }
-    out->data[i] = (char)(boundary ? toupper((unsigned char)out->data[i]) : tolower((unsigned char)out->data[i]));
-    boundary = false;
+  for (uint32_t i = 0; i < out->len;) {
+    unsigned char c = (unsigned char)out->data[i];
+    if (!(isalnum(c) || c == '_')) { i++; continue; }
+    out->data[i] = (char)toupper(c);
+    for (i++; i < out->len && !isspace((unsigned char)out->data[i]); i++) out->data[i] = (char)tolower((unsigned char)out->data[i]);
   }
   ax_release(ax_strv(s));
   return ax_strv(out);
@@ -1645,35 +1982,53 @@ NATIVE(n_b64_encode) {
   ax_release(ax_strv(s));
   return r;
 }
+// Bytes as Node's toString('utf8') reads them (the WHATWG decoder): each ill-formed sequence —
+// the longest prefix of one that could still have been valid — becomes one U+FFFD.
+static AxStr *utf8_repair(const uint8_t *b, size_t n) {
+  char *out = malloc(n * 3 + 1);
+  size_t j = 0;
+  for (size_t i = 0; i < n;) {
+    uint8_t c = b[i];
+    if (c < 0x80) { out[j++] = (char)c; i++; continue; }
+    int need = c >= 0xC2 && c <= 0xDF ? 1 : c >= 0xE0 && c <= 0xEF ? 2 : c >= 0xF0 && c <= 0xF4 ? 3 : 0;
+    uint8_t lo = 0x80, hi = 0xBF;
+    if (c == 0xE0) lo = 0xA0; else if (c == 0xED) hi = 0x9F; else if (c == 0xF0) lo = 0x90; else if (c == 0xF4) hi = 0x8F;
+    size_t k = i + 1;
+    int got = 0;
+    while (need && got < need && k < n) {
+      uint8_t d = b[k];
+      if (got == 0 ? (d < lo || d > hi) : (d < 0x80 || d > 0xBF)) break;
+      k++;
+      got++;
+    }
+    if (need && got == need) { memcpy(out + j, b + i, k - i); j += k - i; i = k; continue; }
+    memcpy(out + j, "\xEF\xBF\xBD", 3);
+    j += 3;
+    i = need ? k : i + 1;
+  }
+  AxStr *s = ax_str_new(out, j);
+  free(out);
+  return s;
+}
+
 NATIVE(n_b64_decode) {
   AxStr *s = arg_str(ARG(0));
-  int rev[256];
-  for (int i = 0; i < 256; i++) rev[i] = -1;
-  for (int i = 0; i < 64; i++) rev[(unsigned char)B64[i]] = i;
-  char *out = malloc(s->len + 1);
-  size_t j = 0;
-  unsigned buf = 0;
-  int bits = 0;
-  for (uint32_t i = 0; i < s->len; i++) {
-    int d = rev[(unsigned char)s->data[i]];
-    if (d < 0) continue;
-    buf = (buf << 6) | (unsigned)d;
-    bits += 6;
-    if (bits >= 8) { bits -= 8; out[j++] = (char)((buf >> bits) & 0xFF); }
-  }
-  out[j] = '\0';
-  AxValue r = ax_strv(ax_str_new(out, j));
-  free(out);
+  uint8_t *bytes = NULL;
+  size_t nb = 0;
+  if (!ax_base64_decode(s->data, s->len, &bytes, &nb)) { bytes = NULL; nb = 0; }
+  AxStr *r = utf8_repair(bytes ? bytes : (const uint8_t *)"", nb);
+  free(bytes);
   ax_release(ax_strv(s));
-  return r;
+  return ax_strv(r);
 }
+// JSON.stringify(v, null, pretty ? 2 : undefined) through the one JSON writer the runtime has
+// (vectors are {"x":…}, functions left out); a big cannot be written, which the reference
+// reports as this marker.
 NATIVE(n_to_json) {
-  SB sb = {0};
-  sb_add(&sb, "", 0);
-  json_write(&sb, ARG(0), (argc > 1 && ax_truthy(args[1])) ? 2 : 0, 0);
-  // JSON.stringify throws on a big, and the reference returns this marker for any failure.
-  AxValue r = sb.bigint ? ax_str_from("<circular>") : ax_strv(ax_str_new(sb.buf, sb.len));
-  free(sb.buf);
+  char *json = NULL;
+  bool ok = ax_json_write_checked(ARG(0), argc > 1 && ax_truthy(args[1]) ? 2 : 0, &json);
+  AxValue r = ok ? ax_str_from(json) : ax_str_from("<circular>");
+  free(json);
   return r;
 }
 // Parse JSON text into a value (dicts for objects); false when it is not valid JSON.
@@ -1702,7 +2057,7 @@ NATIVE(n_from_json) {
 NATIVE(n_re_test) {
   AxStr *s = arg_str(ARG(0));
   regex_t re;
-  bool icase = argc > 2 && ax_truthy(args[2]);
+  bool icase = re_flags(vm, ARG(1), ARG(2), false);
   re_build(vm, ARG(1), &re, icase);
   bool m = regexec(&re, s->data, 0, NULL, 0) == 0;
   regfree(&re);
@@ -1712,7 +2067,7 @@ NATIVE(n_re_test) {
 NATIVE(n_re_match) {
   AxStr *s = arg_str(ARG(0));
   regex_t re;
-  re_build(vm, ARG(1), &re, argc > 2 && ax_truthy(args[2]));
+  re_build(vm, ARG(1), &re, re_flags(vm, ARG(1), ARG(2), false));
   regmatch_t m[16];
   AxValue out = ax_null();
   if (regexec(&re, s->data, 16, m, 0) == 0) out = re_match_record(s->data, m, (int)re.re_nsub);
@@ -1723,7 +2078,7 @@ NATIVE(n_re_match) {
 NATIVE(n_re_all) {
   AxStr *s = arg_str(ARG(0));
   regex_t re;
-  re_build(vm, ARG(1), &re, argc > 2 && ax_truthy(args[2]));
+  re_build(vm, ARG(1), &re, re_flags(vm, ARG(1), ARG(2), true));
   AxArr *out = ax_arr_new(4);
   regmatch_t m[16];
   const char *p = s->data;
@@ -1747,7 +2102,7 @@ NATIVE(n_re_sub) {
   AxStr *s = arg_str(ARG(0));
   AxStr *rep = arg_str(ARG(2));
   regex_t re;
-  re_build(vm, ARG(1), &re, argc > 3 && ax_truthy(args[3]));
+  re_build(vm, ARG(1), &re, re_flags(vm, ARG(1), ARG(3), true));
   SB sb = {0};
   sb_add(&sb, "", 0);
   regmatch_t m[16];
@@ -1780,7 +2135,7 @@ NATIVE(n_re_sub) {
 NATIVE(n_re_split) {
   AxStr *s = arg_str(ARG(0));
   regex_t re;
-  re_build(vm, ARG(1), &re, argc > 2 && ax_truthy(args[2]));
+  re_build(vm, ARG(1), &re, re_flags(vm, ARG(1), ARG(2), false));
   AxArr *out = ax_arr_new(4);
   regmatch_t m[1];
   size_t off = 0;
@@ -2211,6 +2566,45 @@ NATIVE(n_check_eq) {
 
 static bool name_is(AxStr *n, const char *s) { return strcmp(n->data, s) == 0; }
 
+// A method's selector is checked before any element is seen, as the reference builds it first:
+// null (or none), a field name, or something callable — `[].map(2)` is an error, not [].
+static void method_selector(AxVM *vm, AxValue sel) {
+  if (sel.t == AX_NULL || sel.t == AX_STR || sel.t == AX_ATOM || sel.t == AX_FN) return;
+  ax_throw(vm, "AX-CALL-001", "value of type %s is not callable", ax_type_name(sel));
+}
+// The selector applied to a dict entry: (value, key).
+static AxValue selector_apply_kv(AxVM *vm, AxValue sel, AxValue v, AxStr *k) {
+  if (sel.t == AX_NULL) return ax_copy(v);
+  bool is_fn = sel.t == AX_FN;
+  if (!is_fn && sel.t == AX_ATOM) {
+    AxValue f;
+    if (ax_scope_lookup(vm->builtins, (AxStr *)sel.o, &f)) { is_fn = f.t == AX_FN; ax_release(f); }
+  }
+  if (is_fn) {
+    AxValue kv = ax_strv(k);
+    AxValue cargs[2] = { v, kv };
+    return ax_call(vm, sel, cargs, 2);
+  }
+  return ax_key_apply(vm, sel, v, 0);
+}
+// JavaScript's === (includes: SameValueZero, where NaN equals NaN): values by value, containers
+// by identity — [[1]].includes([1]) is false.
+static bool js_same(AxValue a, AxValue b, bool nan_equal) {
+  if (a.t != b.t) return false;
+  switch (a.t) {
+    case AX_NULL: return true;
+    case AX_BOOL: return a.b == b.b;
+    case AX_NUM: return a.num == b.num || (nan_equal && isnan(a.num) && isnan(b.num));
+    case AX_STR: return ax_str_eq((AxStr *)a.o, (AxStr *)b.o);
+    case AX_BIG: return ax_big_cmp((AxBig *)a.o, (AxBig *)b.o) == 0;
+    default: return a.o == b.o;
+  }
+}
+// Missing arguments of a string method read as JavaScript's undefined does: "undefined".
+static AxStr *method_text(AxValue *args, int argc, int i) {
+  return i < argc ? ax_to_str(args[i]) : ax_str_newz("undefined");
+}
+
 AxValue ax_method_call(AxVM *vm, AxValue obj, AxStr *name, AxValue *args, int argc) {
   // A range takes the array methods, as the array it stands for: range(0, n).map(f).
   if (obj.t == AX_RANGE) {
@@ -2247,6 +2641,19 @@ AxValue ax_method_call(AxVM *vm, AxValue obj, AxStr *name, AxValue *args, int ar
       if (!name_is(name, "trim_start")) while (b > a && isspace((unsigned char)s->data[b - 1])) b--;
       return ax_strv(ax_str_new(s->data + a, b - a));
     }
+    if (name_is(name, "split") && argc == 0) {
+      AxArr *out = ax_arr_new(1);   // split() with no separator: the whole string
+      ax_retain(obj);
+      ax_arr_push(out, obj);
+      return ax_arrv(out);
+    }
+    if (name_is(name, "match")) {
+      // String.prototype.match with a pattern given as text: the first match, as re_match.
+      AxValue margs[2] = { obj, argc ? args[0] : ax_str_from("") };
+      AxValue r = n_re_match(vm, NULL, margs, 2);
+      if (!argc) ax_release(margs[1]);
+      return r;
+    }
     if (name_is(name, "split")) {
       AxStr *sep = argc ? ax_to_str(args[0]) : ax_str_newz("");
       AxArr *out = ax_arr_new(4);
@@ -2269,13 +2676,17 @@ AxValue ax_method_call(AxVM *vm, AxValue obj, AxStr *name, AxValue *args, int ar
       return ax_arrv(out);
     }
     if (name_is(name, "replace") || name_is(name, "replace_all")) {
-      AxStr *from = argc ? ax_to_str(args[0]) : ax_str_newz("");
-      AxStr *to = argc > 1 ? ax_to_str(args[1]) : ax_str_newz("");
+      AxStr *from = method_text(args, argc, 0);
+      AxStr *to = argc > 1 && args[1].t != AX_NULL ? ax_to_str(args[1]) : ax_str_newz("");
       SB sb = {0};
       sb_add(&sb, "", 0);
       bool all = name_is(name, "replace_all");
       bool done = false;
+      // An empty pattern matches before the first character (replace) or between every two
+      // (replace_all, which is split("").join(to)).
+      if (!from->len && !all) sb_add(&sb, to->data, to->len);
       for (uint32_t i = 0; i < s->len; ) {
+        if (!from->len && all && i) sb_add(&sb, to->data, to->len);
         if (from->len && !(done && !all) && i + from->len <= s->len && memcmp(s->data + i, from->data, from->len) == 0) {
           sb_add(&sb, to->data, to->len);
           i += from->len;
@@ -2292,40 +2703,49 @@ AxValue ax_method_call(AxVM *vm, AxValue obj, AxStr *name, AxValue *args, int ar
       return r;
     }
     if (name_is(name, "startsWith")) {
-      AxStr *p = argc ? ax_to_str(args[0]) : ax_str_newz("");
+      AxStr *p = method_text(args, argc, 0);
       bool r = p->len <= s->len && memcmp(s->data, p->data, p->len) == 0;
       ax_release(ax_strv(p));
       return ax_bool(r);
     }
     if (name_is(name, "endsWith")) {
-      AxStr *p = argc ? ax_to_str(args[0]) : ax_str_newz("");
+      AxStr *p = method_text(args, argc, 0);
       bool r = p->len <= s->len && memcmp(s->data + s->len - p->len, p->data, p->len) == 0;
       ax_release(ax_strv(p));
       return ax_bool(r);
     }
     if (name_is(name, "includes") || name_is(name, "contains")) {
-      AxStr *p = argc ? ax_to_str(args[0]) : ax_str_newz("");
+      AxStr *p = method_text(args, argc, 0);
       bool r = p->len == 0 || strstr(s->data, p->data) != NULL;
       ax_release(ax_strv(p));
       return ax_bool(r);
     }
     if (name_is(name, "indexOf")) {
-      AxStr *p = argc ? ax_to_str(args[0]) : ax_str_newz("");
+      AxStr *p = method_text(args, argc, 0);
       const char *hit = p->len ? strstr(s->data, p->data) : s->data;
       double idx = hit ? (double)(hit - s->data) : -1;
       ax_release(ax_strv(p));
       return ax_num(idx);
     }
     if (name_is(name, "count")) {
-      AxStr *p = argc ? ax_to_str(args[0]) : ax_str_newz("");
+      AxStr *p = method_text(args, argc, 0);
       double n = 0;
       if (p->len) for (uint32_t i = 0; i + p->len <= s->len; ) { if (memcmp(s->data + i, p->data, p->len) == 0) { n++; i += p->len; } else i++; }
       ax_release(ax_strv(p));
       return ax_num(n);
     }
     if (name_is(name, "repeat")) {
-      int64_t n = argc ? (int64_t)ax_to_num(args[0]) : 0;
-      if (n < 0) n = 0;
+      double c = argc ? ax_to_num(args[0]) : 0;
+      if (isnan(c)) c = 0;
+      if (c < 0 || isinf(c)) {
+        AxStr *cs = ax_to_str(ax_num(c));
+        char msg[64];
+        snprintf(msg, sizeof msg, "Invalid count value: %s", cs->data);
+        ax_release(ax_strv(cs));
+        ax_throw(vm, "AX-RUNTIME-000", "%s", msg);
+      }
+      int64_t n = ax_js_int(c);
+      if (s->len && (double)n * s->len > 536870888.0) ax_throw(vm, "AX-RUNTIME-000", "Invalid string length");
       SB sb = {0};
       sb_add(&sb, "", 0);
       for (int64_t i = 0; i < n; i++) sb_add(&sb, s->data, s->len);
@@ -2334,8 +2754,8 @@ AxValue ax_method_call(AxVM *vm, AxValue obj, AxStr *name, AxValue *args, int ar
       return r;
     }
     if (name_is(name, "slice")) {
-      int64_t a = argc ? (int64_t)ax_to_num(args[0]) : 0;
-      int64_t b = argc > 1 && args[1].t != AX_NULL ? (int64_t)ax_to_num(args[1]) : (int64_t)s->len;
+      int64_t a = argc ? ax_js_int(ax_to_num(args[0])) : 0;
+      int64_t b = argc > 1 && args[1].t != AX_NULL ? ax_js_int(ax_to_num(args[1])) : (int64_t)s->len;
       if (a < 0) a += s->len;
       if (b < 0) b += s->len;
       if (a < 0) a = 0;
@@ -2344,33 +2764,42 @@ AxValue ax_method_call(AxVM *vm, AxValue obj, AxStr *name, AxValue *args, int ar
       return ax_strv(ax_str_new(s->data + a, (size_t)(b - a)));
     }
     if (name_is(name, "padStart") || name_is(name, "padEnd")) {
-      int64_t want = argc ? (int64_t)ax_to_num(args[0]) : 0;
-      AxStr *padc = argc > 1 ? ax_to_str(args[1]) : ax_str_newz(" ");
-      SB sb = {0};
-      sb_add(&sb, "", 0);
+      // String.prototype.padStart/padEnd: the fill (a space when absent or empty) repeats and is
+      // cut to fit; the target is a length (NaN and negatives are 0).
+      int64_t want = argc ? ax_js_int(ax_to_num(args[0])) : 0;
+      AxStr *fill = (argc > 1 && args[1].t != AX_NULL) ? ax_to_str(args[1]) : ax_str_newz(" ");
+      if (!fill->len) { ax_release(ax_strv(fill)); fill = ax_str_newz(" "); }
+      if (want > 536870888) ax_throw(vm, "AX-RUNTIME-000", "Invalid string length");
       int64_t need = want - (int64_t)s->len;
       if (need < 0) need = 0;
-      if (name_is(name, "padStart")) { for (int64_t i = 0; i < need; i++) sb_add(&sb, padc->len ? padc->data : " ", 1); sb_add(&sb, s->data, s->len); }
-      else { sb_add(&sb, s->data, s->len); for (int64_t i = 0; i < need; i++) sb_add(&sb, padc->len ? padc->data : " ", 1); }
+      SB sb = {0};
+      sb_add(&sb, "", 0);
+      if (!name_is(name, "padStart")) sb_add(&sb, s->data, s->len);
+      for (int64_t k = 0; k < need; k++) sb_add(&sb, fill->data + (k % fill->len), 1);
+      if (name_is(name, "padStart")) sb_add(&sb, s->data, s->len);
       AxValue r = ax_strv(ax_str_new(sb.buf, sb.len));
       free(sb.buf);
-      ax_release(ax_strv(padc));
+      ax_release(ax_strv(fill));
       return r;
     }
     if (name_is(name, "charAt")) {
-      int64_t i = argc ? (int64_t)ax_to_num(args[0]) : 0;
+      int64_t i = argc ? ax_js_int(ax_to_num(args[0])) : 0;
       if (i < 0 || i >= (int64_t)s->len) return ax_str_from("");
       return ax_strv(ax_str_new(s->data + i, 1));
     }
     if (name_is(name, "charCodeAt")) {
-      int64_t i = argc ? (int64_t)ax_to_num(args[0]) : 0;
-      if (i < 0 || i >= (int64_t)s->len) return ax_null();
+      int64_t i = argc ? ax_js_int(ax_to_num(args[0])) : 0;
+      if (i < 0 || i >= (int64_t)s->len) return ax_num(NAN);
       return ax_num((unsigned char)s->data[i]);
     }
     if (name_is(name, "to_int") || name_is(name, "to_num")) {
-      char *end = NULL;
-      double d = name_is(name, "to_int") ? (double)strtol(s->data, &end, argc ? (int)ax_to_num(args[0]) : 10) : strtod(s->data, &end);
-      return end == s->data ? ax_null() : ax_num(d);
+      // parseInt(s.trim(), radix || 10) / Number(s.trim()), null for NaN.
+      double d;
+      if (name_is(name, "to_int")) {
+        double r = argc ? ax_to_num(args[0]) : 0;
+        d = js_parse_int(s->data, s->len, (r == 0 || isnan(r)) ? 10 : ax_to_int32(r));
+      } else d = ax_to_num(obj);
+      return isnan(d) ? ax_null() : ax_num(d);
     }
     if (name_is(name, "is_empty")) return ax_bool(s->len == 0);
     // Function forms that read naturally as methods.
@@ -2431,8 +2860,8 @@ AxValue ax_method_call(AxVM *vm, AxValue obj, AxStr *name, AxValue *args, int ar
       return r;
     }
     if (name_is(name, "slice")) {
-      int64_t s0 = argc ? (int64_t)ax_to_num(args[0]) : 0;
-      int64_t e0 = argc > 1 && args[1].t != AX_NULL ? (int64_t)ax_to_num(args[1]) : (int64_t)a->len;
+      int64_t s0 = argc ? ax_js_int(ax_to_num(args[0])) : 0;
+      int64_t e0 = argc > 1 && args[1].t != AX_NULL ? ax_js_int(ax_to_num(args[1])) : (int64_t)a->len;
       if (s0 < 0) s0 += a->len;
       if (e0 < 0) e0 += a->len;
       if (s0 < 0) s0 = 0;
@@ -2441,13 +2870,55 @@ AxValue ax_method_call(AxVM *vm, AxValue obj, AxStr *name, AxValue *args, int ar
       for (int64_t i = s0; i < e0; i++) ax_arr_push(out, ax_copy(a->items[i]));
       return ax_arrv(out);
     }
+    // includes/indexOf/lastIndexOf compare as JavaScript does: by value for numbers, text and
+    // bigs, by identity for containers (a missing argument looks for null).
+    AxValue needle = argc ? args[0] : ax_null();
     if (name_is(name, "includes") || name_is(name, "contains")) {
-      for (uint32_t i = 0; i < a->len; i++) if (argc && ax_equals(a->items[i], args[0])) return ax_bool(true);
+      for (uint32_t i = 0; i < a->len; i++) if (js_same(a->items[i], needle, true)) return ax_bool(true);
       return ax_bool(false);
     }
     if (name_is(name, "indexOf")) {
-      for (uint32_t i = 0; i < a->len; i++) if (argc && ax_equals(a->items[i], args[0])) return ax_num(i);
+      for (uint32_t i = 0; i < a->len; i++) if (js_same(a->items[i], needle, false)) return ax_num(i);
       return ax_num(-1);
+    }
+    if (name_is(name, "lastIndexOf")) {
+      for (uint32_t i = a->len; i-- > 0;) if (js_same(a->items[i], needle, false)) return ax_num(i);
+      return ax_num(-1);
+    }
+    if (name_is(name, "keys") || name_is(name, "values") || name_is(name, "entries")) {
+      AxValue one[1] = { obj };
+      return name_is(name, "keys") ? n_keys(vm, NULL, one, 1) : name_is(name, "values") ? n_values(vm, NULL, one, 1) : n_items(vm, NULL, one, 1);
+    }
+    if (name_is(name, "fill")) {
+      // Array.prototype.fill(value, start, end): relative indices, the array itself returned.
+      int64_t n = a->len;
+      int64_t st = argc > 1 ? ax_js_int(ax_to_num(args[1])) : 0, en = argc > 2 ? ax_js_int(ax_to_num(args[2])) : n;
+      if (st < 0) st = st + n < 0 ? 0 : st + n; else if (st > n) st = n;
+      if (en < 0) en = en + n < 0 ? 0 : en + n; else if (en > n) en = n;
+      for (int64_t i = st; i < en; i++) { ax_release(a->items[i]); a->items[i] = argc ? ax_copy(args[0]) : ax_null(); }
+      ax_retain(obj);
+      return obj;
+    }
+    if (name_is(name, "splice")) {
+      // splice(start, count, …items): the removed elements; count is always given (a missing one
+      // is 0, as the reference passes it through).
+      int64_t n = a->len;
+      int64_t st = argc ? ax_js_int(ax_to_num(args[0])) : 0;
+      if (st < 0) st = st + n < 0 ? 0 : st + n; else if (st > n) st = n;
+      int64_t dc = argc > 1 ? ax_js_int(ax_to_num(args[1])) : 0;
+      if (dc < 0) dc = 0;
+      if (dc > n - st) dc = n - st;
+      AxArr *removed = ax_arr_new((uint32_t)dc);
+      for (int64_t i = 0; i < dc; i++) ax_arr_push(removed, a->items[st + i]);   // ownership moves
+      int ins = argc > 2 ? argc - 2 : 0;
+      AxArr *rest = ax_arr_new((uint32_t)(n - st - dc));
+      for (int64_t i = st + dc; i < n; i++) ax_arr_push(rest, a->items[i]);
+      a->len = (uint32_t)st;
+      for (int i = 0; i < ins; i++) ax_arr_push(a, ax_copy(args[2 + i]));
+      for (uint32_t i = 0; i < rest->len; i++) ax_arr_push(a, rest->items[i]);
+      rest->len = 0;
+      ax_release(ax_arrv(rest));
+      return ax_arrv(removed);
     }
     if (name_is(name, "reverse")) {
       for (uint32_t i = 0, j = a->len ? a->len - 1 : 0; i < j; i++, j--) { AxValue t = a->items[i]; a->items[i] = a->items[j]; a->items[j] = t; }
@@ -2456,18 +2927,39 @@ AxValue ax_method_call(AxVM *vm, AxValue obj, AxStr *name, AxValue *args, int ar
     }
     if (name_is(name, "sort")) {
       AxValue sel = argc ? args[0] : ax_null();
+      method_selector(vm, sel);
       SortCtx c = { vm, sel, false };
       if (sel.t == AX_FN) {
         AxFn *f = (AxFn *)sel.o;
         c.comparator = (!f->native && f->nparams >= 2) || (f->native && f->min_args >= 2);
       }
       if (a->len > 1) {
-        AxValue *tmp = malloc(sizeof(AxValue) * a->len);
-        merge_sort(&c, a->items, a->len, tmp);
-        free(tmp);
+        timsort(&c, a->items, a->len);
       }
       ax_retain(obj);
       return obj;
+    }
+    // Methods that take a selector check it before looking at any element.
+    static const char *const selector_methods[] = { "map", "filter", "reject", "find", "find_index", "findIndex", "each",
+      "forEach", "every", "all", "some", "any", "flat_map", "flatMap", "sum", "min", "max", "sort_by", "group_by", "uniq", NULL };
+    for (int i = 0; selector_methods[i]; i++) if (name_is(name, selector_methods[i])) { method_selector(vm, argc ? args[0] : ax_null()); break; }
+    if (name_is(name, "each") || name_is(name, "forEach")) {
+      AxValue sel = argc ? args[0] : ax_null();
+      for (uint32_t i = 0; i < a->len; i++) ax_release(ax_key_apply(vm, sel, a->items[i], i));
+      return ax_null();
+    }
+    if (name_is(name, "count")) {
+      // No argument: the length; a function: how many it accepts; anything else, null
+      // included: how many equal it.
+      if (!argc) return ax_num(a->len);
+      AxValue fn;
+      bool callable = args[0].t == AX_FN || (args[0].t == AX_ATOM && ax_scope_lookup(vm->builtins, (AxStr *)args[0].o, &fn) && (ax_release(fn), fn.t == AX_FN));
+      double n = 0;
+      for (uint32_t i = 0; i < a->len; i++) {
+        if (callable) { AxValue k = ax_key_apply(vm, args[0], a->items[i], i); n += ax_truthy(k); ax_release(k); }
+        else n += ax_equals(a->items[i], args[0]);
+      }
+      return ax_num(n);
     }
     // Everything else routes to the function form with the array as the first argument.
     AxValue fargs[4];
@@ -2490,7 +2982,7 @@ AxValue ax_method_call(AxVM *vm, AxValue obj, AxStr *name, AxValue *args, int ar
     }
     if (name_is(name, "reduce")) return n_reduce(vm, NULL, fargs, fargc);
     if (name_is(name, "find")) return n_find(vm, NULL, fargs, fargc);
-    if (name_is(name, "find_index")) return n_find_index(vm, NULL, fargs, fargc);
+    if (name_is(name, "find_index") || name_is(name, "findIndex")) return n_find_index(vm, NULL, fargs, fargc);
     if (name_is(name, "forEach") || name_is(name, "each")) return n_each(vm, NULL, fargs, fargc);
     if (name_is(name, "every") || name_is(name, "all")) return n_all(vm, NULL, fargs, fargc);
     if (name_is(name, "some") || name_is(name, "any")) return n_any(vm, NULL, fargs, fargc);
@@ -2533,14 +3025,15 @@ AxValue ax_method_call(AxVM *vm, AxValue obj, AxStr *name, AxValue *args, int ar
     if (name_is(name, "is_empty")) return ax_bool(ax_dict_count(d) == 0);
     if (name_is(name, "merge")) return n_merge(vm, NULL, fargs, fargc);
     if (name_is(name, "clone")) return deep_clone(obj);
+    // Keys as d[k] reads them; a missing key is null.
     if (name_is(name, "has")) {
-      AxStr *k = argc ? ax_to_str(args[0]) : ax_str_newz("");
+      AxStr *k = ax_to_str(argc ? args[0] : ax_null());
       bool r = ax_dict_has(d, k);
       ax_release(ax_strv(k));
       return ax_bool(r);
     }
     if (name_is(name, "get")) {
-      AxStr *k = argc ? ax_to_str(args[0]) : ax_str_newz("");
+      AxStr *k = ax_to_str(argc ? args[0] : ax_null());
       AxValue v;
       bool found = ax_dict_get(d, k, &v);
       ax_release(ax_strv(k));
@@ -2548,7 +3041,7 @@ AxValue ax_method_call(AxVM *vm, AxValue obj, AxStr *name, AxValue *args, int ar
       return argc > 1 ? ax_copy(args[1]) : ax_null();
     }
     if (name_is(name, "set")) {
-      AxStr *ks = argc ? ax_to_str(args[0]) : ax_str_newz("");
+      AxStr *ks = ax_to_str(argc ? args[0] : ax_null());
       AxStr *k = ax_intern(ks->data, ks->len);
       ax_dict_set(d, k, argc > 1 ? ax_copy(args[1]) : ax_null());
       ax_release(ax_strv(k));
@@ -2556,21 +3049,25 @@ AxValue ax_method_call(AxVM *vm, AxValue obj, AxStr *name, AxValue *args, int ar
       return argc > 1 ? ax_copy(args[1]) : ax_null();
     }
     if (name_is(name, "delete")) {
-      AxStr *k = argc ? ax_to_str(args[0]) : ax_str_newz("");
+      AxStr *k = ax_to_str(argc ? args[0] : ax_null());
       ax_dict_del(d, k);
       ax_release(ax_strv(k));
       return ax_null();
     }
-    if (name_is(name, "map_values")) {
+    // The higher-order dict methods take a selector over (value, key), as the array ones do.
+    if (name_is(name, "map_values") || name_is(name, "filter") || name_is(name, "each") || name_is(name, "forEach")) {
+      AxValue sel = argc ? args[0] : ax_null();
+      method_selector(vm, sel);
+      bool each = name_is(name, "each") || name_is(name, "forEach"), filter = name_is(name, "filter");
       AxDict *out = ax_dict_new();
       for (uint32_t i = 0; i < d->len; i++) {
         if (d->entries[i].dead) continue;
-        AxValue kargs[2] = { d->entries[i].val, ax_strv(d->entries[i].key) };
-        ax_retain(kargs[1]);
-        AxValue mapped = argc ? ax_call(vm, args[0], kargs, 2) : ax_copy(d->entries[i].val);
-        ax_release(kargs[1]);
-        ax_dict_set(out, d->entries[i].key, mapped);
+        AxValue r = selector_apply_kv(vm, sel, d->entries[i].val, d->entries[i].key);
+        if (filter) { if (ax_truthy(r)) ax_dict_set(out, d->entries[i].key, ax_copy(d->entries[i].val)); ax_release(r); }
+        else if (each) ax_release(r);
+        else ax_dict_set(out, d->entries[i].key, r);
       }
+      if (each) { ax_release(ax_dictv(out)); return ax_null(); }
       return ax_dictv(out);
     }
   }
@@ -2710,7 +3207,7 @@ void ax_stdlib_install(AxVM *vm) {
   def(vm, "hash", n_hash, 1, 1);
   def(vm, "b64_encode", n_b64_encode, 1, 1);
   def(vm, "b64_decode", n_b64_decode, 1, 1);
-  def(vm, "big", n_big, 0, 1);            def(vm, "is_big", n_is_big, 1, 1);
+  def(vm, "big", n_big, 1, 1);            def(vm, "is_big", n_is_big, 1, 1);
   def(vm, "to_json", n_to_json, 1, 2);    def(vm, "from_json", n_from_json, 1, 1);
   def(vm, "json_stringify", n_to_json, 1, 2);
   def(vm, "json_parse", n_from_json, 1, 1);

@@ -47,6 +47,13 @@ Everything the JavaScript runtime runs, with the same results:
   than Math.random, so they are reproducible here and random there. `infer: exact`
   distributions use no randomness and match exactly.
 * `--json` combined with `--terminal` prints the `--sim` state format.
+* **Text is UTF-8 bytes here and UTF-16 code units there.** ASCII text behaves identically;
+  beyond it, lengths, indices and slices count bytes rather than code units
+  (`len("héllo😀")` is 10 here, 7 there) and `upper`/`lower` change only ASCII letters.
+* **Regular expressions** run on the C library's POSIX engine behind a translation of
+  JavaScript syntax (`\d \w \s \b`, classes, `{n,m}`, the `i` flag). The common syntax and the
+  flag checks agree; the message for a malformed pattern differs, and constructs POSIX lacks
+  (lookaround, backreferences, lazy quantifiers) are not guaranteed to behave the same.
 
 ## Embedding: the C API and WebAssembly
 
@@ -105,9 +112,10 @@ The JavaScript implementation is the specification, so verification is different
 program on **both** runtimes and require the same result.
 
 ```
-./difftest.sh        # 86 checks: language, --json, the REPL, the checker, imports, examples,
+./difftest.sh        # 87 checks: language, --json, the REPL, the checker, imports, examples,
                      # 25 engine programs, math, number formatting, big integers, .glb loading,
-                     # terminal, rendering, the C API, and WebAssembly against this binary
+                     # terminal, rendering, the library sweep, the C API, and WebAssembly
+                     # against this binary
 make debug           # ASan + UBSan build; the corpus runs clean under both
 ```
 
@@ -124,6 +132,9 @@ make debug           # ASan + UBSan build; the corpus runs clean under both
 * **Big integers** — a seeded program (`tests/bigint/gen.js`) of 400 operand pairs, from the
   32- and 64-bit limb boundaries to 80-digit randoms, through every operator and comparison,
   plus conversions from doubles and parsing edge cases: identical to V8's BigInt.
+* **The library** — `tests/libsweep/gen.js`: every library function with 0–3 arguments of
+  eleven shapes, 80 methods on nine receivers, field-name selectors and mixed-value sorts —
+  17 399 calls, each with the same result or the same error (code and message).
 * **The checker** — `--check --json` on a corpus that trips every diagnostic, on every other
   program here, and on 300 mutants of them: identical but for a parse error's wording.
 * **`.glb` loading** — 29 hand-made files (index types, missing attributes, skins, animations,

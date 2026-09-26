@@ -424,7 +424,7 @@ AxValue ax_range(double lo, double hi, double step) {
   r->hdr.rc = 1;
   r->hdr.type = AX_RANGE;
   r->lo = lo; r->hi = hi;
-  r->step = (step == 0 || isnan(step)) ? 1 : step;
+  r->step = step == 0 ? 1 : step;   // as the reference's Range: only 0 means "no step"
   AxValue v; v.t = AX_RANGE; v.o = (AxObj *)r;
   return v;
 }
@@ -503,7 +503,10 @@ bool ax_equals(AxValue a, AxValue b) { return equals_depth(a, b, 0); }
 int ax_compare(AxValue a, AxValue b) {
   if (a.t == AX_NUM && b.t == AX_NUM) return a.num < b.num ? -1 : (a.num > b.num ? 1 : 0);
   if (a.t == AX_BOOL || b.t == AX_BOOL) {
-    int x = (a.t == AX_BOOL && a.b) ? 1 : 0, y = (b.t == AX_BOOL && b.b) ? 1 : 0;
+    // A boolean against anything orders both sides by plain truthiness (every array, dict and
+    // vector counts as true here), as the reference's comparison does.
+    int x = a.t == AX_ARR || a.t == AX_VEC2 || a.t == AX_VEC3 ? 1 : ax_truthy(a);
+    int y = b.t == AX_ARR || b.t == AX_VEC2 || b.t == AX_VEC3 ? 1 : ax_truthy(b);
     return x - y;
   }
   AxStr *sa = ax_to_str(a), *sb = ax_to_str(b);
@@ -723,12 +726,15 @@ AxStr *ax_to_str(AxValue v) {
 const char *ax_type_name(AxValue v) {
   switch (v.t) {
     case AX_NULL: return "null";
-    case AX_BOOL: return "bool";
+    case AX_BOOL: return "boolean";
     case AX_NUM: return "number";
     case AX_STR: return "string";
     case AX_ATOM: return "atom";
     case AX_ARR: return "array";
-    case AX_DICT: return "dict";
+    case AX_DICT: {
+      AxStr *t = ((AxDict *)v.o)->type_tag;   // a record is its ^type
+      return t ? t->data : "dict";
+    }
     case AX_FN: return "fn";
     case AX_RANGE: return "range";
     case AX_BIG: return "bigint";
@@ -742,6 +748,57 @@ const char *ax_type_name(AxValue v) {
   }
 }
 
+// StringToNumber: the whole text, less surrounding white space, must be a numeric literal —
+// decimal (sign, digits, fraction, exponent), Infinity, or 0x/0o/0b digits; "" is 0.
+static double string_to_number(const char *s, size_t len) {
+  size_t i = 0, j = len, w;
+  while (i < j && (w = ax_js_space(s, i, len))) i += w;
+  size_t end = i;
+  for (size_t k = i; k < j;) {
+    if ((w = ax_js_space(s, k, len))) { k += w; continue; }
+    k++;
+    end = k;
+  }
+  j = end;
+  if (i == j) return 0;
+  if (j - i > 2 && s[i] == '0' && strchr("xXoObB", s[i + 1])) {
+    unsigned radix = (s[i + 1] | 0x20) == 'x' ? 16 : (s[i + 1] | 0x20) == 'o' ? 8 : 2;
+    for (size_t k = i + 2; k < j; k++) {
+      char c = s[k];
+      unsigned d = c >= '0' && c <= '9' ? (unsigned)(c - '0') : (c | 0x20) >= 'a' && (c | 0x20) <= 'f' ? (unsigned)((c | 0x20) - 'a' + 10) : 99;
+      if (d >= radix) return NAN;
+    }
+    AxBig *b = ax_big_parse_digits(s + i + 2, j - i - 2, radix);
+    double d = ax_big_to_double(b);
+    free(b);
+    return d;
+  }
+  size_t k = i;
+  bool neg = false;
+  if (s[k] == '+' || s[k] == '-') { neg = s[k] == '-'; k++; }
+  if (j - k == 8 && !strncmp(s + k, "Infinity", 8)) return neg ? -INFINITY : INFINITY;
+  size_t digits = 0;
+  while (k < j && s[k] >= '0' && s[k] <= '9') { k++; digits++; }
+  if (k < j && s[k] == '.') { k++; while (k < j && s[k] >= '0' && s[k] <= '9') { k++; digits++; } }
+  if (!digits) return NAN;
+  if (k < j && (s[k] == 'e' || s[k] == 'E')) {
+    k++;
+    if (k < j && (s[k] == '+' || s[k] == '-')) k++;
+    size_t e = 0;
+    while (k < j && s[k] >= '0' && s[k] <= '9') { k++; e++; }
+    if (!e) return NAN;
+  }
+  if (k != j) return NAN;
+  char buf[128];
+  char *text = j - i < sizeof buf ? buf : xalloc(j - i + 1);
+  memcpy(text, s + i, j - i);
+  text[j - i] = '\0';
+  double d = strtod(text, NULL);
+  if (text != buf) free(text);
+  return d;
+}
+
+// Number(v), as JavaScript computes it.
 double ax_to_num(AxValue v) {
   switch (v.t) {
     case AX_NUM: return v.num;
@@ -749,13 +806,13 @@ double ax_to_num(AxValue v) {
     case AX_NULL: return 0;
     case AX_TIMER: return ((AxTimer *)v.o)->remaining;   // a timer reads as its remaining time
     case AX_BIG: return ax_big_to_double((AxBig *)v.o);   // Number(big)
-    case AX_STR: {
-      AxStr *s = (AxStr *)v.o;
-      char *end = NULL;
-      double d = strtod(s->data, &end);
-      if (end == s->data) return NAN;
-      while (*end == ' ' || *end == '\t' || *end == '\n') end++;
-      return *end ? NAN : d;
+    case AX_STR: { AxStr *s = (AxStr *)v.o; return string_to_number(s->data, s->len); }
+    case AX_ARR: {
+      // An array through its text: [] is 0, [5] is 5, [1, 2] is NaN.
+      AxStr *s = ax_js_string(v);
+      double d = string_to_number(s->data, s->len);
+      ax_release(ax_strv(s));
+      return d;
     }
     default: return NAN;
   }

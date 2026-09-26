@@ -194,6 +194,47 @@ Both runtimes gain `big ** big` (it used to fail: the reference passed bigs to `
   sets do, and are linear rather than quadratic; `deep_eq` compares as JSON text.
 - A `!save` whose state cannot be written as JSON still creates `saves/`, as the reference does.
 
+### Library calls agree on every argument, sensible or not
+
+A model learns the language from what calls do, including the calls a program should never
+make, so both runtimes now answer those the same way. `native/tests/libsweep/gen.js` calls every
+library function with 0–3 arguments of eleven shapes (number, negative, text, array, empty
+array, dict, null, boolean, vector, lambda, big) and 80 methods on nine receivers with eight
+argument lists, plus field-name selectors over mixed elements and sorts of mixed values —
+17 399 calls. Before this change about 4 000 of them differed; now none do, and difftest.sh
+runs the sweep. The rules both runtimes follow:
+
+- **Too few arguments** is an error naming the minimum —
+  `lerp() needs at least 3 argument(s), got 1` (AX-ARITY-001) — from one table of minimums
+  (`LIBRARY_MIN_ARGS` in interpreter.js, `def()` in the native build). Extra arguments are
+  ignored.
+- **Sequences**: an array, a string (characters), a range, a dict (values) or a vector (its
+  components); a function, atom or entity is a one-item sequence; a record's values skip
+  `__type`.
+- **Dict views** (`keys`, `values`, `items`, `merge`, `pick_keys`, …): a dict, an array by index
+  (`"0"`, `"1"`), a vector by component; anything else is empty.
+- **Text arguments**: a value that is not text is read as its displayed form
+  (`lines(12)` is `["12"]`); a missing one is JavaScript's `undefined` for the string methods.
+- **Selectors**: `null` is the identity, text is a field name, a callable is called; anything
+  else is `value of type number is not callable` (AX-CALL-001). Methods check their selector
+  before looking at any element (`[].max(2)` is that error); functions check it on first use.
+- **Field names** read a dict's own entry or a vector's, quaternion's or entity's member —
+  `sort_by(pts, "mag")` — and are `null` for everything else. They used to read JavaScript
+  properties in the reference (a string's `length`, an array's indices, `undefined` that a
+  dict then dropped), and nothing but dict entries natively.
+- **Numbers** are read as `Number()` reads them (`"12"` is 12, `"1e3"` is 1000, `[5]` is 5,
+  `{}` is NaN), and NaN propagates rather than becoming 0 or an error.
+- **Ordering** is one comparison everywhere — numbers numerically, a boolean against anything
+  by truthiness, everything else by displayed text — and one sort: the native runtime now runs
+  V8's TimSort step for step, so values that do not order consistently (booleans among numbers,
+  a comparator that is not a valid ordering) come out the same, and a key function is called the
+  same number of times. `sort_by`, `min_by` and `max_by` in the reference compared by
+  JavaScript's `String()`, which put vectors after `null` and every dict level. A comparator's
+  result is read as a number (`str(a - b)` works; the `.sort()` method treated it as 0).
+- **Type names** in messages are `type()`'s: `boolean`, `vec3`, a record's type name.
+- `v.clone()` on a vector or quaternion is a copy (it crashed in the reference); JSON output
+  leaves out function values; `[].min()`/`.max()` are `null`.
+
 ### Ranges display as their source
 
 A range printed as `Range` in the JavaScript runtime and as `0..3` natively, and `type()` called
