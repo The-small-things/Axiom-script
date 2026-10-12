@@ -812,7 +812,7 @@ static AxNode *body_node(P *p, NodeList *l) {
 }
 
 static void end_stmt(P *p) {
-  if (at(p, T_SEMI)) { advance(p); return; }
+  if (at(p, T_SEMI)) { while (at(p, T_SEMI)) advance(p); return; }   // `;;` is an empty statement
   if (at(p, T_NEWLINE)) { advance(p); return; }
   if (at(p, T_DEDENT) || at(p, T_EOF)) return;
   perr(p, "expected the end of the statement, got %s", tok_name(peek(p, 0)->type));

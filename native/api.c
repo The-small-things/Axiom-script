@@ -280,7 +280,7 @@ int axiom_load(axiom *ax, const char *source, const char *filename) {
     out(ax, 2, "axiom: this instance already holds a program (use a new instance)\n");
     return 1;
   }
-  ax->source = strdup(source ? source : "");
+  ax->source = ax_text_repair(strdup(source ? source : ""), NULL);   // as Node decodes UTF-8
   ax->filename = filename ? strdup(filename) : NULL;
   void *saved = ax_arena_swap(ax->arena);
   Compiled c = compile(ax->source, ax->filename);

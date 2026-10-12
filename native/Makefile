@@ -9,7 +9,7 @@ LDFLAGS ?=
 LDLIBS  ?= -lm
 
 # The runtime; the command is main.c on top, an embedding host links libaxiom.a (axiom_api.h).
-LIB_SRCS = value.c lexer.c parser.c interp.c stdlib.c engine.c host.c infer.c jsmath.c term.c kbd.c render.c fmt.c glb.c check.c repl.c imports.c api.c bigint.c
+LIB_SRCS = value.c lexer.c parser.c interp.c stdlib.c engine.c host.c infer.c jsmath.c term.c kbd.c render.c fmt.c glb.c check.c repl.c imports.c api.c bigint.c ustr.c
 SRCS = $(LIB_SRCS) main.c
 OBJS = $(SRCS:.c=.o)
 LIB_OBJS = $(LIB_SRCS:.c=.o)
@@ -25,7 +25,7 @@ $(LIB): $(LIB_OBJS)
 	rm -f $@
 	$(AR) rcs $@ $(LIB_OBJS)
 
-%.o: %.c axiom.h axiom_api.h jsmath.h term.h render.h checknames.h
+%.o: %.c axiom.h axiom_api.h jsmath.h term.h render.h checknames.h unicode.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # The embedding API's own test: a C host driving every entry point.
@@ -61,7 +61,7 @@ AXIOM_WASM_JS_EXPORTS = $(foreach f,$(API_EXPORTS),-Wl,--export=$(f))
 
 wasm: wasm/axiom.wasm wasm/axiom-lib.wasm
 
-wasm/obj/%.o: %.c axiom.h axiom_api.h jsmath.h term.h render.h checknames.h
+wasm/obj/%.o: %.c axiom.h axiom_api.h jsmath.h term.h render.h checknames.h unicode.h
 	@mkdir -p wasm/obj
 	$(WASI_CC) $(WASI_CFLAGS) -c -o $@ $<
 

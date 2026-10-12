@@ -966,6 +966,15 @@ class Parser {
   }
 
   parseStmt() {
+    // v0.9.3: `;` ends a statement wherever a line break would (GRAMMAR.md, "Newline &
+    // Semicolon Handling") — `x = 1; y = 2` in any body, as the native parser has it. The
+    // single-line block rewrite below is applied to the rest of this line: each `;` becomes a
+    // NEWLINE, so `?c: a; b` is `?c: a` followed by `b`.
+    for (let k = this.pos; k < this.toks.length; k++) {
+      const t = this.toks[k];
+      if (t.type === TT.NEWLINE || t.type === TT.EOF || t.type === TT.DEDENT || t.type === TT.INDENT) break;
+      if (t.type === TT.SEMICOLON) this.toks[k] = { type: TT.NEWLINE, line: t.line, col: t.col };
+    }
     // v0.4: !!expr — assert (double-bang)
     // v0.5.1 fix: lexer emits BANGBANG as a single token (lexer.js line 113), so handle both forms.
     if (this.at(TT.BANGBANG)) {

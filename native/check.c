@@ -1771,7 +1771,7 @@ static char *read_all(const char *path) {
   while ((got = fread(b + n, 1, cap - n - 1, f)) > 0) { n += got; if (n + 1 >= cap) { cap *= 2; b = realloc(b, cap); } }
   b[n] = '\0';
   fclose(f);
-  return b;
+  return ax_text_repair(b, NULL);   // as Node reads a file as UTF-8
 }
 
 static void merge_decls(Ck *c, Prog *root, AxNode *sub, const char *from) {

@@ -20,6 +20,7 @@
 #include "jsmath.h"
 #include <time.h>
 #include <regex.h>
+#include <locale.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <dirent.h>
@@ -426,25 +427,6 @@ static void sb_add(SB *sb, const char *s, size_t n) {
 }
 static void sb_addz(SB *sb, const char *s) { sb_add(sb, s, strlen(s)); }
 
-static void json_quote(SB *sb, AxStr *s) {
-  sb_addz(sb, "\"");
-  for (uint32_t i = 0; i < s->len; i++) {
-    unsigned char c = (unsigned char)s->data[i];
-    switch (c) {
-      case '"': sb_addz(sb, "\\\""); break;
-      case '\\': sb_addz(sb, "\\\\"); break;
-      case '\n': sb_addz(sb, "\\n"); break;
-      case '\t': sb_addz(sb, "\\t"); break;
-      case '\r': sb_addz(sb, "\\r"); break;
-      default:
-        if (c < 0x20) { char b[8]; snprintf(b, sizeof b, "\\u%04x", c); sb_addz(sb, b); }
-        else sb_add(sb, (const char *)&c, 1);
-    }
-  }
-  sb_addz(sb, "\"");
-}
-
-
 typedef struct { const char *p; bool ok; } JP;
 
 static void jp_ws(JP *j) { while (*j->p == ' ' || *j->p == '\t' || *j->p == '\n' || *j->p == '\r') j->p++; }
@@ -592,9 +574,10 @@ static AxValue json_read(JP *j) {
 //
 // Translate the JavaScript-flavoured escapes a program is likely to write into POSIX ERE.
 // Anything else passes through unchanged, so a genuinely POSIX pattern still works.
+#define JS_SPACE "\xC2\xA0\xE1\x9A\x80\xE2\x80\x80\xE2\x80\x81\xE2\x80\x82\xE2\x80\x83\xE2\x80\x84\xE2\x80\x85\xE2\x80\x86\xE2\x80\x87\xE2\x80\x88\xE2\x80\x89\xE2\x80\x8A\xE2\x80\xA8\xE2\x80\xA9\xE2\x80\xAF\xE2\x81\x9F\xE3\x80\x80\xEF\xBB\xBF"
 static char *re_translate(const char *pat) {
   size_t n = strlen(pat);
-  char *out = malloc(n * 12 + 1);
+  char *out = malloc(n * 40 + 64);   // \s alone becomes a 70-byte class
   size_t j = 0;
   bool in_class = false;
   for (size_t i = 0; i < n; i++) {
@@ -625,8 +608,10 @@ static char *re_translate(const char *pat) {
         case 'D': rep = in_class ? "^0-9" : "[^0-9]"; break;
         case 'w': rep = in_class ? "A-Za-z0-9_" : "[A-Za-z0-9_]"; break;
         case 'W': rep = in_class ? "^A-Za-z0-9_" : "[^A-Za-z0-9_]"; break;
-        case 's': rep = in_class ? " \t\n\r\f\v" : "[ \t\n\r\f\v]"; break;
-        case 'S': rep = in_class ? "^ \t\n\r\f\v" : "[^ \t\n\r\f\v]"; break;
+        // JavaScript's white space, past ASCII too (U+00A0, U+1680, U+2000..U+200A, U+2028,
+        // U+2029, U+202F, U+205F, U+3000, U+FEFF), listed rather than ranged.
+        case 's': rep = in_class ? " \t\n\r\f\v" JS_SPACE : "[ \t\n\r\f\v" JS_SPACE "]"; break;
+        case 'S': rep = in_class ? "^ \t\n\r\f\v" JS_SPACE : "[^ \t\n\r\f\v" JS_SPACE "]"; break;
         case 'n': rep = "\n"; break;
         case 't': rep = "\t"; break;
         default: out[j++] = '\\'; out[j++] = e; continue;
@@ -664,11 +649,59 @@ static bool re_flags(AxVM *vm, AxValue patv, AxValue flagsv, bool add_g) {
   return seen['i'];
 }
 
+// Patterns compile and run under a UTF-8 locale, so that `.`, a class and case-insensitive
+// matching take a character past ASCII as one character, as the reference's regexes do for
+// anything in the Basic Multilingual Plane. Only this thread, and only for the call.
+#ifdef __wasi__
+// wasi-libc keys multibyte matching to the global locale (uselocale leaves it single-byte), and
+// a WebAssembly instance has no other threads to disturb.
+typedef char *ReSaved;
+static ReSaved re_enter(void) {
+  const char *cur = setlocale(LC_CTYPE, NULL);
+  char *saved = strdup(cur ? cur : "C");
+  setlocale(LC_CTYPE, "C.UTF-8");
+  return saved;
+}
+static void re_leave(ReSaved saved) { setlocale(LC_CTYPE, saved); free(saved); }
+#else
+typedef locale_t ReSaved;
+static locale_t re_locale(void) {
+  static locale_t loc;
+  static bool tried;
+  if (!tried) {
+    tried = true;
+    loc = newlocale(LC_CTYPE_MASK, "C.UTF-8", (locale_t)0);
+    if (!loc) loc = newlocale(LC_CTYPE_MASK, "en_US.UTF-8", (locale_t)0);
+  }
+  return loc;
+}
+static ReSaved re_enter(void) { locale_t loc = re_locale(); return loc ? uselocale(loc) : (locale_t)0; }
+static void re_leave(ReSaved saved) { if (saved) uselocale(saved); }
+#endif
+static int re_comp(regex_t *re, const char *pat, int flags) {
+  ReSaved saved = re_enter();
+  int rc = regcomp(re, pat, flags);
+  re_leave(saved);
+  return rc;
+}
+static int re_exec(const regex_t *re, const char *s, size_t n, regmatch_t *m, int flags) {
+  ReSaved saved = re_enter();
+  int rc = regexec(re, s, n, m, flags);
+  re_leave(saved);
+  return rc;
+}
+// After an empty match the search moves on by one character, not into the middle of one.
+static size_t re_step(const AxStr *s, size_t at) {
+  if (at >= s->len) return 1;
+  uint32_t cp;
+  return (size_t)ax_utf8_next(s->data + at, s->len - at, &cp);
+}
+
 static bool re_build(AxVM *vm, AxValue patv, regex_t *re, bool icase) {
   AxStr *p = ax_to_str(patv);
   char *translated = re_translate(p->data);
   int flags = REG_EXTENDED | (icase ? REG_ICASE : 0);
-  int rc = regcomp(re, translated, flags);
+  int rc = re_comp(re, translated, flags);
   free(translated);
   if (rc != 0) {
     char buf[256];
@@ -687,7 +720,7 @@ static AxValue re_match_record(const char *subject, regmatch_t *m, int ngroups) 
   AxDict *d = ax_dict_new();
   AxStr *k_match = ax_internz("match"), *k_index = ax_internz("index"), *k_groups = ax_internz("groups");
   ax_dict_set(d, k_match, ax_strv(ax_str_new(subject + m[0].rm_so, m[0].rm_eo - m[0].rm_so)));
-  ax_dict_set(d, k_index, ax_num(m[0].rm_so));
+  ax_dict_set(d, k_index, ax_num(ax_u16_count(subject, (size_t)m[0].rm_so)));   // in UTF-16 units
   AxArr *groups = ax_arr_new(ngroups);
   for (int g = 1; g <= ngroups; g++) {
     if (m[g].rm_so < 0) ax_arr_push(groups, ax_null());
@@ -773,7 +806,7 @@ NATIVE(n_len) {
   // anything else — a number, an atom, a function — has no length.
   AxValue v = ARG(0);
   switch (v.t) {
-    case AX_STR: return ax_num(((AxStr *)v.o)->len);
+    case AX_STR: return ax_num(ax_str_ulen((AxStr *)v.o));   // UTF-16 units
     case AX_VEC2: return ax_num(2);
     case AX_VEC3: return ax_num(3);
     case AX_QUAT: return ax_num(4);
@@ -1863,34 +1896,18 @@ NATIVE(n_deep_eq) {
 
 // --- strings ----------------------------------------------------------------------------------
 
-// String(c).charCodeAt(0): the first UTF-16 code unit (NaN for ""), from UTF-8 text.
+// String(c).charCodeAt(0): the first UTF-16 code unit (NaN for "").
 NATIVE(n_ord) {
   AxStr *s = arg_str(ARG(0));
-  const unsigned char *p = (const unsigned char *)s->data;
-  double v = NAN;
-  if (s->len) {
-    uint32_t cp = p[0];
-    int extra = cp >= 0xF0 ? 3 : cp >= 0xE0 ? 2 : cp >= 0xC0 ? 1 : 0;
-    if (extra && (uint32_t)extra < s->len) {
-      cp &= 0x3F >> extra;
-      for (int i = 1; i <= extra; i++) cp = (cp << 6) | (p[i] & 0x3F);
-    }
-    v = cp > 0xFFFF ? 0xD800 + ((cp - 0x10000) >> 10) : cp;
-  }
+  int32_t u = ax_str_unit_at(s, 0);
   ax_release(ax_strv(s));
-  return ax_num(v);
+  return ax_num(u < 0 ? NAN : u);
 }
-// String.fromCharCode(n): one UTF-16 code unit (ToUint16), written as UTF-8; a lone surrogate
-// comes out as U+FFFD, which is what printing it shows.
+// String.fromCharCode(n): one UTF-16 code unit (ToUint16) — a surrogate too, which pairs with
+// its partner when the two are joined and prints as U+FFFD alone, as in the reference.
 NATIVE(n_chr) {
-  uint32_t u = (uint32_t)ax_to_int32(NUM(0)) & 0xFFFF;
-  if (u >= 0xD800 && u <= 0xDFFF) u = 0xFFFD;
-  char b[4];
-  size_t n;
-  if (u < 0x80) { b[0] = (char)u; n = 1; }
-  else if (u < 0x800) { b[0] = (char)(0xC0 | (u >> 6)); b[1] = (char)(0x80 | (u & 0x3F)); n = 2; }
-  else { b[0] = (char)(0xE0 | (u >> 12)); b[1] = (char)(0x80 | ((u >> 6) & 0x3F)); b[2] = (char)(0x80 | (u & 0x3F)); n = 3; }
-  return ax_strv(ax_str_new(b, n));
+  uint16_t u = (uint16_t)((uint32_t)ax_to_int32(NUM(0)) & 0xFFFF);
+  return ax_strv(ax_str_from_u16(&u, 1));
 }
 NATIVE(n_lines) {
   AxStr *s = ARG(0).t == AX_NULL ? ax_str_newz("") : arg_str(ARG(0));
@@ -1907,116 +1924,140 @@ NATIVE(n_lines) {
   ax_release(ax_strv(s));
   return ax_arrv(out);
 }
+// trim().split(/\s+/): runs of JavaScript white space separate the words.
 NATIVE(n_words) {
   AxStr *s = ARG(0).t == AX_NULL ? ax_str_newz("") : arg_str(ARG(0));
   AxArr *out = ax_arr_new(4);
-  uint32_t i = 0;
-  while (i < s->len) {
-    while (i < s->len && isspace((unsigned char)s->data[i])) i++;
-    uint32_t start = i;
-    while (i < s->len && !isspace((unsigned char)s->data[i])) i++;
-    if (i > start) ax_arr_push(out, ax_strv(ax_str_new(s->data + start, i - start)));
+  size_t i = 0, start = 0;
+  bool in_word = false;
+  while (i <= s->len) {
+    uint32_t cp = ' ';
+    int w = 1;
+    if (i < s->len) w = ax_utf8_next(s->data + i, s->len - i, &cp);
+    bool space = i == s->len || ax_unit_is_space(cp);
+    if (space && in_word) ax_arr_push(out, ax_strv(ax_str_new(s->data + start, i - start)));
+    if (!space && !in_word) start = i;
+    in_word = !space;
+    i += (size_t)w;
   }
   ax_release(ax_strv(s));
   return ax_arrv(out);
 }
 NATIVE(n_chars) {
   AxStr *s = ARG(0).t == AX_NULL ? ax_str_newz("") : arg_str(ARG(0));
-  AxArr *out = ax_arr_new(s->len);
-  for (uint32_t i = 0; i < s->len; i++) ax_arr_push(out, ax_strv(ax_str_new(s->data + i, 1)));
+  AxArr *out = ax_str_unit_strings(s);
   ax_release(ax_strv(s));
   return ax_arrv(out);
 }
+// t[0].toUpperCase() + t.slice(1): the first UTF-16 unit, upper-cased on its own.
 NATIVE(n_capitalize) {
   AxStr *s = arg_str(ARG(0));
-  AxStr *out = ax_str_new(s->data, s->len);
-  if (out->len) out->data[0] = (char)toupper((unsigned char)out->data[0]);
+  if (!s->len) return ax_strv(s);
+  uint32_t n = ax_str_ulen(s);
+  AxStr *head = ax_str_unit_slice(s, 0, 1), *rest = ax_str_unit_slice(s, 1, n);
+  AxStr *up = ax_str_case(head, true);
+  AxStr *out = ax_str_concat(up, rest);
+  ax_release(ax_strv(head));
+  ax_release(ax_strv(rest));
+  ax_release(ax_strv(up));
   ax_release(ax_strv(s));
   return ax_strv(out);
 }
 NATIVE(n_title) {
   AxStr *s = arg_str(ARG(0));
-  // The reference's s.replace(/\w\S*/g, …): each run from a word character to the next white
-  // space is capitalized — the first character up, the rest down.
-  AxStr *out = ax_str_new(s->data, s->len);
-  for (uint32_t i = 0; i < out->len;) {
-    unsigned char c = (unsigned char)out->data[i];
-    if (!(isalnum(c) || c == '_')) { i++; continue; }
-    out->data[i] = (char)toupper(c);
-    for (i++; i < out->len && !isspace((unsigned char)out->data[i]); i++) out->data[i] = (char)tolower((unsigned char)out->data[i]);
+  // The reference's s.replace(/\w\S*/g, w => w[0].toUpperCase() + w.slice(1).toLowerCase()):
+  // a run from an ASCII word character to the next white space, its first character up and
+  // the rest down (lower-cased as a piece of its own, which is what final sigma sees).
+  SB sb = {0};
+  sb_add(&sb, "", 0);
+  for (size_t i = 0; i < s->len;) {
+    unsigned char c = (unsigned char)s->data[i];
+    if (!(isalnum(c) || c == '_') || c >= 0x80) {
+      uint32_t cp;
+      int w = ax_utf8_next(s->data + i, s->len - i, &cp);
+      sb_add(&sb, s->data + i, (size_t)w);
+      i += (size_t)w;
+      continue;
+    }
+    char up = (char)toupper(c);
+    sb_add(&sb, &up, 1);
+    size_t j = i + 1;
+    while (j < s->len) {
+      uint32_t cp;
+      int w = ax_utf8_next(s->data + j, s->len - j, &cp);
+      if (ax_unit_is_space(cp)) break;
+      j += (size_t)w;
+    }
+    AxStr *rest = ax_str_new(s->data + i + 1, j - i - 1);
+    AxStr *low = ax_str_case(rest, false);
+    sb_add(&sb, low->data, low->len);
+    ax_release(ax_strv(rest));
+    ax_release(ax_strv(low));
+    i = j;
   }
+  AxValue r = ax_strv(ax_str_new(sb.buf, sb.len));
+  free(sb.buf);
   ax_release(ax_strv(s));
-  return ax_strv(out);
+  return r;
 }
+// split('').reverse().join(''): the UTF-16 units reversed (a surrogate pair comes apart).
 NATIVE(n_reverse_str) {
   AxStr *s = arg_str(ARG(0));
-  AxStr *out = ax_str_new(s->data, s->len);
-  for (uint32_t i = 0, j = out->len ? out->len - 1 : 0; i < j; i++, j--) { char t = out->data[i]; out->data[i] = out->data[j]; out->data[j] = t; }
+  uint32_t n;
+  uint16_t *u = ax_str_units(s, &n);
+  for (uint32_t i = 0, j = n ? n - 1 : 0; i < j; i++, j--) { uint16_t t = u[i]; u[i] = u[j]; u[j] = t; }
+  AxStr *out = ax_str_from_u16(u, n);
+  free(u);
   ax_release(ax_strv(s));
   return ax_strv(out);
 }
+// FNV-1a over the UTF-16 units (charCodeAt), as the reference computes it.
 NATIVE(n_hash) {
   AxStr *s = arg_str(ARG(0));
-  uint32_t h = ax_hash_bytes(s->data, s->len);
+  uint32_t h;
+  if (s->ascii) h = ax_hash_bytes(s->data, s->len);
+  else {
+    uint32_t n;
+    uint16_t *u = ax_str_units(s, &n);
+    h = 0x811c9dc5u;
+    for (uint32_t i = 0; i < n; i++) { h ^= u[i]; h *= 0x01000193u; }
+    free(u);
+  }
   ax_release(ax_strv(s));
   return ax_num((double)h);
 }
 static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 NATIVE(n_b64_encode) {
   AxStr *s = arg_str(ARG(0));
-  size_t olen = 4 * ((s->len + 2) / 3);
+  // Buffer.from(s, 'utf8'): a lone surrogate is written as U+FFFD.
+  bool owned;
+  size_t n;
+  const unsigned char *p = (const unsigned char *)ax_utf8_out(s->data, s->len, &n, &owned);
+  size_t olen = 4 * ((n + 2) / 3);
   char *out = malloc(olen + 1);
   size_t j = 0;
-  for (size_t i = 0; i < s->len; i += 3) {
-    unsigned v = (unsigned char)s->data[i] << 16;
-    if (i + 1 < s->len) v |= (unsigned char)s->data[i + 1] << 8;
-    if (i + 2 < s->len) v |= (unsigned char)s->data[i + 2];
+  for (size_t i = 0; i < n; i += 3) {
+    unsigned v = (unsigned)p[i] << 16;
+    if (i + 1 < n) v |= (unsigned)p[i + 1] << 8;
+    if (i + 2 < n) v |= p[i + 2];
     out[j++] = B64[(v >> 18) & 63];
     out[j++] = B64[(v >> 12) & 63];
-    out[j++] = i + 1 < s->len ? B64[(v >> 6) & 63] : '=';
-    out[j++] = i + 2 < s->len ? B64[v & 63] : '=';
+    out[j++] = i + 1 < n ? B64[(v >> 6) & 63] : '=';
+    out[j++] = i + 2 < n ? B64[v & 63] : '=';
   }
   out[j] = '\0';
   AxValue r = ax_strv(ax_str_new(out, j));
   free(out);
+  if (owned) free((void *)p);
   ax_release(ax_strv(s));
   return r;
 }
-// Bytes as Node's toString('utf8') reads them (the WHATWG decoder): each ill-formed sequence —
-// the longest prefix of one that could still have been valid — becomes one U+FFFD.
-static AxStr *utf8_repair(const uint8_t *b, size_t n) {
-  char *out = malloc(n * 3 + 1);
-  size_t j = 0;
-  for (size_t i = 0; i < n;) {
-    uint8_t c = b[i];
-    if (c < 0x80) { out[j++] = (char)c; i++; continue; }
-    int need = c >= 0xC2 && c <= 0xDF ? 1 : c >= 0xE0 && c <= 0xEF ? 2 : c >= 0xF0 && c <= 0xF4 ? 3 : 0;
-    uint8_t lo = 0x80, hi = 0xBF;
-    if (c == 0xE0) lo = 0xA0; else if (c == 0xED) hi = 0x9F; else if (c == 0xF0) lo = 0x90; else if (c == 0xF4) hi = 0x8F;
-    size_t k = i + 1;
-    int got = 0;
-    while (need && got < need && k < n) {
-      uint8_t d = b[k];
-      if (got == 0 ? (d < lo || d > hi) : (d < 0x80 || d > 0xBF)) break;
-      k++;
-      got++;
-    }
-    if (need && got == need) { memcpy(out + j, b + i, k - i); j += k - i; i = k; continue; }
-    memcpy(out + j, "\xEF\xBF\xBD", 3);
-    j += 3;
-    i = need ? k : i + 1;
-  }
-  AxStr *s = ax_str_new(out, j);
-  free(out);
-  return s;
-}
-
 NATIVE(n_b64_decode) {
   AxStr *s = arg_str(ARG(0));
   uint8_t *bytes = NULL;
   size_t nb = 0;
   if (!ax_base64_decode(s->data, s->len, &bytes, &nb)) { bytes = NULL; nb = 0; }
-  AxStr *r = utf8_repair(bytes ? bytes : (const uint8_t *)"", nb);
+  AxStr *r = ax_utf8_repair(bytes ? (const char *)bytes : "", nb);
   free(bytes);
   ax_release(ax_strv(s));
   return ax_strv(r);
@@ -2059,7 +2100,7 @@ NATIVE(n_re_test) {
   regex_t re;
   bool icase = re_flags(vm, ARG(1), ARG(2), false);
   re_build(vm, ARG(1), &re, icase);
-  bool m = regexec(&re, s->data, 0, NULL, 0) == 0;
+  bool m = re_exec(&re, s->data, 0, NULL, 0) == 0;
   regfree(&re);
   ax_release(ax_strv(s));
   return ax_bool(m);
@@ -2070,7 +2111,7 @@ NATIVE(n_re_match) {
   re_build(vm, ARG(1), &re, re_flags(vm, ARG(1), ARG(2), false));
   regmatch_t m[16];
   AxValue out = ax_null();
-  if (regexec(&re, s->data, 16, m, 0) == 0) out = re_match_record(s->data, m, (int)re.re_nsub);
+  if (re_exec(&re, s->data, 16, m, 0) == 0) out = re_match_record(s->data, m, (int)re.re_nsub);
   regfree(&re);
   ax_release(ax_strv(s));
   return out;
@@ -2083,14 +2124,14 @@ NATIVE(n_re_all) {
   regmatch_t m[16];
   const char *p = s->data;
   size_t off = 0;
-  while (off <= s->len && regexec(&re, p + off, 16, m, off ? REG_NOTBOL : 0) == 0) {
+  while (off <= s->len && re_exec(&re, p + off, 16, m, off ? REG_NOTBOL : 0) == 0) {
     regmatch_t shifted[16];
     for (int g = 0; g < 16; g++) {
       shifted[g].rm_so = m[g].rm_so < 0 ? -1 : m[g].rm_so + (regoff_t)off;
       shifted[g].rm_eo = m[g].rm_eo < 0 ? -1 : m[g].rm_eo + (regoff_t)off;
     }
     ax_arr_push(out, re_match_record(s->data, shifted, (int)re.re_nsub));
-    size_t adv = (size_t)(m[0].rm_eo > m[0].rm_so ? m[0].rm_eo : m[0].rm_so + 1);
+    size_t adv = (size_t)(m[0].rm_eo > m[0].rm_so ? (size_t)m[0].rm_eo : (size_t)m[0].rm_so + re_step(s, off + (size_t)m[0].rm_so));
     off += adv;
     if (adv == 0) break;
   }
@@ -2107,7 +2148,7 @@ NATIVE(n_re_sub) {
   sb_add(&sb, "", 0);
   regmatch_t m[16];
   size_t off = 0;
-  while (off <= s->len && regexec(&re, s->data + off, 16, m, off ? REG_NOTBOL : 0) == 0) {
+  while (off <= s->len && re_exec(&re, s->data + off, 16, m, off ? REG_NOTBOL : 0) == 0) {
     sb_add(&sb, s->data + off, (size_t)m[0].rm_so);
     // `$1`-style group references in the replacement.
     for (uint32_t i = 0; i < rep->len; i++) {
@@ -2119,8 +2160,9 @@ NATIVE(n_re_sub) {
       }
       sb_add(&sb, rep->data + i, 1);
     }
-    size_t adv = (size_t)(m[0].rm_eo > m[0].rm_so ? m[0].rm_eo : m[0].rm_so + 1);
-    if (m[0].rm_eo == m[0].rm_so && off + (size_t)m[0].rm_so < s->len) sb_add(&sb, s->data + off + m[0].rm_so, 1);
+    size_t step = re_step(s, off + (size_t)m[0].rm_so);
+    size_t adv = (size_t)(m[0].rm_eo > m[0].rm_so ? (size_t)m[0].rm_eo : (size_t)m[0].rm_so + step);
+    if (m[0].rm_eo == m[0].rm_so && off + (size_t)m[0].rm_so < s->len) sb_add(&sb, s->data + off + m[0].rm_so, step);
     off += adv;
     if (adv == 0) break;
   }
@@ -2139,7 +2181,7 @@ NATIVE(n_re_split) {
   AxArr *out = ax_arr_new(4);
   regmatch_t m[1];
   size_t off = 0;
-  while (off <= s->len && regexec(&re, s->data + off, 1, m, off ? REG_NOTBOL : 0) == 0 && m[0].rm_eo > m[0].rm_so) {
+  while (off <= s->len && re_exec(&re, s->data + off, 1, m, off ? REG_NOTBOL : 0) == 0 && m[0].rm_eo > m[0].rm_so) {
     ax_arr_push(out, ax_strv(ax_str_new(s->data + off, (size_t)m[0].rm_so)));
     off += (size_t)m[0].rm_eo;
   }
@@ -2242,7 +2284,7 @@ static char *read_whole(const char *path, size_t *out_len) {
   fclose(f);
   buf[got] = '\0';
   *out_len = got;
-  return buf;
+  return ax_text_repair(buf, out_len);   // as Node reads a file as UTF-8
 }
 
 NATIVE(n_read) {
@@ -2289,6 +2331,14 @@ static bool mkdir_parents(const char *path) {
   }
   return true;
 }
+// Text into a file as Node writes a string: UTF-8, a lone surrogate as U+FFFD.
+static void write_text(FILE *f, AxStr *s) {
+  bool owned;
+  size_t n;
+  const char *p = ax_utf8_out(s->data, s->len, &n, &owned);
+  fwrite(p, 1, n, f);
+  if (owned) free((char *)p);
+}
 NATIVE(n_write) {
   AxStr *p = arg_str(ARG(0));
   check_write(vm, p->data);
@@ -2296,7 +2346,7 @@ NATIVE(n_write) {
   mkdir_parents(p->data);
   FILE *f = fopen(p->data, "wb");
   bool ok = f != NULL;
-  if (f) { fwrite(data->data, 1, data->len, f); fclose(f); }
+  if (f) { write_text(f, data); fclose(f); }
   ax_release(ax_strv(p));
   ax_release(ax_strv(data));
   return ax_bool(ok);
@@ -2308,7 +2358,7 @@ NATIVE(n_append) {
   mkdir_parents(p->data);
   FILE *f = fopen(p->data, "ab");
   bool ok = f != NULL;
-  if (f) { fwrite(data->data, 1, data->len, f); fclose(f); }
+  if (f) { write_text(f, data); fclose(f); }
   ax_release(ax_strv(p));
   ax_release(ax_strv(data));
   return ax_bool(ok);
@@ -2343,7 +2393,7 @@ NATIVE(n_ls) {
     struct dirent *e;
     while ((e = readdir(d))) {
       if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
-      ax_arr_push(out, ax_str_from(e->d_name));
+      ax_arr_push(out, ax_strv(ax_utf8_repair(e->d_name, strlen(e->d_name))));
     }
     closedir(d);
   }
@@ -2394,7 +2444,7 @@ NATIVE(n_input) {
   ssize_t n = getline(&line, &cap, stdin);
   if (n < 0) { free(line); return ax_null(); }
   while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) n--;
-  AxValue v = ax_strv(ax_str_new(line, (size_t)n));
+  AxValue v = ax_strv(ax_utf8_repair(line, (size_t)n));
   free(line);
   return v;
 }
@@ -2404,7 +2454,7 @@ NATIVE(n_read_stdin) {
   char buf[4096];
   size_t got;
   while ((got = fread(buf, 1, sizeof buf, stdin)) > 0) sb_add(&sb, buf, got);
-  AxValue v = ax_strv(ax_str_new(sb.buf, sb.len));
+  AxValue v = ax_strv(ax_utf8_repair(sb.buf, sb.len));
   free(sb.buf);
   return v;
 }
@@ -2414,7 +2464,7 @@ NATIVE(n_env) {
   const char *v = getenv(name->data);
   ax_release(ax_strv(name));
   if (!v) return argc > 1 ? ax_copy(args[1]) : ax_null();
-  return ax_str_from(v);
+  return ax_strv(ax_utf8_repair(v, strlen(v)));
 }
 NATIVE(n_exit) {
   int code = ax_to_int32(NUM(0));
@@ -2437,7 +2487,11 @@ NATIVE(n_sh) {
   ax_throw(vm, "AX-SANDBOX-001", "sandbox: running commands is not available in the WebAssembly build");
   FILE *pipe = NULL;
 #else
-  FILE *pipe = popen(cmd->data, "r");
+  bool owned;
+  size_t cn;
+  const char *cmdtext = ax_utf8_out(cmd->data, cmd->len, &cn, &owned);
+  FILE *pipe = popen(cmdtext, "r");
+  if (owned) free((char *)cmdtext);
 #endif
   int status = -1;
   if (pipe) {
@@ -2452,7 +2506,7 @@ NATIVE(n_sh) {
   ax_release(ax_strv(cmd));
   AxDict *d = ax_dict_new();
   AxStr *k_out = ax_internz("out"), *k_code = ax_internz("code");
-  ax_dict_set(d, k_out, ax_strv(ax_str_new(sb.buf, sb.len)));
+  ax_dict_set(d, k_out, ax_strv(ax_utf8_repair(sb.buf, sb.len)));
   ax_dict_set(d, k_code, ax_num(status));
   ax_release(ax_strv(k_out));
   ax_release(ax_strv(k_code));
@@ -2568,6 +2622,22 @@ static bool name_is(AxStr *n, const char *s) { return strcmp(n->data, s) == 0; }
 
 // A method's selector is checked before any element is seen, as the reference builds it first:
 // null (or none), a field name, or something callable — `[].map(2)` is an error, not [].
+// Text as UTF-16 units, for the string methods whose answer depends on them (ustr.c): a
+// decoded copy, and a builder that encodes back.
+typedef struct { uint16_t *u; uint32_t n, cap; } UB;
+static void ub_add(UB *b, const uint16_t *u, uint32_t n) {
+  if (b->n + n > b->cap) {
+    while (b->n + n > b->cap) b->cap = b->cap ? b->cap * 2 : 64;
+    b->u = realloc(b->u, sizeof(uint16_t) * b->cap);
+  }
+  if (n) memcpy(b->u + b->n, u, sizeof(uint16_t) * n);
+  b->n += n;
+}
+static AxValue ub_str(UB *b) {
+  AxValue r = ax_strv(ax_str_from_u16(b->u, b->n));
+  free(b->u);
+  return r;
+}
 static void method_selector(AxVM *vm, AxValue sel) {
   if (sel.t == AX_NULL || sel.t == AX_STR || sel.t == AX_ATOM || sel.t == AX_FN) return;
   ax_throw(vm, "AX-CALL-001", "value of type %s is not callable", ax_type_name(sel));
@@ -2628,19 +2698,12 @@ AxValue ax_method_call(AxVM *vm, AxValue obj, AxStr *name, AxValue *args, int ar
 
   if (obj.t == AX_STR) {
     AxStr *s = (AxStr *)obj.o;
-    if (name_is(name, "len")) return ax_num(s->len);
-    if (name_is(name, "upper") || name_is(name, "lower")) {
-      AxStr *out = ax_str_new(s->data, s->len);
-      bool up = name_is(name, "upper");
-      for (uint32_t i = 0; i < out->len; i++) out->data[i] = (char)(up ? toupper((unsigned char)out->data[i]) : tolower((unsigned char)out->data[i]));
-      return ax_strv(out);
-    }
-    if (name_is(name, "trim") || name_is(name, "trim_start") || name_is(name, "trim_end")) {
-      uint32_t a = 0, b = s->len;
-      if (!name_is(name, "trim_end")) while (a < b && isspace((unsigned char)s->data[a])) a++;
-      if (!name_is(name, "trim_start")) while (b > a && isspace((unsigned char)s->data[b - 1])) b--;
-      return ax_strv(ax_str_new(s->data + a, b - a));
-    }
+    // Lengths, indices and positions are in UTF-16 units, case is full Unicode case mapping and
+    // white space is JavaScript's, as in the reference (ustr.c).
+    if (name_is(name, "len")) return ax_num(ax_str_ulen(s));
+    if (name_is(name, "upper") || name_is(name, "lower")) return ax_strv(ax_str_case(s, name_is(name, "upper")));
+    if (name_is(name, "trim") || name_is(name, "trim_start") || name_is(name, "trim_end"))
+      return ax_strv(ax_str_trim(s, !name_is(name, "trim_end"), !name_is(name, "trim_start")));
     if (name_is(name, "split") && argc == 0) {
       AxArr *out = ax_arr_new(1);   // split() with no separator: the whole string
       ax_retain(obj);
@@ -2656,10 +2719,21 @@ AxValue ax_method_call(AxVM *vm, AxValue obj, AxStr *name, AxValue *args, int ar
     }
     if (name_is(name, "split")) {
       AxStr *sep = argc ? ax_to_str(args[0]) : ax_str_newz("");
-      AxArr *out = ax_arr_new(4);
+      AxArr *out;
       if (!sep->len) {
-        for (uint32_t i = 0; i < s->len; i++) ax_arr_push(out, ax_strv(ax_str_new(s->data + i, 1)));
+        out = ax_str_unit_strings(s);
+      } else if (!ax_str_byte_searchable(sep)) {
+        out = ax_arr_new(4);
+        uint32_t hn, nn;
+        uint16_t *hu = ax_str_units(s, &hn), *nu = ax_str_units(sep, &nn);
+        uint32_t start = 0;
+        for (int64_t at; (at = ax_u16_find(hu, hn, nu, nn, start)) >= 0; start = (uint32_t)at + nn)
+          ax_arr_push(out, ax_strv(ax_str_from_u16(hu + start, (uint32_t)at - start)));
+        ax_arr_push(out, ax_strv(ax_str_from_u16(hu + start, hn - start)));
+        free(hu);
+        free(nu);
       } else {
+        out = ax_arr_new(4);
         uint32_t start = 0;
         for (uint32_t i = 0; i + sep->len <= s->len; ) {
           if (memcmp(s->data + i, sep->data, sep->len) == 0) {
@@ -2678,9 +2752,32 @@ AxValue ax_method_call(AxVM *vm, AxValue obj, AxStr *name, AxValue *args, int ar
     if (name_is(name, "replace") || name_is(name, "replace_all")) {
       AxStr *from = method_text(args, argc, 0);
       AxStr *to = argc > 1 && args[1].t != AX_NULL ? ax_to_str(args[1]) : ax_str_newz("");
+      bool all = name_is(name, "replace_all");
+      if ((!from->len && all && !s->ascii) || !ax_str_byte_searchable(from)) {
+        // By units: between every two of them for an empty pattern, or a pattern that can
+        // match half of a surrogate pair.
+        uint32_t hn, fn, tn;
+        uint16_t *hu = ax_str_units(s, &hn), *fu = ax_str_units(from, &fn), *tu = ax_str_units(to, &tn);
+        UB b = {0};
+        if (!fn) {
+          for (uint32_t i = 0; i < hn; i++) { if (i) ub_add(&b, tu, tn); ub_add(&b, hu + i, 1); }
+        } else {
+          uint32_t i = 0;
+          for (int64_t at; (at = ax_u16_find(hu, hn, fu, fn, i)) >= 0;) {
+            ub_add(&b, hu + i, (uint32_t)at - i);
+            ub_add(&b, tu, tn);
+            i = (uint32_t)at + fn;
+            if (!all) break;
+          }
+          ub_add(&b, hu + i, hn - i);
+        }
+        free(hu); free(fu); free(tu);
+        ax_release(ax_strv(from));
+        ax_release(ax_strv(to));
+        return ub_str(&b);
+      }
       SB sb = {0};
       sb_add(&sb, "", 0);
-      bool all = name_is(name, "replace_all");
       bool done = false;
       // An empty pattern matches before the first character (replace) or between every two
       // (replace_all, which is split("").join(to)).
@@ -2702,35 +2799,41 @@ AxValue ax_method_call(AxVM *vm, AxValue obj, AxStr *name, AxValue *args, int ar
       ax_release(ax_strv(to));
       return r;
     }
-    if (name_is(name, "startsWith")) {
+    if (name_is(name, "startsWith") || name_is(name, "endsWith")) {
       AxStr *p = method_text(args, argc, 0);
-      bool r = p->len <= s->len && memcmp(s->data, p->data, p->len) == 0;
+      bool r, start = name_is(name, "startsWith");
+      if (ax_str_byte_searchable(p)) {
+        r = p->len <= s->len && memcmp(start ? s->data : s->data + s->len - p->len, p->data, p->len) == 0;
+      } else {
+        uint32_t hn, pn;
+        uint16_t *hu = ax_str_units(s, &hn), *pu = ax_str_units(p, &pn);
+        r = pn <= hn && memcmp(start ? hu : hu + hn - pn, pu, sizeof(uint16_t) * pn) == 0;
+        free(hu);
+        free(pu);
+      }
       ax_release(ax_strv(p));
       return ax_bool(r);
     }
-    if (name_is(name, "endsWith")) {
+    if (name_is(name, "includes") || name_is(name, "contains") || name_is(name, "indexOf")) {
       AxStr *p = method_text(args, argc, 0);
-      bool r = p->len <= s->len && memcmp(s->data + s->len - p->len, p->data, p->len) == 0;
+      int64_t at = ax_str_find(s, p);
       ax_release(ax_strv(p));
-      return ax_bool(r);
-    }
-    if (name_is(name, "includes") || name_is(name, "contains")) {
-      AxStr *p = method_text(args, argc, 0);
-      bool r = p->len == 0 || strstr(s->data, p->data) != NULL;
-      ax_release(ax_strv(p));
-      return ax_bool(r);
-    }
-    if (name_is(name, "indexOf")) {
-      AxStr *p = method_text(args, argc, 0);
-      const char *hit = p->len ? strstr(s->data, p->data) : s->data;
-      double idx = hit ? (double)(hit - s->data) : -1;
-      ax_release(ax_strv(p));
-      return ax_num(idx);
+      return name_is(name, "indexOf") ? ax_num((double)at) : ax_bool(at >= 0);
     }
     if (name_is(name, "count")) {
+      // split(p).length - 1: matches that do not overlap, left to right.
       AxStr *p = method_text(args, argc, 0);
       double n = 0;
-      if (p->len) for (uint32_t i = 0; i + p->len <= s->len; ) { if (memcmp(s->data + i, p->data, p->len) == 0) { n++; i += p->len; } else i++; }
+      if (!p->len) {
+      } else if (ax_str_byte_searchable(p)) {
+        for (uint32_t i = 0; i + p->len <= s->len; ) { if (memcmp(s->data + i, p->data, p->len) == 0) { n++; i += p->len; } else i++; }
+      } else {
+        uint32_t hn, pn;
+        uint16_t *hu = ax_str_units(s, &hn), *pu = ax_str_units(p, &pn);
+        for (int64_t at = 0; (at = ax_u16_find(hu, hn, pu, pn, (uint32_t)at)) >= 0; at += pn) n++;
+        free(hu);
+        free(pu);
+      }
       ax_release(ax_strv(p));
       return ax_num(n);
     }
@@ -2754,14 +2857,16 @@ AxValue ax_method_call(AxVM *vm, AxValue obj, AxStr *name, AxValue *args, int ar
       return r;
     }
     if (name_is(name, "slice")) {
+      int64_t n = ax_str_ulen(s);
       int64_t a = argc ? ax_js_int(ax_to_num(args[0])) : 0;
-      int64_t b = argc > 1 && args[1].t != AX_NULL ? ax_js_int(ax_to_num(args[1])) : (int64_t)s->len;
-      if (a < 0) a += s->len;
-      if (b < 0) b += s->len;
+      int64_t b = argc > 1 && args[1].t != AX_NULL ? ax_js_int(ax_to_num(args[1])) : n;
+      if (a < 0) a += n;
+      if (b < 0) b += n;
       if (a < 0) a = 0;
-      if (b > (int64_t)s->len) b = s->len;
+      if (b > n) b = n;
+      if (a > n) a = n;
       if (b < a) b = a;
-      return ax_strv(ax_str_new(s->data + a, (size_t)(b - a)));
+      return ax_strv(ax_str_unit_slice(s, (uint32_t)a, (uint32_t)b));
     }
     if (name_is(name, "padStart") || name_is(name, "padEnd")) {
       // String.prototype.padStart/padEnd: the fill (a space when absent or empty) repeats and is
@@ -2770,6 +2875,20 @@ AxValue ax_method_call(AxVM *vm, AxValue obj, AxStr *name, AxValue *args, int ar
       AxStr *fill = (argc > 1 && args[1].t != AX_NULL) ? ax_to_str(args[1]) : ax_str_newz(" ");
       if (!fill->len) { ax_release(ax_strv(fill)); fill = ax_str_newz(" "); }
       if (want > 536870888) ax_throw(vm, "AX-RUNTIME-000", "Invalid string length");
+      if (!s->ascii || !fill->ascii) {
+        // In units: the fill repeats and is cut to fit, which can cut a surrogate pair.
+        uint32_t hn, fn;
+        uint16_t *hu = ax_str_units(s, &hn), *fu = ax_str_units(fill, &fn);
+        int64_t need = want - (int64_t)hn;
+        UB b = {0};
+        if (!name_is(name, "padStart")) ub_add(&b, hu, hn);
+        for (int64_t k = 0; k < need; k++) ub_add(&b, fu + (k % fn), 1);
+        if (name_is(name, "padStart")) ub_add(&b, hu, hn);
+        free(hu);
+        free(fu);
+        ax_release(ax_strv(fill));
+        return ub_str(&b);
+      }
       int64_t need = want - (int64_t)s->len;
       if (need < 0) need = 0;
       SB sb = {0};
@@ -2784,13 +2903,13 @@ AxValue ax_method_call(AxVM *vm, AxValue obj, AxStr *name, AxValue *args, int ar
     }
     if (name_is(name, "charAt")) {
       int64_t i = argc ? ax_js_int(ax_to_num(args[0])) : 0;
-      if (i < 0 || i >= (int64_t)s->len) return ax_str_from("");
-      return ax_strv(ax_str_new(s->data + i, 1));
+      if (i < 0 || i >= (int64_t)ax_str_ulen(s)) return ax_str_from("");
+      return ax_strv(ax_str_unit_slice(s, (uint32_t)i, (uint32_t)i + 1));
     }
     if (name_is(name, "charCodeAt")) {
       int64_t i = argc ? ax_js_int(ax_to_num(args[0])) : 0;
-      if (i < 0 || i >= (int64_t)s->len) return ax_num(NAN);
-      return ax_num((unsigned char)s->data[i]);
+      int32_t u = i < 0 || i > UINT32_MAX ? -1 : ax_str_unit_at(s, (uint32_t)i);
+      return u < 0 ? ax_num(NAN) : ax_num(u);
     }
     if (name_is(name, "to_int") || name_is(name, "to_num")) {
       // parseInt(s.trim(), radix || 10) / Number(s.trim()), null for NaN.

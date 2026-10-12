@@ -235,6 +235,48 @@ runs the sweep. The rules both runtimes follow:
 - `v.clone()` on a vector or quaternion is a copy (it crashed in the reference); JSON output
   leaves out function values; `[].min()`/`.max()` are `null`.
 
+### Text means the same thing in both runtimes
+
+A JavaScript string is a sequence of UTF-16 code units, and the native runtime counted UTF-8
+bytes: `len("héllo😀")` was 10 there and 7 here, `"é".upper()` stayed `é`, sorting put `～`
+before `😀`, `trim()` left a no-break space, and every index, slice and error column past the
+first non-ASCII character was off. The native runtime now gives text the reference's model
+exactly (`native/ustr.c`), keeping UTF-8 storage so ASCII text costs nothing extra:
+
+- **Units.** `len`, `s[i]` (negative too), `slice`, `charAt`, `charCodeAt`, `indexOf`,
+  `padStart`/`padEnd`, `split("")`, `chars`, iteration, `reverse_str` and `hash` count UTF-16
+  units, so `"😀"[0]` is half of a surrogate pair. A lone surrogate is a real value: it joins
+  its partner (`chr(0xD83D) + chr(0xDE00) == "😀"`, and the two are one dict key), prints as
+  U+FFFD and is written as `\ud83d` in JSON, as Node writes it.
+- **Case.** `upper`/`lower` are `toUpperCase`/`toLowerCase`: full Unicode mappings, including
+  the ones that change length (`ß` → `SS`, `ŉ` → `ʼN`, `İ` → `i̇`) and final sigma
+  (`"ΣΑΣ".lower()` is `σας`). The tables are generated from Node itself
+  (`native/tools/gen_unicode.js`), and difftest puts every code point through both runtimes.
+  `capitalize` and `title` follow from them.
+- **Order and white space.** Strings compare by units (`"😀" < "～"`); `trim`, `words`,
+  `int`, `float`, `Number` and `\s` know JavaScript's white space (U+00A0, U+3000, U+FEFF …).
+- **Input and output.** Source files, `read`, stdin, `sh` output, the environment and
+  arguments are decoded as Node decodes UTF-8 (each ill-formed sequence becomes U+FFFD); output,
+  files, commands and `b64_encode` get UTF-8 with U+FFFD for a lone surrogate.
+- **Regexes** run under a UTF-8 locale and report positions in units, so `.`, classes and `i`
+  treat `é` as one character, as the reference does.
+- Parse and check diagnostics count columns in units.
+
+### Comparison operators follow JavaScript
+
+`<`, `<=`, `>`, `>=` between values of different kinds compared their displayed text natively —
+`"10" < 9` was true, `[] < 1` false, `null < "1"` false. Both runtimes now follow JavaScript's
+relational comparison: both sides to primitives (an array is its joined text, a dict
+`"[object Object]"`), two strings by units, anything else as numbers, and NaN makes all four
+false. `tests/19_compare.ax` checks 784 pairs.
+
+### `;` separates statements everywhere
+
+GRAMMAR.md calls `;` an inline line break, and the native parser took `x = 1; y = 2` in any
+body, but the reference accepted it only in one-line blocks and rejected it everywhere else.
+Both now take it wherever a line break ends a statement (`?c: a; b` is `?c: a` and then `b`,
+as with a line break), and `;;` is an empty statement.
+
 ### Ranges display as their source
 
 A range printed as `Range` in the JavaScript runtime and as `0..3` natively, and `type()` called

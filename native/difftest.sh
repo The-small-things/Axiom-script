@@ -106,6 +106,20 @@ else
   fail=$((fail + 1)); printf 'FAIL checknames.h is stale: node tools/gen_checknames.js > checknames.h\n'
 fi
 
+if node "$ROOT/native/tools/gen_unicode.js" | cmp -s - "$ROOT/native/unicode.h"; then
+  pass=$((pass + 1)); printf 'OK   unicode.h matches the case mapping of this Node\n'
+else
+  fail=$((fail + 1)); printf 'FAIL unicode.h is stale: node tools/gen_unicode.js > unicode.h\n'
+fi
+
+# Text: a source file that is not valid UTF-8, and every code point through upper() and
+# lower() (tests/unicode/gen_case.js), with final sigma in the contexts that decide it.
+run_case "unicode/bad_source.ax" "$ROOT/native/tests/unicode/bad_source.ax"
+UDIR=$(mktemp -d)
+node "$ROOT/native/tests/unicode/gen_case.js" "$UDIR/case.ax"
+run_case "case mapping of every code point" "$UDIR/case.ax"
+rm -rf "$UDIR"
+
 # Imports: a three-file program with a diamond, built in a temp directory.
 IMPDIR=$(mktemp -d)
 printf '~TWO: 2\n^fn triple(x) = x * 3\n' > "$IMPDIR/mathlib.ax"

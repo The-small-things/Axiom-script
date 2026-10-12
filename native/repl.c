@@ -399,7 +399,10 @@ int ax_repl(AxVM *vm) {
   for (;;) {
     if (interactive) { fputs(chunk.len ? "... " : "> ", stdout); fflush(stdout); }
     if (getline(&line, &cap, stdin) < 0) break;
-    if (!feed(line)) break;
+    char *text = ax_text_repair(strdup(line), NULL);   // as Node decodes UTF-8
+    bool more = feed(text);
+    free(text);
+    if (!more) break;
   }
   flush_chunk();
   free(line);

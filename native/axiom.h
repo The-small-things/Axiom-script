@@ -101,7 +101,9 @@ struct AxStr {
   uint32_t len;
   uint32_t hash;
   bool interned;
-  char data[];    // NUL-terminated for convenience with C library calls
+  bool ascii;     // every byte below 0x80, so bytes are UTF-16 units (ustr.c)
+  struct AxStrIndex *ix;   // where every 64th unit is, for a long non-ASCII string (ustr.c)
+  char data[];    // NUL-terminated for convenience with C library calls; WTF-8 (ustr.c)
 };
 
 struct AxArr {
@@ -190,12 +192,39 @@ AxStr *ax_str_concat(AxStr *a, AxStr *b);
 bool ax_str_eq(const AxStr *a, const AxStr *b);
 uint32_t ax_hash_bytes(const char *p, size_t n);
 
+// Text as UTF-16 code units, the reference's model (ustr.c).
+size_t ax_wtf8_normalize(char *buf, size_t n);
+bool ax_bytes_ascii(const char *p, size_t n);
+bool ax_bytes_have_lone(const char *p, size_t n);
+uint32_t ax_u16_count(const char *p, size_t n);
+uint32_t ax_str_ulen(const AxStr *s);
+uint32_t ax_str_units_before(const AxStr *s, size_t byte_off);
+uint16_t *ax_u16_decode(const char *p, size_t n, uint32_t *out_n);   // malloc'd
+uint16_t *ax_str_units(const AxStr *s, uint32_t *out_n);             // malloc'd
+AxStr *ax_str_from_u16(const uint16_t *u, size_t n);
+int32_t ax_str_unit_at(const AxStr *s, uint32_t i);                  // -1 past the end
+AxStr *ax_str_unit_slice(const AxStr *s, uint32_t a, uint32_t b);
+int ax_str_cmp(const AxStr *a, const AxStr *b);
+const char *ax_utf8_out(const char *p, size_t n, size_t *out_n, bool *owned);
+AxStr *ax_utf8_repair(const char *p, size_t n);
+bool ax_unit_is_space(uint32_t u);
+AxStr *ax_str_case(const AxStr *s, bool upper);
+void ax_str_index_free(AxStr *s);
+char *ax_text_repair(char *buf, size_t *n);   // n may be NULL (NUL-terminated)
+bool ax_str_byte_searchable(const AxStr *needle);
+int ax_utf8_next(const char *p, size_t n, uint32_t *cp);   // one code point of WTF-8; its length
+int64_t ax_u16_find(const uint16_t *h, uint32_t hn, const uint16_t *n, uint32_t nn, uint32_t from);
+int64_t ax_str_find(const AxStr *h, const AxStr *n);
+void ax_trim_bytes(const char *p, size_t n, bool start, bool end, size_t *a, size_t *b);
+AxStr *ax_str_trim(const AxStr *s, bool start, bool end);
+
 // Arrays
 AxArr *ax_arr_new(uint32_t cap);
 AxValue ax_arrv(AxArr *a);
 void ax_arr_push(AxArr *a, AxValue v);     // takes ownership of v
 AxValue ax_arr_get(AxArr *a, int64_t i);   // borrowed → returns +1
 void ax_arr_set(AxArr *a, int64_t i, AxValue v);
+AxArr *ax_str_unit_strings(const AxStr *s);   // ustr.c: each UTF-16 unit as a string
 
 // Dicts
 AxDict *ax_dict_new(void);

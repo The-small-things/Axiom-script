@@ -60,12 +60,23 @@ static AxValue entity_value(AxEntity *e) {
 // Output
 // ---------------------------------------------------------------------------------------------
 
+// Text leaves the runtime as Node writes it: UTF-8, a lone surrogate as U+FFFD (ustr.c).
 void ax_write(AxVM *vm, int stream, const char *data, size_t len) {
-  if (vm->write) { vm->write(vm->write_user, stream, data, len); return; }
-  fwrite(data, 1, len, stream == 2 ? stderr : stdout);
+  bool owned;
+  data = ax_utf8_out(data, len, &len, &owned);
+  if (vm->write) vm->write(vm->write_user, stream, data, len);
+  else fwrite(data, 1, len, stream == 2 ? stderr : stdout);
+  if (owned) free((char *)data);
 }
 
 void ax_write_line(AxVM *vm, int stream, const char *data, size_t len) {
+  bool owned;
+  data = ax_utf8_out(data, len, &len, &owned);
+  if (owned) {
+    ax_write_line(vm, stream, data, len);
+    free((char *)data);
+    return;
+  }
   if (!vm->write) {
     FILE *f = stream == 2 ? stderr : stdout;
     fwrite(data, 1, len, f);
@@ -148,7 +159,7 @@ static bool value_in(AxVM *vm, AxValue needle, AxValue hay) {
     case AX_STR: {
       AxStr *h = (AxStr *)hay.o;
       AxStr *n = ax_to_str(needle);
-      bool found = n->len == 0 || (h->len >= n->len && strstr(h->data, n->data) != NULL);
+      bool found = ax_str_find(h, n) >= 0;
       ax_release(ax_strv(n));
       return found;
     }
@@ -246,6 +257,18 @@ static AxValue big_binary(AxVM *vm, int op, AxValue l, AxValue r) {
   }
 }
 
+// ToPrimitive(v, number) as the reference's values answer it (+1).
+static AxValue js_primitive(AxValue v) {
+  switch (v.t) {
+    case AX_NULL: case AX_BOOL: case AX_NUM: case AX_STR: case AX_BIG: return ax_copy(v);
+    case AX_TIMER: return ax_num(((AxTimer *)v.o)->remaining);
+    case AX_ARR: return ax_strv(ax_js_string(v));
+    case AX_DICT: return ax_str_from("[object Object]");
+    case AX_ATOM: ax_retain(v); return ax_strv((AxStr *)v.o);
+    default: return ax_strv(ax_to_str(v));
+  }
+}
+
 static AxValue binary_op(AxVM *vm, int op, AxValue l, AxValue r) {
   // A timer takes part in arithmetic and comparison as its remaining time (the reference's
   // valueOf), so `?cd <= 0:` and `cd - dt` read the way they look.
@@ -275,16 +298,23 @@ static AxValue binary_op(AxVM *vm, int op, AxValue l, AxValue r) {
     case OP_EQ: return ax_bool(ax_equals(l, r));
     case OP_NE: return ax_bool(!ax_equals(l, r));
     case OP_GT: case OP_LT: case OP_GE: case OP_LE: {
-      // Numbers compare numerically, strings lexicographically, as in the reference.
-      bool numeric = (l.t == AX_NUM || l.t == AX_BOOL || l.t == AX_NULL) && (r.t == AX_NUM || r.t == AX_BOOL || r.t == AX_NULL);
-      int c;
-      if (numeric) {
-        double a = ax_to_num(l), b = ax_to_num(r);
-        if (isnan(a) || isnan(b)) return ax_bool(false);
-        c = a < b ? -1 : (a > b ? 1 : 0);
-      } else {
-        c = ax_compare(l, r);
+      // JavaScript's relational comparison: each side to a primitive (an array is its joined
+      // text, a dict "[object Object]", an atom its name); two strings compare by UTF-16
+      // units, anything else as numbers — and NaN on either side makes all four false.
+      AxValue pl = js_primitive(l), pr = js_primitive(r);
+      int c = 0;
+      bool unordered = false;
+      if (pl.t == AX_STR && pr.t == AX_STR) c = ax_str_cmp((AxStr *)pl.o, (AxStr *)pr.o);
+      else if (pl.t == AX_BIG) c = big_relation(pl, pr, &unordered);
+      else if (pr.t == AX_BIG) c = -big_relation(pr, pl, &unordered);
+      else {
+        double a = ax_to_num(pl), b = ax_to_num(pr);
+        if (isnan(a) || isnan(b)) unordered = true;
+        else c = a < b ? -1 : (a > b ? 1 : 0);
       }
+      ax_release(pl);
+      ax_release(pr);
+      if (unordered) return ax_bool(false);
       switch (op) {
         case OP_GT: return ax_bool(c > 0);
         case OP_LT: return ax_bool(c < 0);
@@ -311,12 +341,7 @@ AxValue ax_binary_op(AxVM *vm, int op, AxValue l, AxValue r) { return binary_op(
 AxArr *ax_to_seq(AxVM *vm, AxValue v) {
   switch (v.t) {
     case AX_ARR: ax_retain(v); return (AxArr *)v.o;
-    case AX_STR: {
-      AxStr *s = (AxStr *)v.o;
-      AxArr *a = ax_arr_new(s->len);
-      for (uint32_t i = 0; i < s->len; i++) ax_arr_push(a, ax_strv(ax_str_new(s->data + i, 1)));
-      return a;
-    }
+    case AX_STR: return ax_str_unit_strings((AxStr *)v.o);   // UTF-16 units, as the reference
     case AX_RANGE: {
       AxRange *r = (AxRange *)v.o;
       AxArr *a = ax_arr_new(8);
@@ -367,9 +392,10 @@ AxValue ax_index_get(AxVM *vm, AxValue obj, AxValue idx) {
       AxStr *s = (AxStr *)obj.o;
       if (idx.t == AX_BIG) ax_throw(vm, "AX-RUNTIME-000", "Cannot convert a BigInt value to a number");
       int64_t i = ax_js_int(ax_to_num(idx));
-      if (i < 0) i += s->len;
-      if (i < 0 || (uint64_t)i >= s->len) return ax_null();
-      return ax_strv(ax_str_new(s->data + i, 1));
+      int64_t n = ax_str_ulen(s);   // in UTF-16 units, as the reference indexes
+      if (i < 0) i += n;
+      if (i < 0 || i >= n) return ax_null();
+      return ax_strv(ax_str_unit_slice(s, (uint32_t)i, (uint32_t)i + 1));
     }
     case AX_DICT: {
       AxStr *k = ax_to_str(idx);
@@ -1152,12 +1178,8 @@ AxValue ax_member_get(AxVM *vm, AxValue obj, AxStr *prop) {
       return ax_null();
     case AX_STR: {
       AxStr *s = (AxStr *)obj.o;
-      if (prop == S_length || prop == S_len) return ax_num(s->len);
-      if (prop == S_chars) {
-        AxArr *a = ax_arr_new(s->len);
-        for (uint32_t i = 0; i < s->len; i++) ax_arr_push(a, ax_strv(ax_str_new(s->data + i, 1)));
-        return ax_arrv(a);
-      }
+      if (prop == S_length || prop == S_len) return ax_num(ax_str_ulen(s));
+      if (prop == S_chars) return ax_arrv(ax_str_unit_strings(s));
       ax_throw(vm, "AX-RUNTIME-MEMBER", "no member '%s' on string", prop->data);
       return ax_null();
     }

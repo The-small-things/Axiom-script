@@ -47,7 +47,7 @@ static char *read_file(const char *path) {
   size_t got = fread(buf, 1, (size_t)n, f);
   buf[got] = '\0';
   fclose(f);
-  return buf;
+  return ax_text_repair(buf, NULL);   // as Node reads a file as UTF-8
 }
 
 static char *read_stdin_all(void) {
@@ -59,7 +59,7 @@ static char *read_stdin_all(void) {
     if (len + 1 >= cap) { cap *= 2; buf = realloc(buf, cap); }
   }
   buf[len] = '\0';
-  return buf;
+  return ax_text_repair(buf, NULL);
 }
 
 static void usage(void) {
@@ -164,7 +164,7 @@ int main(int argc, char **argv) {
     vm->allow_exec = allow_exec;
     for (int i = 0; i < n_allow_read; i++) ax_arr_push(vm->allow_read, ax_str_from(allow_read[i]));
     for (int i = 0; i < n_allow_write; i++) ax_arr_push(vm->allow_write, ax_str_from(allow_write[i]));
-    for (int i = 0; i < n_prog_args; i++) ax_arr_push(vm->argv, ax_str_from(prog_args[i]));
+    for (int i = 0; i < n_prog_args; i++) ax_arr_push(vm->argv, ax_strv(ax_utf8_repair(prog_args[i], strlen(prog_args[i]))));
     return ax_repl(vm);
   }
 
@@ -217,7 +217,7 @@ int main(int argc, char **argv) {
   vm->allow_exec = allow_exec;
   for (int i = 0; i < n_allow_read; i++) ax_arr_push(vm->allow_read, ax_str_from(allow_read[i]));
   for (int i = 0; i < n_allow_write; i++) ax_arr_push(vm->allow_write, ax_str_from(allow_write[i]));
-  for (int i = 0; i < n_prog_args; i++) ax_arr_push(vm->argv, ax_str_from(prog_args[i]));
+  for (int i = 0; i < n_prog_args; i++) ax_arr_push(vm->argv, ax_strv(ax_utf8_repair(prog_args[i], strlen(prog_args[i]))));
   vm->source_path = path;
 
   const char *label = path ? path : (use_stdin ? "<stdin>" : "<eval>");

@@ -14,7 +14,9 @@ const SKIP = new Set(['exit', 'sleep', 'sh', 'rm', 'mkdir', 'write', 'append', '
   'print', 'eprint', 'clock', 'now', 'time', 'date_iso', 'random', 'randomRange', 'randomInt', 'random_int',
   'random_range', 'rand', 'shuffle', 'sample', 'choice', 'pick', 'seed', 'gauss', 'uuid', 'ls', 'read', 'read_lines',
   'read_json', 'env', 'args', 'noise', 'timestamp', 'today', 'perf_now', 'time_ms', 'uid']);
-const SHAPES = ['N', 'R', 'S', 'A', 'E', 'D', 'Z', 'T', 'V', 'F', 'B'];
+// U is text past ASCII — two-byte letters, a character outside the BMP (two UTF-16 units),
+// letters whose case changes their length (ß → SS), and sigmas; H holds a lone surrogate.
+const SHAPES = ['N', 'R', 'S', 'A', 'E', 'D', 'Z', 'T', 'V', 'F', 'B', 'U', 'H'];
 let out = [
   '^fn t(label, f):',
   '  ^try:',
@@ -34,6 +36,8 @@ let out = [
   '  V = v3(1, 2, 3)',
   '  F = \\x: x',
   '  B = big(5)',
+  '  U = "Ünï ß😀ΣΑΣ. Σ"',
+  '  H = chr(55357) + "x"',
 ];
 const seen = new Set();   // `A, F` comes from two of the shape loops
 const call = (n, args) => { if (!seen.has(`${n}(${args})`)) { seen.add(`${n}(${args})`); out.push(`  t("${n}(${args})", \\: ${n}(${args}))`); } };
@@ -55,8 +59,8 @@ const METHODS = ['all', 'any', 'capitalize', 'charAt', 'charCodeAt', 'chars', 'c
   'padStart', 'pop', 'push', 'reduce', 'reject', 'repeat', 'replace', 'replace_all', 'reverse', 'set', 'shift', 'slice',
   'some', 'sort', 'sort_by', 'splice', 'split', 'startsWith', 'sum', 'to_int', 'to_num', 'trim', 'trim_end', 'trim_start',
   'uniq', 'unshift', 'upper', 'values', 'words'];
-const RECEIVERS = { N: '(5)', R: '(-2.5)', S: '"ab c"', A: '[5, 2]', E: '[]', D: '{a: 1}', T: '(true)', V: 'v3(1, 2, 3)', B: 'big(5)' };
-const MARGS = ['', '2', 'F', 'S', '2, 3', 'F, 2', 'A', '"a", 2'];
+const RECEIVERS = { N: '(5)', R: '(-2.5)', S: '"ab c"', A: '[5, 2]', E: '[]', D: '{a: 1}', T: '(true)', V: 'v3(1, 2, 3)', B: 'big(5)', U: '"Ünï ß😀ΣΑΣ. Σ"', H: '(chr(55357) + "x")' };
+const MARGS = ['', '2', 'F', 'S', '2, 3', 'F, 2', 'A', '"a", 2', '5, 6', '"😀"', 'U', '9, "é😀"', '-3'];
 for (const m of METHODS) {
   for (const [label, recv] of Object.entries(RECEIVERS)) {
     for (const a of MARGS) out.push(`  t("${label}.${m}(${a.replace(/"/g, "'")})", \\: ${recv}.${m}(${a}))`);

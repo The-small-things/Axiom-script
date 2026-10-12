@@ -1,0 +1,34 @@
+// Text past ASCII: both runtimes count, index, slice, compare and case-map UTF-16 code units,
+// as JavaScript does, and write a lone surrogate as U+FFFD.
+^main:
+  w = "a😀b"
+  hi = chr(55357)
+  lo = chr(56832)
+  print(len(w), len("héllo"), len(hi), len(hi + lo), hi + lo == "😀", (hi + lo).len)
+  print(w[0], w[1] + w[2], w[-1], w.slice(1, 3) == "😀", w.slice(2), w.charCodeAt(1), w.charCodeAt(2))
+  print(chars(w), reversed(w), w.split(""), reverse_str("añb"))
+  out = []
+  *c in "é😀":
+    out.push(ord(c))
+  print(out)
+  print(map("x😀", \c: c + "|"))
+  d = {}
+  d[hi + lo] = 1
+  d["😀"] = d["😀"] + 1
+  print(d, keys(d), has_key(d, "😀"), hi in "😀", lo in w, "😀" in w)
+  print(to_json([hi, lo, hi + lo, "é"]), from_json(to_json(hi)) == hi, json_stringify({k: lo + hi}))
+  print(w.indexOf("b"), w.indexOf(lo), w.startsWith("a" + hi), w.endsWith(lo + "b"), w.count(hi))
+  print(w.replace(hi, "<"), w.replace_all("", "."), w.split(lo), w.padStart(7, "é😀"), "é".padEnd(4, "😀"))
+  print("straße ǈ ΣΑΣ ἀΐ ŉ ﬀ İ".upper(), "STRASSE ǈ ΣΑΣ. ΑΣ'Σ İ".lower())
+  print(capitalize("élan"), capitalize("😀x"), title("ünïcode ﬁne çà"), words("a" + chr(160) + "b" + chr(12288) + "c"))
+  print((chr(65279) + " x " + chr(8233)).trim(), int(chr(160) + "42"), float(chr(8195) + "2.5"), (chr(160) + "3") < 4)
+  print(sorted([chr(65374), "😀", "é", "z", "Z"]), max(["😀", chr(65374)]), "😀" < chr(65374), "é" > "z")
+  print(hash("é😀"), b64_encode("é" + hi), b64_decode("w6nwn5iA"), b64_decode("/w=="))
+  print(f"[{w:>6}][{w:<5}][{'é':*^5}][{w:.2}]")
+  print(re_match("été d'été", "t."), re_all("ça va", "\\w+"), re_sub("éÉ", "é", "e", "i"))
+  print(uniq(chars("ééa")), count(chars("aéé"), "é"), "é" * 1)
+  write("saves/unicode.txt", "é😀" + hi + "!")
+  print(read("saves/unicode.txt"), len(read("saves/unicode.txt")))
+  print(hi, [hi], {k: hi}, lo + "x")
+  bad = read("tests/unicode/invalid.txt")
+  print(bad, len(bad), map(chars(lines(bad)[0]), \c: ord(c)))

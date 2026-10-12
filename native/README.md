@@ -47,13 +47,27 @@ Everything the JavaScript runtime runs, with the same results:
   than Math.random, so they are reproducible here and random there. `infer: exact`
   distributions use no randomness and match exactly.
 * `--json` combined with `--terminal` prints the `--sim` state format.
-* **Text is UTF-8 bytes here and UTF-16 code units there.** ASCII text behaves identically;
-  beyond it, lengths, indices and slices count bytes rather than code units
-  (`len("héllo😀")` is 10 here, 7 there) and `upper`/`lower` change only ASCII letters.
-* **Regular expressions** run on the C library's POSIX engine behind a translation of
-  JavaScript syntax (`\d \w \s \b`, classes, `{n,m}`, the `i` flag). The common syntax and the
-  flag checks agree; the message for a malformed pattern differs, and constructs POSIX lacks
-  (lookaround, backreferences, lazy quantifiers) are not guaranteed to behave the same.
+* **Regular expressions** run on the C library's POSIX engine, under a UTF-8 locale, behind a
+  translation of JavaScript syntax (`\d \w \s \b`, classes, `{n,m}`, the `i` flag); match
+  positions are reported in UTF-16 units. The common syntax, non-ASCII text in the Basic
+  Multilingual Plane and the flag checks agree. The message for a malformed pattern differs,
+  `.` takes a character outside the BMP whole where JavaScript takes half of it, and constructs
+  POSIX lacks (lookaround, backreferences, lazy quantifiers) are not guaranteed to behave the
+  same.
+
+### Text
+
+Text is what it is in the reference: a sequence of UTF-16 code units (`ustr.c`). Lengths,
+indices, slices, `charCodeAt`, padding, ordering and `split("")` count units, so `len("a😀b")`
+is 4 and `"😀"[0]` is half of a surrogate pair; `upper`/`lower` are full Unicode case mapping
+(`ß` → `SS`, final sigma), from tables generated out of Node (`tools/gen_unicode.js` →
+`unicode.h`); `trim`, `words` and `\s` know JavaScript's white space. Storage stays UTF-8 — a
+lone surrogate in its 3-byte generalized form, a pair always joined — so ASCII text costs
+nothing extra, and a long non-ASCII string keeps an index of every 64th unit so `s[i]` in a
+loop stays linear. Text leaving the runtime is written as Node writes it (a lone surrogate as
+U+FFFD, or `\ud83d` in JSON); text entering it — source files, `read`, stdin, `sh`, the
+environment, arguments — is decoded as Node decodes UTF-8, each ill-formed sequence becoming
+U+FFFD. Error columns count units too.
 
 ## Embedding: the C API and WebAssembly
 
@@ -112,10 +126,10 @@ The JavaScript implementation is the specification, so verification is different
 program on **both** runtimes and require the same result.
 
 ```
-./difftest.sh        # 87 checks: language, --json, the REPL, the checker, imports, examples,
-                     # 25 engine programs, math, number formatting, big integers, .glb loading,
-                     # terminal, rendering, the library sweep, the C API, and WebAssembly
-                     # against this binary
+./difftest.sh        # 92 checks: language, --json, the REPL, the checker, imports, examples,
+                     # 25 engine programs, math, number formatting, big integers, Unicode
+                     # text, .glb loading, terminal, rendering, the library sweep, the C API,
+                     # and WebAssembly against this binary
 make debug           # ASan + UBSan build; the corpus runs clean under both
 ```
 
@@ -133,8 +147,14 @@ make debug           # ASan + UBSan build; the corpus runs clean under both
   32- and 64-bit limb boundaries to 80-digit randoms, through every operator and comparison,
   plus conversions from doubles and parsing edge cases: identical to V8's BigInt.
 * **The library** — `tests/libsweep/gen.js`: every library function with 0–3 arguments of
-  eleven shapes, 80 methods on nine receivers, field-name selectors and mixed-value sorts —
-  17 399 calls, each with the same result or the same error (code and message).
+  thirteen shapes (non-ASCII text and a lone surrogate among them), 80 methods on eleven
+  receivers, field-name selectors and mixed-value sorts — 24 815 calls, each with the same
+  result or the same error (code and message).
+* **Text** — every code point through `upper()` and `lower()` (`tests/unicode/gen_case.js`),
+  final sigma in 24 contexts, a source file and a data file of ill-formed UTF-8, and
+  `tests/18_unicode.ax`: indexing, slicing, surrogate halves joining, dict keys, JSON, files,
+  f-string widths, regexes. `tests/19_compare.ax` holds `< <= > >=` to JavaScript's rules over
+  28 values of every kind.
 * **The checker** — `--check --json` on a corpus that trips every diagnostic, on every other
   program here, and on 300 mutants of them: identical but for a parse error's wording.
 * **`.glb` loading** — 29 hand-made files (index types, missing attributes, skins, animations,
@@ -238,6 +258,7 @@ rasterizer's span loop), and nothing is there yet.
 |---|---|
 | `axiom.h` | the whole public surface: values, tokens, AST, VM, engine types |
 | `value.c` | refcounting, strings, arrays, insertion-ordered dictionaries, scopes |
+| `ustr.c`, `unicode.h` | text as UTF-16 units over UTF-8 storage, case mapping (the tables are generated by `tools/gen_unicode.js`) |
 | `lexer.c` | indentation, sigils, f-strings, bracket continuation |
 | `parser.c` | recursive descent into an arena-allocated AST, engine declarations included |
 | `interp.c` | evaluation, calls, patterns, errors, the assignment rule |

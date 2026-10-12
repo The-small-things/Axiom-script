@@ -73,11 +73,14 @@ static AxStr *str_alloc(const char *data, size_t len) {
   AxStr *s = xalloc(sizeof(AxStr) + len + 1);
   s->hdr.rc = 1;
   s->hdr.type = AX_STR;
-  s->len = (uint32_t)len;
   if (len && data) memcpy(s->data, data, len);
+  s->ascii = ax_bytes_ascii(s->data, len);
+  if (!s->ascii) len = ax_wtf8_normalize(s->data, len);   // one form per unit sequence (ustr.c)
+  s->len = (uint32_t)len;
   s->data[len] = '\0';
   s->hash = ax_hash_bytes(s->data, len);
   s->interned = false;
+  s->ix = NULL;
   return s;
 }
 
@@ -85,6 +88,15 @@ AxStr *ax_str_new(const char *data, size_t len) { return str_alloc(data, len); }
 AxStr *ax_str_newz(const char *cstr) { return str_alloc(cstr, strlen(cstr)); }
 
 AxStr *ax_intern(const char *data, size_t len) {
+  if (len && memchr(data, 0xED, len)) {
+    // Look up the normalized form, the one a string with these units would hold.
+    char *tmp = malloc(len);
+    memcpy(tmp, data, len);
+    size_t n = ax_wtf8_normalize(tmp, len);
+    AxStr *r = n == len ? NULL : ax_intern(tmp, n);
+    free(tmp);
+    if (r) return r;
+  }
   if (!g_intern.cap) intern_grow();
   if (g_intern.len * 4 >= g_intern.cap * 3) intern_grow();
   uint32_t h = ax_hash_bytes(data, len);
@@ -127,6 +139,7 @@ static void obj_free(AxObj *o) {
     case AX_STR: {
       AxStr *s = (AxStr *)o;
       if (s->interned) { s->hdr.rc = 1; return; }   // the intern table keeps it alive
+      if (s->ix) ax_str_index_free(s);
       free(s);
       return;
     }
@@ -210,9 +223,15 @@ AxStr *ax_str_concat(AxStr *a, AxStr *b) {
   AxStr *s = xalloc(sizeof(AxStr) + a->len + b->len + 1);
   s->hdr.rc = 1;
   s->hdr.type = AX_STR;
+  s->interned = false;
+  s->ix = NULL;
   s->len = a->len + b->len;
   memcpy(s->data, a->data, a->len);
   memcpy(s->data + a->len, b->data, b->len);
+  s->ascii = a->ascii && b->ascii;
+  // A high surrogate at the end of a meeting a low one at the start of b make one character.
+  if (!s->ascii && a->len >= 3 && b->len >= 3 && (uint8_t)b->data[0] == 0xED && (uint8_t)a->data[a->len - 3] == 0xED)
+    s->len = (uint32_t)ax_wtf8_normalize(s->data, s->len);
   s->data[s->len] = '\0';
   s->hash = ax_hash_bytes(s->data, s->len);
   return s;
@@ -510,7 +529,7 @@ int ax_compare(AxValue a, AxValue b) {
     return x - y;
   }
   AxStr *sa = ax_to_str(a), *sb = ax_to_str(b);
-  int c = strcmp(sa->data, sb->data);
+  int c = ax_str_cmp(sa, sb);
   ax_release(ax_strv(sa));
   ax_release(ax_strv(sb));
   return c < 0 ? -1 : (c > 0 ? 1 : 0);

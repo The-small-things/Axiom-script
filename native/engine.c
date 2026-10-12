@@ -572,6 +572,13 @@ static void jstr(JB *b, const char *s, size_t n) {
       case '\f': jb(b, "\\f"); break;
       default:
         if (c < 0x20) { char u[8]; snprintf(u, sizeof u, "\\u%04x", c); jb(b, u); }
+        else if (c == 0xED && i + 2 < n && (unsigned char)s[i + 1] >= 0xA0) {
+          // A lone surrogate (ustr.c), which JSON.stringify writes as an escape.
+          char u[8];
+          snprintf(u, sizeof u, "\\u%04x", 0xD000 | (((unsigned char)s[i + 1] & 0x3F) << 6) | ((unsigned char)s[i + 2] & 0x3F));
+          jb(b, u);
+          i += 2;
+        }
         else jbn(b, (const char *)&c, 1);
     }
   }

@@ -36,7 +36,7 @@ static char *read_file(const char *path) {
   size_t got = fread(buf, 1, (size_t)n, f);
   buf[got] = '\0';
   fclose(f);
-  return buf;
+  return ax_text_repair(buf, NULL);   // as Node reads a file as UTF-8
 }
 
 static bool import_seen(ImportSet *set, const char *path) {

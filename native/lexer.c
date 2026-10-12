@@ -170,10 +170,11 @@ static char *decode_escapes(const char *s, int n, int *out_len) {
 
 static void scan_line(AxTokens *t, const char *line, int len, int lineno) {
   int i = 0;
+  bool ascii = ax_bytes_ascii(line, (size_t)len);   // else columns count UTF-16 units, as the reference's
   while (i < len) {
     char c = line[i];
     if (c == ' ' || c == '\t') { i++; continue; }
-    int col = i + 1;
+    int col = (ascii ? i : (int)ax_u16_count(line, (size_t)i)) + 1;
 
     // f-strings: f"..." or $"...", one token carrying the raw payload.
     if ((c == 'f' || c == '$') && i + 1 < len && line[i + 1] == '"') {

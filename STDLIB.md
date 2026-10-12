@@ -22,6 +22,9 @@ Conventions:
   member, else `null`) or a callable — anything else is `AX-CALL-001 value of type … is not
   callable`. Sorting orders numbers numerically, a boolean by truthiness, anything else by its
   displayed text, and is stable
+* **text** is a sequence of UTF-16 code units, as in JavaScript, in both runtimes: `len("a😀b")`
+  is 4, indices and slices count units, `upper`/`lower` are full Unicode case mapping
+  (`"ß".upper()` is `"SS"`), and `trim`/`words` know Unicode white space
 
 ---
 
