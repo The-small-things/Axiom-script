@@ -12,7 +12,7 @@ const expect = argv.includes('--expect') ? Number(argv[argv.indexOf('--expect') 
 function parse(file) {
   const out = new Map();
   let key = null;
-  for (const line of fs.readFileSync(file, 'latin1').split('\n')) {
+  for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
     const m = /^([a-zA-Z_][a-zA-Z0-9_.]*\([^)]*\)) (=>|!!) /.exec(line);
     if (m) { key = m[1]; out.set(key, line.slice(m[1].length + 1)); }
     else if (key && line !== '') out.set(key, out.get(key) + '\n' + line);

@@ -258,9 +258,50 @@ exactly (`native/ustr.c`), keeping UTF-8 storage so ASCII text costs nothing ext
 - **Input and output.** Source files, `read`, stdin, `sh` output, the environment and
   arguments are decoded as Node decodes UTF-8 (each ill-formed sequence becomes U+FFFD); output,
   files, commands and `b64_encode` get UTF-8 with U+FFFD for a lone surrogate.
-- **Regexes** run under a UTF-8 locale and report positions in units, so `.`, classes and `i`
-  treat `é` as one character, as the reference does.
 - Parse and check diagnostics count columns in units.
+
+### Regular expressions are JavaScript's
+
+The native `re_*` functions ran the C library's POSIX engine behind a translation of the
+common escapes, so lookaround, backreferences, lazy quantifiers, named groups, `$1` in a
+replacement, captures in `re_split`, the `u`/`v`/`y`/`s` flags and `\p{…}` were missing or
+different, and every malformed pattern had another message. `native/regex.c` is an ECMAScript
+regular expression engine that matches V8 behaviour for behaviour:
+
+- **Syntax**: all of ES2024 — groups, named groups and `\k<name>`, lookahead and lookbehind,
+  backreferences, greedy and lazy quantifiers, `\p{…}` / `\P{…}` (General_Category, binary
+  properties, Script and Script_Extensions by every name V8 accepts), and under `v` class set
+  operations (`[\p{L}--[aeiou]]`, `&&`), `\q{…}` and the properties of strings
+  (`\p{RGI_Emoji}`). Without `u` or `v`, Annex B's legacy forms: octal escapes, a literal `{`
+  or `]`, `\c` before a non-letter, `\8`.
+- **Matching** on UTF-16 units, with the specification's matcher semantics (captures reset per
+  iteration, empty iterations past the minimum rejected, atomic lookarounds, lookbehind read
+  right to left), and V8's own choices where it departs from the specification: a `u`/`v`
+  search moves one unit at a time and, at a position inside a surrogate pair, tries the pair's
+  start first; `split` without `y` runs V8's own loop; `v` does not count as unicode when a
+  sticky `split` steps on.
+- **Case-insensitive** matching from tables of which characters `/i`, `/iu` and `/iv` treat
+  as one, read out of V8 itself by matching every character (`native/tools/gen_regex.js`);
+  under `v` a negated class or property is complemented after folding, as V8 does.
+- **Errors**: V8's message for every malformed pattern, found in the order V8 finds them
+  (a duplicate group name when the second group closes, an unknown named reference at the
+  end), and the reference's handling of it: `re_*` report `bad regular expression /…/: …`
+  (unless a line break in the pattern defeats the reference's prefix-stripping, as it does
+  there), the `.match` method the raw `Invalid regular expression: /…/flags: …`.
+- **The wrappers** follow the specification's `exec`, `@@match`, `@@replace` (`$$ $& $\` $'
+  $n $nn $<name>`) and `@@split` (captures between the pieces).
+
+`tests/regex/gen.js` makes random patterns from a grammar of every construct, plus malformed
+variations, with random flags and subjects holding accents, Greek, `K`/`ſ`/`ß`, emoji and lone
+surrogates, through all five functions and `.match`; difftest runs 3 000 of them (15 750 calls)
+and 30 more seeds (630 000 calls) ran with no difference. `tests/regex/gen_fold.js` checks
+case-insensitive matching of every cased character and of random ranges under `i`, `iu` and
+`iv`. On a 240 KB text the new engine is about 50× faster than the POSIX one was.
+
+Two changes in the reference, found while testing it: `re_all` with `u` moved on from an empty
+match by one unit, which lands inside a surrogate pair that the regex reads as the pair again —
+it looped forever and now steps by a character; and `re_match` with `g` returns `index: null`
+instead of a key holding `undefined`.
 
 ### Comparison operators follow JavaScript
 

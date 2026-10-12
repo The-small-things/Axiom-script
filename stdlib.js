@@ -302,8 +302,26 @@ function stdlibIntrinsics(world, rt) {
     // Regular expressions. `re_*` take the pattern as a plain string, so no regex literal
     // syntax has to be added to the lexer (and no escaping rules have to be learned twice).
     re_test: (s, pat, flags) => buildRegex(text(pat), flags).test(text(s)),
-    re_match: (s, pat, flags) => { const m = text(s).match(buildRegex(text(pat), flags)); if (!m) return null; return { match: m[0], index: m.index, groups: Array.from(m).slice(1) }; },
-    re_all: (s, pat, flags) => { const re = buildRegex(text(pat), (flags || '') + (String(flags || '').includes('g') ? '' : 'g')); const out = []; let m; while ((m = re.exec(text(s))) !== null) { out.push({ match: m[0], index: m.index, groups: Array.from(m).slice(1) }); if (m.index === re.lastIndex) re.lastIndex++; } return out; },
+    // v0.9.3: with the g flag, match() gives every match and no index, which is null here (a
+    // program has no undefined to hold).
+    re_match: (s, pat, flags) => { const m = text(s).match(buildRegex(text(pat), flags)); if (!m) return null; return { match: m[0], index: m.index === undefined ? null : m.index, groups: Array.from(m).slice(1) }; },
+    // v0.9.3: after an empty match the search moves on by a whole character under u or v —
+    // one unit would land inside a surrogate pair, which the regex reads as the pair again,
+    // forever.
+    re_all: (s, pat, flags) => {
+      const re = buildRegex(text(pat), (flags || '') + (String(flags || '').includes('g') ? '' : 'g'));
+      const str = text(s);
+      const out = [];
+      let m;
+      while ((m = re.exec(str)) !== null) {
+        out.push({ match: m[0], index: m.index, groups: Array.from(m).slice(1) });
+        if (m.index === re.lastIndex) {
+          const c = str.codePointAt(re.lastIndex);
+          re.lastIndex += (re.unicode || re.unicodeSets) && c > 0xffff ? 2 : 1;
+        }
+      }
+      return out;
+    },
     re_sub: (s, pat, repl, flags) => text(s).replace(buildRegex(text(pat), (flags || '') + (String(flags || '').includes('g') ? '' : 'g')), text(repl)),
     re_split: (s, pat, flags) => text(s).split(buildRegex(text(pat), flags)),
     b64_encode: (s) => Buffer.from(text(s), 'utf8').toString('base64'),

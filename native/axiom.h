@@ -210,6 +210,19 @@ AxStr *ax_utf8_repair(const char *p, size_t n);
 bool ax_unit_is_space(uint32_t u);
 AxStr *ax_str_case(const AxStr *s, bool upper);
 void ax_str_index_free(AxStr *s);
+
+// JavaScript regular expressions over UTF-16 units (regex.c). ax_regex_compile returns NULL with
+// V8's message for a malformed pattern in err (flags are checked by the caller).
+typedef struct AxRegex AxRegex;
+AxRegex *ax_regex_compile(const uint16_t *pat, uint32_t n, const char *flags, char *err, size_t errsz);
+void ax_regex_free(AxRegex *re);
+int ax_regex_ncaps(const AxRegex *re);            // capture groups, group 0 included
+bool ax_regex_global(const AxRegex *re);
+bool ax_regex_sticky(const AxRegex *re);
+bool ax_regex_unicode(const AxRegex *re);         // u or v
+bool ax_regex_u_flag(const AxRegex *re);          // u itself
+const uint16_t *ax_regex_group_name(const AxRegex *re, int group, uint32_t *len);
+int ax_regex_exec(AxRegex *re, const uint16_t *s, uint32_t n, uint32_t start, int32_t *caps);
 char *ax_text_repair(char *buf, size_t *n);   // n may be NULL (NUL-terminated)
 bool ax_str_byte_searchable(const AxStr *needle);
 int ax_utf8_next(const char *p, size_t n, uint32_t *cp);   // one code point of WTF-8; its length
@@ -516,6 +529,7 @@ void ax_write_line(AxVM *vm, int stream, const char *data, size_t len);   // app
 
 // Raise a runtime error. Never returns.
 void ax_throw(AxVM *vm, const char *code, const char *fmt, ...);
+void ax_throw_str(AxVM *vm, const char *code, AxStr *msg);   // takes msg
 void ax_throw_value(AxVM *vm, AxValue v);
 
 // Execution

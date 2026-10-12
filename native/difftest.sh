@@ -267,6 +267,27 @@ else
 fi
 rm -rf "$SDIR"
 
+# Regular expressions: random patterns (and malformed variations) with random flags and
+# subjects through every re_* function (tests/regex/gen.js), then case-insensitive matching of
+# every cased character and of random ranges (tests/regex/gen_fold.js).
+RXDIR=$(mktemp -d)
+node "$ROOT/native/tests/regex/gen.js" "$RXDIR/rx.ax" 3000 20261012
+(cd "$RXDIR" && $NODE_RUN rx.ax > js.txt 2>&1; "$NATIVE" rx.ax > c.txt 2>&1)
+calls=$(grep -c '^  t("' "$RXDIR/rx.ax")
+if node "$ROOT/native/tests/libsweep/compare.js" "$RXDIR/js.txt" "$RXDIR/c.txt" --expect "$calls" > /tmp/ax_rx.txt 2>&1; then
+  pass=$((pass + 1)); printf 'OK   regex fuzz: %s\n' "$(tail -1 /tmp/ax_rx.txt)"
+else
+  fail=$((fail + 1)); printf 'FAIL regex fuzz\n'; head -24 /tmp/ax_rx.txt; tail -2 /tmp/ax_rx.txt
+fi
+node "$ROOT/native/tests/regex/gen_fold.js" "$RXDIR/fold.ax"
+run_case "regex case folding of every cased character" "$RXDIR/fold.ax"
+rm -rf "$RXDIR"
+if node "$ROOT/native/tools/gen_regex.js" | cmp -s - "$ROOT/native/regex_tables.h"; then
+  pass=$((pass + 1)); printf 'OK   regex_tables.h matches the regexes of this Node\n'
+else
+  fail=$((fail + 1)); printf 'FAIL regex_tables.h is stale: node tools/gen_regex.js > regex_tables.h\n'
+fi
+
 # The embedding API: a C host driving every entry point (tests/api/apitest.c).
 if make -s -C "$ROOT/native" tests/api/apitest > /dev/null 2>&1 && "$ROOT/native/tests/api/apitest" > /tmp/ax_api.txt 2>&1; then
   pass=$((pass + 1)); printf 'OK   embedding API: %s\n' "$(tail -1 /tmp/ax_api.txt)"

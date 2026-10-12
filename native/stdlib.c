@@ -19,8 +19,6 @@
 #include <math.h>
 #include "jsmath.h"
 #include <time.h>
-#include <regex.h>
-#include <locale.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <dirent.h>
@@ -52,6 +50,23 @@ static AxStr *arg_str(AxValue v) { return ax_to_str(v); }   // +1
 static AxValue str_take(AxStr *s) { return ax_strv(s); }
 
 static AxValue num_or_null(double d, bool ok) { return ok ? ax_num(d) : ax_null(); }
+
+// Text as UTF-16 units, for the string methods whose answer depends on them (ustr.c): a
+// decoded copy, and a builder that encodes back.
+typedef struct { uint16_t *u; uint32_t n, cap; } UB;
+static void ub_add(UB *b, const uint16_t *u, uint32_t n) {
+  if (b->n + n > b->cap) {
+    while (b->n + n > b->cap) b->cap = b->cap ? b->cap * 2 : 64;
+    b->u = realloc(b->u, sizeof(uint16_t) * b->cap);
+  }
+  if (n) memcpy(b->u + b->n, u, sizeof(uint16_t) * n);
+  b->n += n;
+}
+static AxValue ub_str(UB *b) {
+  AxValue r = ax_strv(ax_str_from_u16(b->u, b->n));
+  free(b->u);
+  return r;
+}
 
 static int cmp_values_asc(const void *a, const void *b) {
   return ax_compare(*(const AxValue *)a, *(const AxValue *)b);
@@ -569,163 +584,161 @@ static AxValue json_read(JP *j) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Regular expressions
+// Regular expressions: JavaScript's, from regex.c, behind the reference's re_* functions
 // ---------------------------------------------------------------------------------------------
-//
-// Translate the JavaScript-flavoured escapes a program is likely to write into POSIX ERE.
-// Anything else passes through unchanged, so a genuinely POSIX pattern still works.
-#define JS_SPACE "\xC2\xA0\xE1\x9A\x80\xE2\x80\x80\xE2\x80\x81\xE2\x80\x82\xE2\x80\x83\xE2\x80\x84\xE2\x80\x85\xE2\x80\x86\xE2\x80\x87\xE2\x80\x88\xE2\x80\x89\xE2\x80\x8A\xE2\x80\xA8\xE2\x80\xA9\xE2\x80\xAF\xE2\x81\x9F\xE3\x80\x80\xEF\xBB\xBF"
-static char *re_translate(const char *pat) {
-  size_t n = strlen(pat);
-  char *out = malloc(n * 40 + 64);   // \s alone becomes a 70-byte class
-  size_t j = 0;
-  bool in_class = false;
-  for (size_t i = 0; i < n; i++) {
-    char c = pat[i];
-    // JavaScript's [] matches nothing and [^] anything; POSIX has neither (a C string holds
-    // no NUL byte, so a class of every other byte stands in).
-    if (c == '[' && !in_class && (i == 0 || pat[i - 1] != '\\')) {
-      const char *cls = pat[i + 1] == ']' ? "[^\x01-\xff]" : (pat[i + 1] == '^' && pat[i + 2] == ']') ? "[\x01-\xff]" : NULL;
-      if (cls) { size_t cl = strlen(cls); memcpy(out + j, cls, cl); j += cl; i += pat[i + 1] == ']' ? 1 : 2; continue; }
-    }
-    if (c == '[' && (i == 0 || pat[i - 1] != '\\')) in_class = true;
-    else if (c == ']' && in_class) in_class = false;
-    // A brace that does not make a quantifier ({n}, {n,}, {n,m} after something to repeat) is
-    // a literal in JavaScript; POSIX would reject it.
-    if (c == '{' && !in_class) {
-      size_t k = i + 1;
-      bool digits = false;
-      while (pat[k] >= '0' && pat[k] <= '9') { k++; digits = true; }
-      if (digits && pat[k] == ',') { k++; while (pat[k] >= '0' && pat[k] <= '9') k++; }
-      bool quant = digits && pat[k] == '}' && j > 0 && out[j - 1] != '(' && out[j - 1] != '|';
-      if (!quant) { out[j++] = '\\'; out[j++] = '{'; continue; }
-    }
-    if (c == '\\' && i + 1 < n) {
-      char e = pat[++i];
-      const char *rep = NULL;
-      switch (e) {
-        case 'd': rep = in_class ? "0-9" : "[0-9]"; break;
-        case 'D': rep = in_class ? "^0-9" : "[^0-9]"; break;
-        case 'w': rep = in_class ? "A-Za-z0-9_" : "[A-Za-z0-9_]"; break;
-        case 'W': rep = in_class ? "^A-Za-z0-9_" : "[^A-Za-z0-9_]"; break;
-        // JavaScript's white space, past ASCII too (U+00A0, U+1680, U+2000..U+200A, U+2028,
-        // U+2029, U+202F, U+205F, U+3000, U+FEFF), listed rather than ranged.
-        case 's': rep = in_class ? " \t\n\r\f\v" JS_SPACE : "[ \t\n\r\f\v" JS_SPACE "]"; break;
-        case 'S': rep = in_class ? "^ \t\n\r\f\v" JS_SPACE : "[^ \t\n\r\f\v" JS_SPACE "]"; break;
-        case 'n': rep = "\n"; break;
-        case 't': rep = "\t"; break;
-        default: out[j++] = '\\'; out[j++] = e; continue;
-      }
-      size_t rl = strlen(rep);
-      memcpy(out + j, rep, rl);
-      j += rl;
-      continue;
-    }
-    out[j++] = c;
+
+// String(v), as `new RegExp(p, flags)` reads its flags.
+static AxStr *js_text(AxValue v) {
+  if (v.t == AX_ARR) return ax_js_string(v);
+  if (v.t == AX_DICT) return ax_str_newz("[object Object]");
+  return ax_to_str(v);
+}
+// JavaScript truthiness (an empty array or dict is true), as `flags || ''` sees it.
+static bool js_truthy(AxValue v) {
+  switch (v.t) {
+    case AX_NULL: return false;
+    case AX_BOOL: return v.b;
+    case AX_NUM: return v.num != 0 && !isnan(v.num);
+    case AX_STR: return ((AxStr *)v.o)->len > 0;
+    case AX_BIG: return !ax_big_is_zero((AxBig *)v.o);
+    default: return true;
   }
-  out[j] = '\0';
-  return out;
 }
 
-// A regex's flags, as new RegExp checks them: letters from "dgimsuyv", none twice (re_all and
-// re_sub add "g" first). Only "i" changes what POSIX matching does.
-static bool re_flags(AxVM *vm, AxValue patv, AxValue flagsv, bool add_g) {
-  AxStr *f = flagsv.t == AX_NULL ? ax_str_newz("") : ax_to_str(flagsv);
-  char buf[64];
-  snprintf(buf, sizeof buf, "%s%s", f->data, add_g && !strchr(f->data, 'g') ? "g" : "");
-  bool seen[128] = { 0 }, ok = strlen(f->data) < 60;
-  for (const char *c = buf; *c && ok; c++) {
-    ok = strchr("dgimsuyv", *c) && !seen[(unsigned char)*c];
-    if (ok) seen[(unsigned char)*c] = true;
-  }
+// The flags text: String(flags) (nothing for null), or for re_all/re_sub `(flags || '')` with a
+// "g" added when it has none. Checked as the RegExp constructor checks it.
+static char *rx_flags(AxVM *vm, AxStr *pat, AxValue flagsv, bool add_g) {
+  AxStr *f = add_g ? (js_truthy(flagsv) ? js_text(flagsv) : ax_str_newz("")) : (flagsv.t == AX_NULL ? ax_str_newz("") : js_text(flagsv));
+  size_t n = f->len;
+  char *flags = malloc(n + 2);
+  memcpy(flags, f->data, n);
+  if (add_g && !memchr(f->data, 'g', n)) flags[n++] = 'g';
+  flags[n] = '\0';
   ax_release(ax_strv(f));
+  bool seen[128] = { 0 }, ok = strlen(flags) == n;
+  for (size_t i = 0; i < n && ok; i++) {
+    unsigned char c = (unsigned char)flags[i];
+    ok = c < 128 && strchr("dgimsuyv", c) && c && !seen[c];
+    if (ok) seen[c] = true;
+  }
+  if (ok && seen['u'] && seen['v']) ok = false;
   if (!ok) {
-    AxStr *p = ax_to_str(patv);
-    char patbuf[256];
-    snprintf(patbuf, sizeof patbuf, "%s", p->data);
-    ax_release(ax_strv(p));
-    ax_throw(vm, "AX-REGEX", "bad regular expression /%s/: Invalid flags supplied to RegExp constructor '%s'", patbuf, buf);
+    SB sb = {0};
+    sb_addz(&sb, "bad regular expression /");
+    sb_add(&sb, pat->data, pat->len);
+    sb_addz(&sb, "/: Invalid flags supplied to RegExp constructor '");
+    sb_add(&sb, flags, n);
+    sb_addz(&sb, "'");
+    free(flags);
+    AxStr *msg = ax_str_new(sb.buf, sb.len);
+    free(sb.buf);
+    ax_throw_str(vm, "AX-REGEX", msg);
   }
-  return seen['i'];
+  return flags;
 }
 
-// Patterns compile and run under a UTF-8 locale, so that `.`, a class and case-insensitive
-// matching take a character past ASCII as one character, as the reference's regexes do for
-// anything in the Basic Multilingual Plane. Only this thread, and only for the call.
-#ifdef __wasi__
-// wasi-libc keys multibyte matching to the global locale (uselocale leaves it single-byte), and
-// a WebAssembly instance has no other threads to disturb.
-typedef char *ReSaved;
-static ReSaved re_enter(void) {
-  const char *cur = setlocale(LC_CTYPE, NULL);
-  char *saved = strdup(cur ? cur : "C");
-  setlocale(LC_CTYPE, "C.UTF-8");
-  return saved;
-}
-static void re_leave(ReSaved saved) { setlocale(LC_CTYPE, saved); free(saved); }
-#else
-typedef locale_t ReSaved;
-static locale_t re_locale(void) {
-  static locale_t loc;
-  static bool tried;
-  if (!tried) {
-    tried = true;
-    loc = newlocale(LC_CTYPE_MASK, "C.UTF-8", (locale_t)0);
-    if (!loc) loc = newlocale(LC_CTYPE_MASK, "en_US.UTF-8", (locale_t)0);
-  }
-  return loc;
-}
-static ReSaved re_enter(void) { locale_t loc = re_locale(); return loc ? uselocale(loc) : (locale_t)0; }
-static void re_leave(ReSaved saved) { if (saved) uselocale(saved); }
-#endif
-static int re_comp(regex_t *re, const char *pat, int flags) {
-  ReSaved saved = re_enter();
-  int rc = regcomp(re, pat, flags);
-  re_leave(saved);
-  return rc;
-}
-static int re_exec(const regex_t *re, const char *s, size_t n, regmatch_t *m, int flags) {
-  ReSaved saved = re_enter();
-  int rc = regexec(re, s, n, m, flags);
-  re_leave(saved);
-  return rc;
-}
-// After an empty match the search moves on by one character, not into the middle of one.
-static size_t re_step(const AxStr *s, size_t at) {
-  if (at >= s->len) return 1;
-  uint32_t cp;
-  return (size_t)ax_utf8_next(s->data + at, s->len - at, &cp);
+static bool is_line_term_byte_at(const char *p, size_t n, size_t i) {
+  unsigned char c = (unsigned char)p[i];
+  if (c == '\n' || c == '\r') return true;
+  return c == 0xE2 && i + 2 < n && (unsigned char)p[i + 1] == 0x80 && ((unsigned char)p[i + 2] == 0xA8 || (unsigned char)p[i + 2] == 0xA9);
 }
 
-static bool re_build(AxVM *vm, AxValue patv, regex_t *re, bool icase) {
-  AxStr *p = ax_to_str(patv);
-  char *translated = re_translate(p->data);
-  int flags = REG_EXTENDED | (icase ? REG_ICASE : 0);
-  int rc = re_comp(re, translated, flags);
-  free(translated);
-  if (rc != 0) {
-    char buf[256];
-    regerror(rc, re, buf, sizeof buf);
-    char patbuf[256];
-    snprintf(patbuf, sizeof patbuf, "%s", p->data);
-    ax_release(ax_strv(p));
-    ax_throw(vm, "AX-REGEX", "bad regular expression /%s/: %s", patbuf, buf);
+// The pattern compiled with flags. A malformed pattern is the reference's error. V8's message is
+// "Invalid regular expression: /<pattern>/<flags in canonical order>: <reason>"; the .match
+// method throws it as it is, and the re_* functions as "bad regular expression /<pattern>/: …"
+// after removing that prefix with /^Invalid regular expression: \/.*\/[a-z]*: / — whose `.`
+// stops at a line break, so a pattern holding one keeps the whole message.
+static AxRegex *rx_build(AxVM *vm, AxStr *pat, const char *flags, bool raw_error) {
+  uint32_t n;
+  uint16_t *u = ax_str_units(pat, &n);
+  char err[256];
+  AxRegex *re = ax_regex_compile(u, n, flags, err, sizeof err);
+  free(u);
+  if (re) return re;
+  SB full = {0};
+  sb_addz(&full, "Invalid regular expression: /");
+  sb_add(&full, pat->data, pat->len);
+  sb_addz(&full, "/");
+  for (const char *c = "dgimsuvy"; *c; c++) if (strchr(flags, *c)) sb_add(&full, c, 1);
+  sb_addz(&full, ": ");
+  sb_addz(&full, err);
+  SB out = {0};
+  if (raw_error) {
+    sb_add(&out, full.buf, full.len);
+  } else {
+    sb_addz(&out, "bad regular expression /");
+    sb_add(&out, pat->data, pat->len);
+    sb_addz(&out, "/: ");
+    const size_t head = strlen("Invalid regular expression: /");
+    size_t stop = head;
+    while (stop < full.len && !is_line_term_byte_at(full.buf, full.len, stop)) stop++;
+    // The last "/" before the first line break that is followed by [a-z]* and ": ".
+    size_t cut = 0;
+    for (size_t j = head; j < stop; j++) {
+      if (full.buf[j] != '/') continue;
+      size_t k = j + 1;
+      while (k < full.len && full.buf[k] >= 'a' && full.buf[k] <= 'z') k++;
+      if (k + 1 < full.len && full.buf[k] == ':' && full.buf[k + 1] == ' ') cut = k + 2;
+    }
+    if (cut) sb_add(&out, full.buf + cut, full.len - cut);
+    else sb_add(&out, full.buf, full.len);
+  }
+  free(full.buf);
+  AxStr *msg = ax_str_new(out.buf, out.len);
+  free(out.buf);
+  ax_throw_str(vm, raw_error ? "AX-RUNTIME-000" : "AX-REGEX", msg);
+  return NULL;
+}
+
+// A regex and its subject as UTF-16 units, with RegExpBuiltinExec's lastIndex.
+typedef struct {
+  AxRegex *re;
+  uint16_t *s;
+  uint32_t n;
+  int32_t *caps;
+  int ncaps;
+  uint32_t last;
+  bool gy, uni;
+} Rx;
+
+static void rx_open(Rx *x, AxRegex *re, AxStr *subject) {
+  x->re = re;
+  x->s = ax_str_units(subject, &x->n);
+  x->ncaps = ax_regex_ncaps(re);
+  x->caps = malloc(sizeof(int32_t) * 2 * (size_t)x->ncaps);
+  x->last = 0;
+  x->gy = ax_regex_global(re) || ax_regex_sticky(re);
+  x->uni = ax_regex_unicode(re);
+}
+static void rx_close(Rx *x) { free(x->s); free(x->caps); ax_regex_free(x->re); }
+
+// RegExpBuiltinExec: a match from lastIndex (0 unless g or y), which then moves to its end.
+static bool rx_exec(Rx *x) {
+  uint32_t from = x->gy ? x->last : 0;
+  if (from > x->n || !ax_regex_exec(x->re, x->s, x->n, from, x->caps)) {
+    if (x->gy) x->last = 0;
     return false;
   }
-  ax_release(ax_strv(p));
+  if (x->gy) x->last = (uint32_t)x->caps[1];
   return true;
 }
-
-static AxValue re_match_record(const char *subject, regmatch_t *m, int ngroups) {
+// AdvanceStringIndex.
+static uint32_t rx_advance(Rx *x, uint32_t i) {
+  if (x->uni && i + 1 < x->n && x->s[i] >= 0xD800 && x->s[i] <= 0xDBFF && x->s[i + 1] >= 0xDC00 && x->s[i + 1] <= 0xDFFF) return i + 2;
+  return i + 1;
+}
+static AxValue rx_sub(Rx *x, int32_t a, int32_t b) {
+  if (a < 0 || b < 0) return ax_null();
+  return ax_strv(ax_str_from_u16(x->s + a, (size_t)(b - a)));
+}
+// {match, index, groups} from the last match.
+static AxValue rx_record(Rx *x) {
   AxDict *d = ax_dict_new();
   AxStr *k_match = ax_internz("match"), *k_index = ax_internz("index"), *k_groups = ax_internz("groups");
-  ax_dict_set(d, k_match, ax_strv(ax_str_new(subject + m[0].rm_so, m[0].rm_eo - m[0].rm_so)));
-  ax_dict_set(d, k_index, ax_num(ax_u16_count(subject, (size_t)m[0].rm_so)));   // in UTF-16 units
-  AxArr *groups = ax_arr_new(ngroups);
-  for (int g = 1; g <= ngroups; g++) {
-    if (m[g].rm_so < 0) ax_arr_push(groups, ax_null());
-    else ax_arr_push(groups, ax_strv(ax_str_new(subject + m[g].rm_so, m[g].rm_eo - m[g].rm_so)));
-  }
+  ax_dict_set(d, k_match, rx_sub(x, x->caps[0], x->caps[1]));
+  ax_dict_set(d, k_index, ax_num(x->caps[0]));
+  AxArr *groups = ax_arr_new((uint32_t)x->ncaps);
+  for (int g = 1; g < x->ncaps; g++) ax_arr_push(groups, rx_sub(x, x->caps[2 * g], x->caps[2 * g + 1]));
   ax_dict_set(d, k_groups, ax_arrv(groups));
   ax_release(ax_strv(k_match)); ax_release(ax_strv(k_index)); ax_release(ax_strv(k_groups));
   return ax_dictv(d);
@@ -2095,99 +2108,214 @@ NATIVE(n_from_json) {
 
 // --- regex ------------------------------------------------------------------------------------
 
+// buildRegex(text(pat), flags).test(text(s)).
 NATIVE(n_re_test) {
-  AxStr *s = arg_str(ARG(0));
-  regex_t re;
-  bool icase = re_flags(vm, ARG(1), ARG(2), false);
-  re_build(vm, ARG(1), &re, icase);
-  bool m = re_exec(&re, s->data, 0, NULL, 0) == 0;
-  regfree(&re);
+  AxStr *s = arg_str(ARG(0)), *pat = arg_str(ARG(1));
+  char *flags = rx_flags(vm, pat, ARG(2), false);
+  AxRegex *re = rx_build(vm, pat, flags, false);
+  free(flags);
+  Rx x;
+  rx_open(&x, re, s);
+  bool m = rx_exec(&x);
+  rx_close(&x);
   ax_release(ax_strv(s));
+  ax_release(ax_strv(pat));
   return ax_bool(m);
 }
-NATIVE(n_re_match) {
-  AxStr *s = arg_str(ARG(0));
-  regex_t re;
-  re_build(vm, ARG(1), &re, re_flags(vm, ARG(1), ARG(2), false));
-  regmatch_t m[16];
+// String.prototype.match: the first match as {match, index, groups}; with g, every matched
+// text, the first as `match` and the rest as `groups`, and no index (null).
+static AxValue rx_match(AxVM *vm, AxStr *s, AxStr *pat, char *flags, bool raw_error) {
+  AxRegex *re = rx_build(vm, pat, flags, raw_error);
+  Rx x;
+  rx_open(&x, re, s);
   AxValue out = ax_null();
-  if (re_exec(&re, s->data, 16, m, 0) == 0) out = re_match_record(s->data, m, (int)re.re_nsub);
-  regfree(&re);
-  ax_release(ax_strv(s));
+  if (!ax_regex_global(re)) {
+    if (rx_exec(&x)) out = rx_record(&x);
+  } else {
+    AxArr *all = ax_arr_new(4);
+    x.last = 0;
+    while (rx_exec(&x)) {
+      ax_arr_push(all, rx_sub(&x, x.caps[0], x.caps[1]));
+      if (x.caps[0] == x.caps[1]) x.last = rx_advance(&x, x.last);
+    }
+    if (all->len) {
+      AxDict *d = ax_dict_new();
+      AxStr *k_match = ax_internz("match"), *k_index = ax_internz("index"), *k_groups = ax_internz("groups");
+      ax_dict_set(d, k_match, ax_copy(all->items[0]));
+      ax_dict_set(d, k_index, ax_null());
+      AxArr *rest = ax_arr_new(all->len);
+      for (uint32_t i = 1; i < all->len; i++) ax_arr_push(rest, ax_copy(all->items[i]));
+      ax_dict_set(d, k_groups, ax_arrv(rest));
+      ax_release(ax_strv(k_match)); ax_release(ax_strv(k_index)); ax_release(ax_strv(k_groups));
+      out = ax_dictv(d);
+    }
+    ax_release(ax_arrv(all));
+  }
+  rx_close(&x);
   return out;
 }
-NATIVE(n_re_all) {
-  AxStr *s = arg_str(ARG(0));
-  regex_t re;
-  re_build(vm, ARG(1), &re, re_flags(vm, ARG(1), ARG(2), true));
-  AxArr *out = ax_arr_new(4);
-  regmatch_t m[16];
-  const char *p = s->data;
-  size_t off = 0;
-  while (off <= s->len && re_exec(&re, p + off, 16, m, off ? REG_NOTBOL : 0) == 0) {
-    regmatch_t shifted[16];
-    for (int g = 0; g < 16; g++) {
-      shifted[g].rm_so = m[g].rm_so < 0 ? -1 : m[g].rm_so + (regoff_t)off;
-      shifted[g].rm_eo = m[g].rm_eo < 0 ? -1 : m[g].rm_eo + (regoff_t)off;
-    }
-    ax_arr_push(out, re_match_record(s->data, shifted, (int)re.re_nsub));
-    size_t adv = (size_t)(m[0].rm_eo > m[0].rm_so ? (size_t)m[0].rm_eo : (size_t)m[0].rm_so + re_step(s, off + (size_t)m[0].rm_so));
-    off += adv;
-    if (adv == 0) break;
-  }
-  regfree(&re);
+NATIVE(n_re_match) {
+  AxStr *s = arg_str(ARG(0)), *pat = arg_str(ARG(1));
+  char *flags = rx_flags(vm, pat, ARG(2), false);
+  AxValue out = rx_match(vm, s, pat, flags, false);
+  free(flags);
   ax_release(ax_strv(s));
+  ax_release(ax_strv(pat));
+  return out;
+}
+// The method form: s.match(pattern) — String.prototype.match with a string, so a regex with
+// no flags, and the RegExp constructor's own error for a malformed one.
+AxValue ax_string_match(AxVM *vm, AxStr *s, AxStr *pat) {
+  return rx_match(vm, s, pat, "", true);
+}
+// Every match as {match, index, groups}: exec until it fails, an empty match moving the search on
+// by a character.
+NATIVE(n_re_all) {
+  AxStr *s = arg_str(ARG(0)), *pat = arg_str(ARG(1));
+  char *flags = rx_flags(vm, pat, ARG(2), true);
+  AxRegex *re = rx_build(vm, pat, flags, false);
+  free(flags);
+  Rx x;
+  rx_open(&x, re, s);
+  AxArr *out = ax_arr_new(4);
+  while (rx_exec(&x)) {
+    ax_arr_push(out, rx_record(&x));
+    if ((uint32_t)x.caps[0] == x.last) x.last = rx_advance(&x, x.last);
+  }
+  rx_close(&x);
+  ax_release(ax_strv(s));
+  ax_release(ax_strv(pat));
   return ax_arrv(out);
 }
-NATIVE(n_re_sub) {
-  AxStr *s = arg_str(ARG(0));
-  AxStr *rep = arg_str(ARG(2));
-  regex_t re;
-  re_build(vm, ARG(1), &re, re_flags(vm, ARG(1), ARG(3), true));
-  SB sb = {0};
-  sb_add(&sb, "", 0);
-  regmatch_t m[16];
-  size_t off = 0;
-  while (off <= s->len && re_exec(&re, s->data + off, 16, m, off ? REG_NOTBOL : 0) == 0) {
-    sb_add(&sb, s->data + off, (size_t)m[0].rm_so);
-    // `$1`-style group references in the replacement.
-    for (uint32_t i = 0; i < rep->len; i++) {
-      if (rep->data[i] == '$' && i + 1 < rep->len && isdigit((unsigned char)rep->data[i + 1])) {
-        int g = rep->data[i + 1] - '0';
-        if (g <= (int)re.re_nsub && m[g].rm_so >= 0) sb_add(&sb, s->data + off + m[g].rm_so, (size_t)(m[g].rm_eo - m[g].rm_so));
-        i++;
-        continue;
+
+// GetSubstitution: the replacement text for one match, with $$, $&, $`, $', $n / $nn and $<name>.
+static void rx_substitute(UB *b, Rx *x, const uint16_t *t, uint32_t tn) {
+  int32_t pos = x->caps[0], end = x->caps[1];
+  int m = x->ncaps - 1;
+  bool named = false;
+  for (int g = 1; g < x->ncaps; g++) { uint32_t l; if (ax_regex_group_name(x->re, g, &l)) named = true; }
+  for (uint32_t i = 0; i < tn; i++) {
+    uint16_t c = t[i];
+    if (c != '$' || i + 1 >= tn) { ub_add(b, &c, 1); continue; }
+    uint16_t d = t[i + 1];
+    if (d == '$') { ub_add(b, &c, 1); i++; continue; }
+    if (d == '&') { ub_add(b, x->s + pos, (uint32_t)(end - pos)); i++; continue; }
+    if (d == '`') { ub_add(b, x->s, (uint32_t)pos); i++; continue; }
+    if (d == '\'') { ub_add(b, x->s + end, x->n - (uint32_t)end); i++; continue; }
+    if (d >= '0' && d <= '9') {
+      int digits = i + 2 < tn && t[i + 2] >= '0' && t[i + 2] <= '9' ? 2 : 1;
+      int index = digits == 2 ? (d - '0') * 10 + (t[i + 2] - '0') : d - '0';
+      if (index > m && digits == 2) { digits = 1; index = d - '0'; }
+      if (index >= 1 && index <= m) {
+        int32_t a = x->caps[2 * index], e = x->caps[2 * index + 1];
+        if (a >= 0 && e >= 0) ub_add(b, x->s + a, (uint32_t)(e - a));
+      } else {
+        ub_add(b, t + i, (uint32_t)(1 + digits));
       }
-      sb_add(&sb, rep->data + i, 1);
+      i += (uint32_t)digits;
+      continue;
     }
-    size_t step = re_step(s, off + (size_t)m[0].rm_so);
-    size_t adv = (size_t)(m[0].rm_eo > m[0].rm_so ? (size_t)m[0].rm_eo : (size_t)m[0].rm_so + step);
-    if (m[0].rm_eo == m[0].rm_so && off + (size_t)m[0].rm_so < s->len) sb_add(&sb, s->data + off + m[0].rm_so, step);
-    off += adv;
-    if (adv == 0) break;
+    if (d == '<' && named) {
+      uint32_t close = i + 2;
+      while (close < tn && t[close] != '>') close++;
+      if (close >= tn) { ub_add(b, t + i, 2); i++; continue; }
+      const uint16_t *name = t + i + 2;
+      uint32_t nl = close - (i + 2);
+      for (int g = 1; g < x->ncaps; g++) {
+        uint32_t l;
+        const uint16_t *gn = ax_regex_group_name(x->re, g, &l);
+        if (gn && l == nl && !memcmp(gn, name, nl * 2)) {
+          int32_t a = x->caps[2 * g], e = x->caps[2 * g + 1];
+          if (a >= 0 && e >= 0) ub_add(b, x->s + a, (uint32_t)(e - a));
+          break;
+        }
+      }
+      i = close;
+      continue;
+    }
+    ub_add(b, &c, 1);
   }
-  if (off <= s->len) sb_add(&sb, s->data + off, s->len - off);
-  regfree(&re);
-  AxValue r = ax_strv(ax_str_new(sb.buf, sb.len));
-  free(sb.buf);
-  ax_release(ax_strv(s));
-  ax_release(ax_strv(rep));
-  return r;
 }
-NATIVE(n_re_split) {
-  AxStr *s = arg_str(ARG(0));
-  regex_t re;
-  re_build(vm, ARG(1), &re, re_flags(vm, ARG(1), ARG(2), false));
-  AxArr *out = ax_arr_new(4);
-  regmatch_t m[1];
-  size_t off = 0;
-  while (off <= s->len && re_exec(&re, s->data + off, 1, m, off ? REG_NOTBOL : 0) == 0 && m[0].rm_eo > m[0].rm_so) {
-    ax_arr_push(out, ax_strv(ax_str_new(s->data + off, (size_t)m[0].rm_so)));
-    off += (size_t)m[0].rm_eo;
+
+// text(s).replace(regex with g, text(repl)): RegExp.prototype[@@replace].
+NATIVE(n_re_sub) {
+  AxStr *s = arg_str(ARG(0)), *pat = arg_str(ARG(1)), *rep = arg_str(ARG(2));
+  char *flags = rx_flags(vm, pat, ARG(3), true);
+  AxRegex *re = rx_build(vm, pat, flags, false);
+  free(flags);
+  Rx x;
+  rx_open(&x, re, s);
+  uint32_t tn;
+  uint16_t *t = ax_str_units(rep, &tn);
+  UB b = {0};
+  uint32_t next = 0;
+  x.last = 0;
+  while (rx_exec(&x)) {
+    uint32_t pos = (uint32_t)x.caps[0];
+    if (pos >= next) {
+      ub_add(&b, x.s + next, pos - next);
+      rx_substitute(&b, &x, t, tn);
+      next = (uint32_t)x.caps[1];
+    }
+    if (x.caps[0] == x.caps[1]) x.last = rx_advance(&x, x.last);
+    if (!ax_regex_global(re)) break;
   }
-  ax_arr_push(out, ax_strv(ax_str_new(s->data + off, s->len - off)));
-  regfree(&re);
+  if (next < x.n) ub_add(&b, x.s + next, x.n - next);
+  free(t);
+  rx_close(&x);
   ax_release(ax_strv(s));
+  ax_release(ax_strv(pat));
+  ax_release(ax_strv(rep));
+  return ub_str(&b);
+}
+
+// text(s).split(regex): the pieces between matches, each match's captures between them. V8 runs
+// a regex without y through its own loop (RegExpSplit), not the specification's sticky splitter:
+// a search forward from the last cut, an empty match at the cut stepping the search on.
+NATIVE(n_re_split) {
+  AxStr *s = arg_str(ARG(0)), *pat = arg_str(ARG(1));
+  char *flags = rx_flags(vm, pat, ARG(2), false);
+  AxRegex *re = rx_build(vm, pat, flags, false);
+  bool sticky = strchr(flags, 'y') != NULL;
+  free(flags);
+  Rx x;
+  rx_open(&x, re, s);
+  AxArr *out = ax_arr_new(4);
+  if (!x.n) {
+    x.last = 0;
+    if (!rx_exec(&x)) ax_arr_push(out, ax_copy(ax_strv(s)));
+  } else if (!sticky) {
+    uint32_t current = 0, start = 0;
+    while (start < x.n) {
+      if (!ax_regex_exec(re, x.s, x.n, start, x.caps)) break;
+      uint32_t mstart = (uint32_t)x.caps[0], mend = (uint32_t)x.caps[1];
+      if (mstart == x.n) break;
+      if (mend == current) { start = rx_advance(&x, start); continue; }
+      ax_arr_push(out, ax_strv(ax_str_from_u16(x.s + current, mstart > current ? mstart - current : 0)));
+      for (int g = 1; g < x.ncaps; g++) ax_arr_push(out, rx_sub(&x, x.caps[2 * g], x.caps[2 * g + 1]));
+      start = current = mend;
+    }
+    ax_arr_push(out, ax_strv(ax_str_from_u16(x.s + current, x.n - current)));
+  } else {
+    // RegExp.prototype[@@split]: the regex (already sticky) tried at each position q — moving on
+    // by a code point only for u (V8 does not count v here).
+    x.uni = ax_regex_u_flag(re);
+    uint32_t p = 0, q = 0;
+    while (q < x.n) {
+      x.last = q;
+      if (!rx_exec(&x)) { q = rx_advance(&x, q); continue; }
+      uint32_t e = x.last < x.n ? x.last : x.n;
+      if (e == p) { q = rx_advance(&x, q); continue; }
+      ax_arr_push(out, ax_strv(ax_str_from_u16(x.s + p, q > p ? q - p : 0)));
+      for (int g = 1; g < x.ncaps; g++) ax_arr_push(out, rx_sub(&x, x.caps[2 * g], x.caps[2 * g + 1]));
+      p = e;
+      q = p;
+    }
+    ax_arr_push(out, ax_strv(ax_str_from_u16(x.s + p, x.n - p)));
+  }
+  rx_close(&x);
+  ax_release(ax_strv(s));
+  ax_release(ax_strv(pat));
   return ax_arrv(out);
 }
 
@@ -2622,22 +2750,6 @@ static bool name_is(AxStr *n, const char *s) { return strcmp(n->data, s) == 0; }
 
 // A method's selector is checked before any element is seen, as the reference builds it first:
 // null (or none), a field name, or something callable — `[].map(2)` is an error, not [].
-// Text as UTF-16 units, for the string methods whose answer depends on them (ustr.c): a
-// decoded copy, and a builder that encodes back.
-typedef struct { uint16_t *u; uint32_t n, cap; } UB;
-static void ub_add(UB *b, const uint16_t *u, uint32_t n) {
-  if (b->n + n > b->cap) {
-    while (b->n + n > b->cap) b->cap = b->cap ? b->cap * 2 : 64;
-    b->u = realloc(b->u, sizeof(uint16_t) * b->cap);
-  }
-  if (n) memcpy(b->u + b->n, u, sizeof(uint16_t) * n);
-  b->n += n;
-}
-static AxValue ub_str(UB *b) {
-  AxValue r = ax_strv(ax_str_from_u16(b->u, b->n));
-  free(b->u);
-  return r;
-}
 static void method_selector(AxVM *vm, AxValue sel) {
   if (sel.t == AX_NULL || sel.t == AX_STR || sel.t == AX_ATOM || sel.t == AX_FN) return;
   ax_throw(vm, "AX-CALL-001", "value of type %s is not callable", ax_type_name(sel));
@@ -2711,10 +2823,10 @@ AxValue ax_method_call(AxVM *vm, AxValue obj, AxStr *name, AxValue *args, int ar
       return ax_arrv(out);
     }
     if (name_is(name, "match")) {
-      // String.prototype.match with a pattern given as text: the first match, as re_match.
-      AxValue margs[2] = { obj, argc ? args[0] : ax_str_from("") };
-      AxValue r = n_re_match(vm, NULL, margs, 2);
-      if (!argc) ax_release(margs[1]);
+      // String.prototype.match with a pattern given as text (none: the empty pattern).
+      AxStr *pat = argc ? method_text(args, argc, 0) : ax_str_newz("");
+      AxValue r = ax_string_match(vm, s, pat);
+      ax_release(ax_strv(pat));
       return r;
     }
     if (name_is(name, "split")) {

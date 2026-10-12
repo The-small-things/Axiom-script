@@ -128,6 +128,18 @@ void ax_throw_value(AxVM *vm, AxValue v) {
   exit(1);
 }
 
+// ax_throw with a message of any length, which the error takes over (the formatted form is
+// limited to error_msg's size).
+void ax_throw_str(AxVM *vm, const char *code, AxStr *msg) {
+  snprintf(vm->error_msg, sizeof vm->error_msg, "%.*s", (int)(msg->len < sizeof vm->error_msg ? msg->len : sizeof vm->error_msg - 1), msg->data);
+  snprintf(vm->error_code, sizeof vm->error_code, "%s", code);
+  AxDict *d = ax_dict_new();
+  ax_dict_set(d, S_msg, ax_strv(msg));
+  ax_dict_set(d, S_code, ax_str_from(code));
+  ax_dict_set(d, S_value, ax_null());
+  ax_throw_value(vm, ax_dictv(d));
+}
+
 void ax_throw(AxVM *vm, const char *code, const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);

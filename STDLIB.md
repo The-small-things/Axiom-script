@@ -128,7 +128,13 @@ Seeded, so a run is reproducible: call `seed(n)` and the whole sequence repeats.
 | `re_match(s, pat, flags?)` | `{match, index, groups}` or null |
 | `re_all(s, pat, flags?)` | every match, as an array of the same records |
 | `re_sub(s, pat, repl, flags?)` | replace all matches |
-| `re_split(s, pat, flags?)` | split on a pattern |
+| `re_split(s, pat, flags?)` | split on a pattern (captured groups go between the pieces) |
+
+Patterns are JavaScript regular expressions, in both runtimes: lookahead and lookbehind, named
+groups (`(?<year>\d{4})`, `\k<year>`), backreferences, lazy quantifiers, `\p{L}` and other
+Unicode properties under `u`, set operations and `\p{RGI_Emoji}` under `v`; flags `d g i m s u
+v y`. In `re_sub`'s replacement, `$1`…`$99`, `$<name>`, `$&` (the match), `` $` `` and `$'`
+(the text before and after it) and `$$`.
 
 String **methods** (called on a value) cover the rest: `.split(sep)` `.replace(a, b)`
 `.replace_all(a, b)` `.trim()` `.trim_start()` `.trim_end()` `.upper()` `.lower()`
