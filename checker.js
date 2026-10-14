@@ -23,6 +23,7 @@ const RULE = {
   PARSE: { section: 'Appendix B', title: 'Minimal Grammar Sketch' },
   FN: { section: 'v0.4', title: 'User Function / Proc Validation' },
   LOOP: { section: 'v0.4', title: 'Loop Control Flow' },
+  SEMI: { section: 'v0.9.3', title: 'Newline & Semicolon Handling' },
   MIXIN: { section: 'v0.4', title: 'Mixin Composition' },
 };
 
@@ -86,6 +87,8 @@ function stmtExprRoots(stmt) {
     case 'Assign': return [stmt.value];
     // v0.8.8: IndexAssign — walk the index and value (either may contain a zero-alloc violation).
     case 'IndexAssign': return [stmt.index, stmt.value];
+    // v0.9.3: a chained target — the container read, the last index, the value.
+    case 'ChainAssign': return stmt.last.kind === 'index' ? [stmt.container, stmt.last.index, stmt.value] : [stmt.container, stmt.value];
     // v0.8.8: MemberAssign/DeepAssign with compoundOp — walk the value (the read of current is
     // implicit, not an expr root; the value expr is what the LLM wrote).
     case 'MemberAssign': return [stmt.value];
@@ -1245,6 +1248,7 @@ function collectBoundNames(stmts, typeNames, out) {
     if (st.type === 'MemberAssign' && st.obj) out.add(st.obj);
     if (st.type === 'DeepAssign' && st.path && st.path.length) out.add(st.path[0]);
     if (st.type === 'IndexAssign' && st.obj) out.add(st.obj);
+    if (st.type === 'ChainAssign' && st.base) out.add(st.base);
     for (const key of ['body', 'ifBody', 'elseBody', 'catchBody', 'finallyBody']) {
       if (Array.isArray(st[key])) collectBoundNames(st[key], typeNames, out);
     }
@@ -1760,6 +1764,24 @@ function checkUndefinedFunctionsInBodies(program, source) {
 }
 
 // -----------------------------------------------------------------------------
+// v0.9.3: AX-SEMI-001 — a statement after ';' on the line of a one-line `?` or loop body. `;`
+// ends a statement as a line break does, so `?x == 2: y = 10; x = 99` runs `x = 99` whatever
+// x is; it reads as if both were in the branch. In source order.
+function checkSemicolonTails(program, source) {
+  const tails = (program.semicolonTails || []).slice().sort((a, b) => a.line - b.line || a.col - b.col);
+  return tails.map((t) => makePayload({
+    code: 'AX-SEMI-001', severity: 'advisory', entity: null, block: null, line: t.line, col: t.col,
+    rule: RULE.SEMI, snippet: sourceLine(source, t.line),
+    human: t.kind === 'cond'
+      ? "The statement after ';' is not part of the one-line ?-body before it: it runs whether or not the condition holds."
+      : "The statement after ';' is not part of the one-line loop body before it: it runs once, after the loop.",
+    agent: t.kind === 'cond'
+      ? "To make both statements conditional, put them on their own indented lines under the '?…:' header. If the second one should always run, move it to its own line so it reads that way."
+      : "To repeat both statements, put them on their own indented lines under the loop header. If the second one should run once after the loop, move it to its own line so it reads that way.",
+    fix: null,
+  }));
+}
+
 function parseErrorPayload(err, source) {
   const line = err && err.line ? err.line : null;
   const col = err && err.col ? err.col : null;
@@ -1767,8 +1789,10 @@ function parseErrorPayload(err, source) {
     code: 'AX-PARSE-000', severity: 'fatal', entity: null, block: null, line, col,
     rule: RULE.PARSE, snippet: sourceLine(source, line),
     human: `Parse error: ${err.message}`,
-    agent: `Fix syntax at or near this line.`,
-    fix: null, autoFixable: false,
+    // v0.9.3: what to change, from the parser where it knows (an assignment to a call, '=' in a
+    // condition, a missing ':' or bracket …), else the error itself restated as an instruction.
+    agent: err.hint || `Fix the syntax at line ${line ?? '?'}: ${err.message}.`,
+    fix: err.fix ? { kind: 'text', detail: err.fix } : null, autoFixable: false,
   });
 }
 
@@ -1794,6 +1818,10 @@ function compile(source, opts) {
   // instances. Each becomes an AX-PARSE-000 diagnostic. The program is still returned
   // (partially parsed) so semantic checks can run on the valid portions.
   const parseErrorPayloads = (program.parseErrors || []).map(err => parseErrorPayload(err, source));
+  // v0.9.3: a program that does not parse gets its parse errors only (as the native checker
+  // does). The semantic checks ran on what was left of it and reported follow-on noise — a
+  // ^main whose body failed to parse was "no ^main", a dropped assignment an unknown name.
+  if (parseErrorPayloads.length) return { ok: false, program, diagnostics: parseErrorPayloads };
   const diagnostics = [
     // v0.8.8: parse errors first (recovery mode — these were collected during parsing, not thrown).
     ...parseErrorPayloads,
@@ -1831,6 +1859,7 @@ function compile(source, opts) {
     ...checkRecordFields(program, source),
     ...checkUnknownNames(program, source),
     ...checkLiteralTypes(program, source),
+    ...checkSemicolonTails(program, source),
   ];
   const blocking = diagnostics.some(d => d.severity === 'fatal' || d.severity === 'contract_violation');
   return { ok: !blocking, program, diagnostics };

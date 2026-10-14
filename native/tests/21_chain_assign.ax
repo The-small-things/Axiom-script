@@ -1,0 +1,65 @@
+// Chained assignment targets (g[r][c] = v, items[i].done = true) and the index rule reads and
+// writes share: arrays round down and count negatives from the end, dicts key by display text.
+^type Item:
+  name:: string
+  done:: bool
+
+^fn t(label, f):
+  ^try:
+    print(label, "=>", f())
+  ^catch e:
+    print(label, "!!", e.code, e.msg)
+
+^main:
+  g = [[0, 0, 0], [0, 0, 0]]
+  g[1][0] = 5
+  g[0][-1] = 7
+  g[1][2] += 3
+  ++g[0][0]
+  --g[1][1]
+  best = [1, 1]
+  g[best[0]][best[1]] *= 10
+  print(g)
+  items = [Item("a", false), Item("b", false)]
+  n = len(items)
+  items[n - 1].done = true
+  items[0].name += "!"
+  print(items)
+  d = {rows: [{cells: [1, 2]}]}
+  d.rows[0].cells[1] = 9
+  d["rows"][0]["cells"][0] ??= 4
+  d.rows[0].extra ??= "x"
+  print(d)
+  m = {a: {b: {}}}
+  m.a.b["k"] = 1
+  m.a["b"].z = 2
+  print(m)
+  t("neg", \: g[0][-9])
+  t("write neg", \: wr(g))
+  t("on null", \: wr2(d))
+  t("on num", \: wr3(g))
+  t("member on array", \: wr4(g))
+  print(g, d)
+  v = [v3(1, 2, 3)]
+  v[0].x = 9
+  print(v)
+  xs = [10, 20, 30]
+  print(map([0, 1.7, -1, -1.5, -4, 3, "1", " 2 ", "", "x", true, null, 0 / 0, [1], 1e300], \i: xs[i]))
+  xs[4] = 50
+  xs["0"] = 11
+  xs[-1.5] = 40
+  print(xs)
+  k = {}
+  k[[1, 2]] = "a"
+  k[v3(1, 2, 3)] = "b"
+  k[3] = "c"
+  print(k, k[[1, 2]], k["3"], k[3], k.get([1, 2]))
+
+^fn wr(g):
+  g[0][-9] = 1
+^fn wr2(d):
+  d.missing[0] = 1
+^fn wr3(g):
+  g[0][0][1] = 2
+^fn wr4(g):
+  g[0].x = 1

@@ -191,6 +191,7 @@ static const char *stmt_type(const AxNode *st) {
       if (st->str2) return st->nnames == 1 ? "MemberAssign" : "DeepAssign";
       return st->nnames == 2 ? "MemberAssign" : "DeepAssign";
     case N_INDEX_ASSIGN: return "IndexAssign";
+    case N_CHAIN_ASSIGN: return "ChainAssign";
     case N_EXPRSTMT: return "ExprStmt";
     case N_IF: return "CondBlock";
     case N_WHILE: return "WhileLoop";
@@ -277,6 +278,7 @@ static void roots_of(AxNode *st, NV *out) {
   switch (st->kind) {
     case N_ASSIGN: nv_push(out, st->a); return;
     case N_INDEX_ASSIGN: nv_push(out, st->a); nv_push(out, st->b); return;
+    case N_CHAIN_ASSIGN: nv_push(out, st->a); if (st->c) nv_push(out, st->c); nv_push(out, st->b); return;
     case N_MEMBER_ASSIGN: nv_push(out, st->a); return;
     case N_EXPRSTMT: nv_push(out, st->a); return;
     case N_ACTION: case N_EMIT: for (int i = 0; i < st->nlist; i++) nv_push(out, argv_of(st->list[i])); return;
@@ -1501,6 +1503,7 @@ static void collect_bound_names(AxNode **stmts, int n, SSet *types, SSet *out) {
       if (!st->str2 || st->nnames >= 2) ss_add(out, S(st->names[0]));
     }
     if (st->kind == N_INDEX_ASSIGN && st->str) ss_add(out, S(st->str));
+    if (st->kind == N_CHAIN_ASSIGN) ss_add(out, S(st->str2));
     switch (st->kind) {
       case N_WHILE: case N_FOR: collect_bound_names(st->list, st->nlist, types, out); break;
       case N_IF: collect_bound_names(st->list, st->nlist, types, out); if (st->c) collect_bound_names(st->c->list, st->c->nlist, types, out); break;
@@ -1870,10 +1873,36 @@ static void use_visit(Ck *c, Prog *root, AxNode **uses, int nuses, const char *d
   }
 }
 
+// checkSemicolonTails: AX-SEMI-001, a statement after ';' on the line of a one-line `?` or loop
+// body (the parser marks them on the program node), in source order.
+static int cmp_tail(const void *a, const void *b) {
+  const AxNode *x = *(AxNode *const *)a, *y = *(AxNode *const *)b;
+  return x->line != y->line ? (x->line < y->line ? -1 : 1) : (x->col < y->col ? -1 : x->col > y->col);
+}
+static void check_semicolon_tails(Ck *c, AxNode *program) {
+  int n = program->narms;
+  if (!n) return;
+  AxNode **t = malloc(sizeof(AxNode *) * n);
+  memcpy(t, program->defaults, sizeof(AxNode *) * n);
+  qsort(t, (size_t)n, sizeof(AxNode *), cmp_tail);
+  for (int i = 0; i < n; i++) {
+    bool cond = t[i]->flag;
+    CD *d = emit(c, "AX-SEMI-001", "advisory");
+    d->line = t[i]->line; d->col = t[i]->col;
+    d->snippet = source_line(c, t[i]->line);
+    d->rsec = "v0.9.3"; d->rtitle = "Newline & Semicolon Handling";
+    d->human = fmt("%s", cond ? "The statement after ';' is not part of the one-line ?-body before it: it runs whether or not the condition holds."
+                              : "The statement after ';' is not part of the one-line loop body before it: it runs once, after the loop.");
+    d->agent = fmt("%s", cond ? "To make both statements conditional, put them on their own indented lines under the '?…:' header. If the second one should always run, move it to its own line so it reads that way."
+                              : "To repeat both statements, put them on their own indented lines under the loop header. If the second one should run once after the loop, move it to its own line so it reads that way.");
+  }
+  free(t);
+}
+
 // ---- entry point ---------------------------------------------------------------------------
 
 AxCheck *ax_check(AxNode *program, const char *source, const char *filename, const char *version,
-                  const char *parse_err, int parse_line, int parse_col) {
+                  const char *parse_err, const char *parse_hint, int parse_line, int parse_col) {
   AxCheck *out = calloc(1, sizeof *out);
   Ck c = { source, filename, out };
   if (parse_err) {
@@ -1882,7 +1911,9 @@ AxCheck *ax_check(AxNode *program, const char *source, const char *filename, con
     d->snippet = source_line(&c, parse_line);
     d->rsec = "Appendix B"; d->rtitle = "Minimal Grammar Sketch";
     d->human = fmt("Parse error: %s", parse_err);
-    d->agent = fmt("Fix syntax at or near this line.");
+    if (parse_hint && parse_hint[0]) d->agent = fmt("%s", parse_hint);
+    else if (parse_line) d->agent = fmt("Fix the syntax at line %d: %s.", parse_line, parse_err);
+    else d->agent = fmt("Fix the syntax at line ?: %s.", parse_err);
     out->ok = false;
     return out;
   }
@@ -1933,6 +1964,7 @@ AxCheck *ax_check(AxNode *program, const char *source, const char *filename, con
   check_record_fields(&c, &pg);
   check_unknown_names(&c, &pg);
   check_literal_types(&c, &pg);
+  check_semicolon_tails(&c, program);
   out->ok = true;
   for (int i = 0; i < out->n; i++) if (!strcmp(out->v[i].severity, "fatal") || !strcmp(out->v[i].severity, "contract_violation")) out->ok = false;
   free(pg.entities.v); free(pg.events.v); free(pg.types.v); free(pg.fns.v); free(pg.procs.v);

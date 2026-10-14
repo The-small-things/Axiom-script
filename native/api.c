@@ -239,8 +239,8 @@ static Compiled compile(const char *source, const char *filename) {
   c.pr = calloc(1, sizeof *c.pr);
   bool lexed = ax_tokenize(source, c.toks);
   bool parsed = lexed && ax_parse(c.toks, c.pr);
-  c.chk = parsed ? ax_check(c.pr->program, source, filename, c.toks->version, NULL, 0, 0)
-                 : ax_check(NULL, source, filename, NULL, lexed ? c.pr->err : c.toks->err,
+  c.chk = parsed ? ax_check(c.pr->program, source, filename, c.toks->version, NULL, NULL, 0, 0)
+                 : ax_check(NULL, source, filename, NULL, lexed ? c.pr->err : c.toks->err, lexed ? c.pr->hint : NULL,
                             lexed ? c.pr->err_line : c.toks->err_line, lexed ? c.pr->err_col : 0);
   return c;
 }

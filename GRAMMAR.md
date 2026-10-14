@@ -360,11 +360,19 @@ assign_op = '=' | '+=' | '-=' | '*=' | '/=' | '%=' | '~=' | '??=' ;
 assign_stmt = [ '$' ] IDENT assign_op expr ( NEWLINE | ';' )                    (* simple/compound *)
             | IDENT { '.' IDENT } assign_op expr ( NEWLINE | ';' )               (* member assign/compound *)
             | IDENT '[' expr ']' assign_op expr ( NEWLINE | ';' )                (* index assign/compound *)
+            | IDENT target_step { target_step } assign_op expr ( NEWLINE | ';' ) (* v0.9.3: chained *)
             | '~' IDENT ':' expr ( NEWLINE | ';' ) ;                             (* ~field: expr reassign *)
+target_step = '.' IDENT | '[' expr ']' ;
+
+(* v0.9.3: any chain of `.field` and `[index]` steps is a target — `g[r][c] = v`,
+   `items[i].done = true`, `d.rows[0].cells[1] += 1`. Everything but the last step is read as
+   an expression; the last step is written. Index writes follow the read rule: an array index
+   is rounded down and a negative one counts from the end, a write past the end grows the array
+   with nulls, one before the start is AX-RUNTIME-INDEX; a dict key is the index as displayed. *)
 
 (* v0.8.15: prefix increment/decrement. `++x` desugars to `x = x + 1` (statement, not expression).
    Prefix form only — `x++` (postfix) is not supported. *)
-incr_stmt = ( '++' | '--' ) ( IDENT | IDENT { '.' IDENT } | IDENT '[' expr ']' ) ( NEWLINE | ';' ) ;
+incr_stmt = ( '++' | '--' ) ( IDENT | IDENT { '.' IDENT } | IDENT target_step { target_step } ) ( NEWLINE | ';' ) ;
 
 cross_entity_assign = '#' IDENT { '.' IDENT } '=' expr ( NEWLINE | ';' ) ;  (* #Tag.field = expr *)
 

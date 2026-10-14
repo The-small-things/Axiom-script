@@ -850,5 +850,22 @@ section('22. Big integers and conversions (v0.9.3)');
   eq('22.8 int() and float() are parseInt and parseFloat', val('[int("  -7abc"), float("3.5kg"), is_nan(int("x"))]'), [-7, 3.5, true]);
 }
 
+// =========================================================================================
+section('23. Issue #1: chained targets and parse errors');
+// =========================================================================================
+{
+  eq('23.1 a chained index target', val('g()', `^fn g():\n  g = [[0, 0], [0, 0]]\n  g[1][0] = 5\n  ++g[0][1]\n  ^return g\n`), [[0, 1], [5, 0]]);
+  eq('23.2 a field through an index', val('f()', `^type It:\n  done:: bool\n^fn f():\n  xs = [It(false), It(false)]\n  xs[len(xs) - 1].done = true\n  ^return map(xs, \\x: x.done)\n`), [false, true]);
+  eq('23.3 a negative index writes the last element', val('f()', `^fn f():\n  xs = [1, 2, 3]\n  xs[-1] = 9\n  ^return xs\n`), [1, 2, 9]);
+  const diags = (src) => compile(src, { imports: false }).diagnostics;
+  const d1 = diags(`^fn f(a):\n  f(a) = 3\n  ^return a\n\n^main:\n  print(f(1))\n`);
+  eq('23.4 one bad line is one diagnostic (no cascade into ^return)', d1.map(d => [d.error_code, d.location.line]), [['AX-PARSE-000', 2]]);
+  ok('23.5 the message names the problem without a raw token dump', !/undefined|ASSIGN|NEWLINE/.test(d1[0].message_for_human), d1[0].message_for_human);
+  ok('23.6 the agent message says what to change', /variable first/.test(d1[0].message_for_agent), d1[0].message_for_agent);
+  const d2 = diags(`^main:\n  x = 1\n  ?x = 2: print(x)\n  y = )\n  print(y)\n`);
+  eq('23.7 a bad ^main reports each bad line, and no "no ^main"', d2.map(d => [d.error_code, d.location.line]), [['AX-PARSE-000', 3], ['AX-PARSE-000', 4]]);
+  ok('23.8 "=" in a condition points at "=="', /'=='/.test(d2[0].message_for_agent), d2[0].message_for_agent);
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed === 0 ? 0 : 1);

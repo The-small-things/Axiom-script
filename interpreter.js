@@ -3803,16 +3803,9 @@ function evalExpr(node, ctx) {
         if (i < 0 || i >= obj.length) return null;
         return obj[i];
       }
-      if (Array.isArray(obj)) {
-        let i = typeof idx === 'number' ? Math.floor(idx) : idx;
-        if (typeof i === 'number' && i < 0) i += obj.length;
-        const v = obj[i];
-        return v === undefined ? null : v;
-      }
-      if (obj instanceof BVec) return obj.get(idx);
-      if (obj instanceof BMap) return obj.get(idx);
-      if (obj instanceof Map) return obj.get(idx);
       // v0.8.11: dict indexing — {a: 1}["a"] → 1, {a: 1}.a → 1 (via memberOf)
+      const got = indexRead(obj, idx);
+      if (got !== undefined) return got;
       if (obj && typeof obj === 'object' && !Array.isArray(obj) && !(obj instanceof Vec2) && !(obj instanceof Vec3) && !(obj instanceof Quat) && !(obj instanceof EntityInstance)) return obj[idx];
       if (obj && typeof obj === 'object' && obj[idx] !== undefined) return obj[idx];
       if (obj && typeof obj[idx] !== 'undefined') return obj[idx];
@@ -3969,6 +3962,44 @@ function evalExpr(node, ctx) {
     default:
       throw new Error(`cannot evaluate node type '${node.type}'`);
   }
+}
+
+// v0.9.3: one rule for `x[i]`, read or written. An array takes a number (rounded down; a
+// negative one counts from the end) or text that reads as one; a dict takes any key as it
+// displays (stringifyKey), as d.get/d.set do. Before, a write took JavaScript's property rules:
+// `xs[-1] = v` and `xs[1.5] = v` set invisible properties, `xs[5] = v` left holes, and
+// `d[[1, 2]] = v` used another key than `d[[1, 2]]` read.
+function arraySlot(len, idx) {
+  const n = typeof idx === 'number' ? idx : (typeof idx === 'string' && idx.trim() !== '') ? Number(idx) : NaN;
+  if (!Number.isFinite(n)) return null;
+  const i = Math.floor(n);
+  return i < 0 ? (i + len >= 0 ? i + len : null) : i;
+}
+function isPlainDict(obj) {
+  return obj && typeof obj === 'object' && !Array.isArray(obj) && !(obj instanceof Vec2) && !(obj instanceof Vec3) && !(obj instanceof Quat) && !(obj instanceof EntityInstance) && !(obj instanceof BVec) && !(obj instanceof BMap) && !(obj instanceof Map) && !(obj instanceof Transform) && !(obj instanceof Mat4);
+}
+function indexRead(obj, idx) {
+  if (Array.isArray(obj)) {
+    const i = arraySlot(obj.length, idx);
+    if (i === null || i >= obj.length) return null;
+    const v = obj[i];
+    return v === undefined ? null : v;
+  }
+  if (obj instanceof BVec || obj instanceof BMap || obj instanceof Map) return obj.get(idx);
+  if (isPlainDict(obj)) { const v = obj[stringifyKey(idx)]; return v === undefined ? null : v; }
+  return undefined;   // not a container: the caller decides
+}
+function indexWrite(obj, idx, v, what) {
+  if (Array.isArray(obj)) {
+    const i = arraySlot(obj.length, idx);
+    if (i === null) throw new AxiomError(`index ${stringifyKey(idx)} is not a position in ${what} (an array of length ${obj.length})`, 'AX-RUNTIME-INDEX');
+    while (obj.length < i) obj.push(null);
+    obj[i] = v;
+    return;
+  }
+  if (obj instanceof BVec || obj instanceof BMap) { obj.set(idx, v); return; }
+  if (isPlainDict(obj)) { obj[stringifyKey(idx)] = v; return; }
+  throw new AxiomError(`cannot assign into ${typeNameOf(obj)} by index — ${what} is not an array or dict`, 'AX-RUNTIME-INDEX');
 }
 
 function memberOf(obj, prop) {
@@ -5091,13 +5122,10 @@ function execStmtInner(stmt, ctx) {
       const idx = evalExpr(stmt.index, ctx);
       let v = evalExpr(stmt.value, ctx);
       const arr = resolveIdent(stmt.obj, ctx);
+      const what = `'${stmt.obj}'`;
       if (stmt.compoundOp) {
-        let current;
-        if (Array.isArray(arr)) current = arr[idx];
-        else if (arr instanceof BVec) current = arr.get(idx);
-        else if (arr instanceof BMap) current = arr.get(idx);
-        else if (arr && typeof arr === 'object') current = arr[idx];
-        else throw new AxiomError(`cannot assign into ${typeNameOf(arr)} by index — '${stmt.obj}' is not an array or dict`, 'AX-RUNTIME-INDEX');
+        const current = indexRead(arr, idx);
+        if (current === undefined) throw new AxiomError(`cannot assign into ${typeNameOf(arr)} by index — ${what} is not an array or dict`, 'AX-RUNTIME-INDEX');
         // v0.8.17: ??= short-circuits on non-null current.
         if (stmt.compoundOp === '??') {
           if (current !== null && current !== undefined) return;
@@ -5105,11 +5133,38 @@ function execStmtInner(stmt, ctx) {
           v = binaryOp(stmt.compoundOp, current, v);
         }
       }
-      if (Array.isArray(arr)) arr[idx] = v;
-      else if (arr instanceof BVec) arr.set(idx, v);
-      else if (arr instanceof BMap) arr.set(idx, v);
-      else if (arr && typeof arr === 'object') arr[idx] = v;
-      else throw new AxiomError(`cannot assign into ${typeNameOf(arr)} by index — '${stmt.obj}' is not an array or dict`, 'AX-RUNTIME-INDEX');
+      indexWrite(arr, idx, v, what);
+      return;
+    }
+    // v0.9.3: `g[r][c] = v`, `items[i].done = true`, `a.b[k] += 1`: the container is read as
+    // any expression is, then the last step is written as IndexAssign / MemberAssign write.
+    case 'ChainAssign': {
+      const obj = evalExpr(stmt.container, ctx);
+      const idx = stmt.last.kind === 'index' ? evalExpr(stmt.last.index, ctx) : null;
+      let v = evalExpr(stmt.value, ctx);
+      const what = `'${stmt.base}…'`;
+      if (stmt.last.kind === 'index') {
+        if (stmt.compoundOp) {
+          const current = indexRead(obj, idx);
+          if (current === undefined) throw new AxiomError(`cannot assign into ${typeNameOf(obj)} by index — ${what} is not an array or dict`, 'AX-RUNTIME-INDEX');
+          if (stmt.compoundOp === '??') { if (current !== null && current !== undefined) return; }
+          else v = binaryOp(stmt.compoundOp, current, v);
+        }
+        indexWrite(obj, idx, v, what);
+        return;
+      }
+      const prop = stmt.last.name;
+      if (obj === null || obj === undefined || typeof obj !== 'object' || Array.isArray(obj) || obj instanceof BVec || obj instanceof BMap) {
+        throw new AxiomError(`cannot set .${prop} on ${typeNameOf(obj)} — the value before .${prop} is not a dict, record, vector or entity`, 'AX-RUNTIME-MEMBER');
+      }
+      if (stmt.compoundOp) {
+        let current = obj instanceof EntityInstance ? obj.get(prop) : obj[prop];
+        if (current === undefined) current = null;
+        if (stmt.compoundOp === '??') { if (current !== null) return; }
+        else v = binaryOp(stmt.compoundOp, current, v);
+      }
+      if (obj instanceof EntityInstance) obj.set(prop, v);
+      else obj[prop] = v;
       return;
     }
     // v0.4 fix: member assignment (e.hp = val)

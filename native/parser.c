@@ -98,6 +98,8 @@ typedef struct {
   int pos;
   AxParseResult *res;
   jmp_buf bail;
+  AxNode **tails;      // AX-SEMI-001 marks (see parse_stmt)
+  int ntails, captails;
 } P;
 
 static AxNode *node(P *p, AxNodeKind kind) {
@@ -118,40 +120,138 @@ static AxTok *peek(P *p, int off) {
 static bool at(P *p, AxTokType t) { return peek(p, 0)->type == t; }
 static AxTok *advance(P *p) { return &p->toks->toks[p->pos++]; }
 
-static void perr(P *p, const char *fmt, ...) {
+static void perr_v(P *p, const char *hint, const char *fmt, va_list ap) {
   if (!p->res->err[0]) {
-    va_list ap;
-    va_start(ap, fmt);
     vsnprintf(p->res->err, sizeof p->res->err, fmt, ap);
-    va_end(ap);
+    snprintf(p->res->hint, sizeof p->res->hint, "%s", hint ? hint : "");
     p->res->err_line = peek(p, 0)->line;
     p->res->err_col = peek(p, 0)->col;
   }
   p->res->nerrors++;
   longjmp(p->bail, 1);
 }
+static void perr(P *p, const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  perr_v(p, NULL, fmt, ap);
+  va_end(ap);
+}
+// perr with what to change (parser.js ParseError.hint).
+static void perr_hint(P *p, const char *hint, const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  perr_v(p, hint, fmt, ap);
+  va_end(ap);
+}
 
+// Tokens as a message names them (parser.js describeType / describeToken).
 static const char *tok_name(AxTokType t) {
   switch (t) {
-    case T_EOF: return "end of file";
-    case T_NEWLINE: return "end of line";
-    case T_INDENT: return "indent";
-    case T_DEDENT: return "dedent";
+    case T_EOF: return "the end of the file";
+    case T_NEWLINE: return "the end of the line";
+    case T_INDENT: return "an indented block";
+    case T_DEDENT: return "the end of the block";
     case T_IDENT: return "a name";
     case T_NUM: return "a number";
     case T_STR: return "a string";
+    case T_FSTR: return "an f-string";
+    case T_AT: return "'@'";
+    case T_TILDE: return "'~'";
+    case T_DOLLAR: return "'$'";
+    case T_AMP: return "'&'";
+    case T_BANG: return "'!'";
+    case T_BANGBANG: return "'!!'";
+    case T_QUESTION: return "'?'";
+    case T_CARET: return "'^'";
+    case T_HASH: return "'#'";
+    case T_QMARKEQ: return "'?!'";
+    case T_ARROW: return "'->'";
+    case T_TILDEGT: return "'~>'";
+    case T_COLONCOLON: return "'::'";
+    case T_DOTDOT: return "'..'";
     case T_COLON: return "':'";
     case T_LPAREN: return "'('";
     case T_RPAREN: return "')'";
+    case T_LBRACKET: return "'['";
     case T_RBRACKET: return "']'";
-    case T_RBRACE: return "'}'";
     case T_COMMA: return "','";
-    default: return "a different token";
+    case T_DOT: return "'.'";
+    case T_LBRACE: return "'{'";
+    case T_RBRACE: return "'}'";
+    case T_SEMI: return "';'";
+    case T_PLUS: return "'+'";
+    case T_MINUS: return "'-'";
+    case T_STAR: return "'*'";
+    case T_SLASH: return "'/'";
+    case T_PERCENT: return "'%'";
+    case T_STARSTAR: return "'**'";
+    case T_PLUSEQ: return "'+='";
+    case T_MINUSEQ: return "'-='";
+    case T_STAREQ: return "'*='";
+    case T_SLASHEQ: return "'/='";
+    case T_PERCEQ: return "'%='";
+    case T_NULLCOALEQ: return "'?\?='";
+    case T_PLUSPLUS: return "'++'";
+    case T_MINUSMINUS: return "'--'";
+    case T_NULLCOAL: return "'?\?'";
+    case T_ANDAND: return "'&&'";
+    case T_OROR: return "'||'";
+    case T_GT: return "'>'";
+    case T_LT: return "'<'";
+    case T_GE: return "'>='";
+    case T_LE: return "'<='";
+    case T_EQEQ: return "'=='";
+    case T_NE: return "'!='";
+    case T_ASSIGN: return "'='";
+    case T_PIPE: return "'|'";
+    case T_PIPEGT: return "'|>'";
+    case T_BACKSLASH: return "'\\'";
+    case T_FATARROW: return "'=>'";
+    case T_MIDDOT: return "'·'";
+    case T_CROSS: return "'×'";
+    case T_QMARKGT: return "'?>'";
+    case T_TILDEEQ: return "'~='";
+    default: return "a token";
   }
+}
+static const char *tok_desc(AxTok *t) {
+  static char buf[160];
+  if (t->type == T_IDENT) { snprintf(buf, sizeof buf, "the name '%s'", t->payload); return buf; }
+  if (t->type == T_NUM) { snprintf(buf, sizeof buf, "the number %.*s", (int)t->len, t->start); return buf; }
+  return tok_name(t->type);
+}
+static bool is_assign_tok(AxTokType t) {
+  return t == T_ASSIGN || t == T_PLUSEQ || t == T_MINUSEQ || t == T_STAREQ || t == T_SLASHEQ || t == T_PERCEQ || t == T_NULLCOALEQ;
+}
+// What to change when `t` was expected and `got` came instead (parser.js expectHint).
+static const char *expect_hint(AxTokType t, AxTok *got) {
+  static char buf[300];
+  if (t == T_COLON && got->type == T_ASSIGN)
+    return "':' is expected here. In a condition, compare with '==' ('=' assigns); a field, local or global is declared with `~name: value`.";
+  if (t == T_COLON) return "End the header with ':', then write the body after it on the same line or indented on the lines below.";
+  if (t == T_NEWLINE && is_assign_tok(got->type))
+    return "Only a name, optionally followed by .field and [index] steps, can be assigned to. Store anything else in a variable first.";
+  if (t == T_NEWLINE) {
+    snprintf(buf, sizeof buf, "The statement is complete before %s. Split the rest into its own statement, or add the operator or ',' that is missing.", tok_desc(got));
+    return buf;
+  }
+  if (t == T_RPAREN || t == T_RBRACKET || t == T_RBRACE) {
+    snprintf(buf, sizeof buf, "Close the %s opened earlier on this line, or add the ',' missing between two items.", t == T_RPAREN ? "(" : t == T_RBRACKET ? "[" : "{");
+    return buf;
+  }
+  if (t == T_INDENT) return "Indent the body on the lines after the header (two spaces), or put a single statement after the colon.";
+  char what[64];
+  snprintf(what, sizeof what, "%s", tok_name(t));
+  snprintf(buf, sizeof buf, "Write %s here, where %s is.", what, tok_desc(got));
+  return buf;
 }
 
 static AxTok *expect(P *p, AxTokType t, const char *what) {
-  if (!at(p, t)) perr(p, "expected %s%s%s, got %s", tok_name(t), what ? " " : "", what ? what : "", tok_name(peek(p, 0)->type));
+  if (!at(p, t)) {
+    char got[160];
+    snprintf(got, sizeof got, "%s", tok_desc(peek(p, 0)));
+    perr_hint(p, expect_hint(t, peek(p, 0)), "expected %s%s%s, got %s", tok_name(t), what ? " " : "", what ? what : "", got);
+  }
   return advance(p);
 }
 
@@ -584,7 +684,16 @@ static AxNode *parse_primary(P *p) {
     }
     case T_HASH: return parse_tagref(p);
     default:
-      perr(p, "unexpected %s in an expression", tok_name(t->type));
+      {
+        char got[160];
+        snprintf(got, sizeof got, "%s", tok_desc(t));
+        char hint[300];
+        if (t->type == T_ASSIGN) snprintf(hint, sizeof hint, "'=' assigns, and only as a statement of its own; to compare, use '=='.");
+        else if (t->type == T_NEWLINE || t->type == T_EOF) snprintf(hint, sizeof hint, "The expression is unfinished: add what is missing after the last operator, or close the bracket left open.");
+        else snprintf(hint, sizeof hint, "An expression cannot have %s here. Check for a missing operand or operator just before it.", got);
+        if (t->type == T_NEWLINE || t->type == T_EOF) perr_hint(p, hint, "expected an expression, got %s", got);
+        perr_hint(p, hint, "unexpected %s in an expression", got);
+      }
       return NULL;
   }
 }
@@ -815,7 +924,37 @@ static void end_stmt(P *p) {
   if (at(p, T_SEMI)) { while (at(p, T_SEMI)) advance(p); return; }   // `;;` is an empty statement
   if (at(p, T_NEWLINE)) { advance(p); return; }
   if (at(p, T_DEDENT) || at(p, T_EOF)) return;
-  perr(p, "expected the end of the statement, got %s", tok_name(peek(p, 0)->type));
+  char got[160];
+  snprintf(got, sizeof got, "%s", tok_desc(peek(p, 0)));
+  perr_hint(p, expect_hint(T_NEWLINE, peek(p, 0)), "expected the end of the statement, got %s", got);
+}
+
+// An expression in plain words, for "cannot be assigned to" (parser.js describeExpr).
+static const char *describe_expr(AxNode *e, char *buf, size_t n) {
+  switch (e ? e->kind : -1) {
+    case N_CALL: case N_CALLV: case N_QUERY: snprintf(buf, n, "a function call"); break;
+    case N_METHOD: snprintf(buf, n, "a method call"); break;
+    case N_NUM: case N_STR: case N_FSTR: case N_ARRAY: snprintf(buf, n, "a literal"); break;
+    case N_MEMBER: case N_INDEX: {
+      char inner[200];
+      describe_expr(e->a, inner, sizeof inner);
+      snprintf(buf, n, "a part of %s", inner);
+      break;
+    }
+    case N_IDENT: snprintf(buf, n, "'%s'", e->str->data); break;
+    default: snprintf(buf, n, "an expression"); break;
+  }
+  return buf;
+}
+// The end of an expression statement: an assignment operator here means the left side is not
+// a target.
+static void end_expr_stmt(P *p, AxNode *expr) {
+  if (is_assign_tok(peek(p, 0)->type)) {
+    char what[240];
+    perr_hint(p, "Assign to a variable or to a name.field / name[index] chain (`g[r][c] = v` and `items[i].done = v` work). To store into the result of a call or an expression, put it in a variable first: `t = f(x)`, then `t.field = v`.",
+              "%s cannot be assigned to — an assignment target is a name, optionally followed by .field and [index] steps", describe_expr(expr, what, sizeof what));
+  }
+  end_stmt(p);
 }
 
 static int compound_op_of(AxTokType t) {
@@ -1052,6 +1191,79 @@ static AxNode *parse_stmt(P *p) {
   int line = t->line, col = t->col;
   AxNode *n = parse_stmt_inner(p);
   if (n) { n->line = line; n->col = col; }
+  // `?c: a; b` — the one-line body ended at a ';' and the line goes on: `b` is the next
+  // statement, not part of the body. Marked for the checker (parser.js, AX-SEMI-001).
+  if (n && (n->kind == N_IF || n->kind == N_WHILE || n->kind == N_FOR) && p->pos > 0) {
+    AxTok *prev = &p->toks->toks[p->pos - 1], *next = peek(p, 0);
+    if (prev->type == T_SEMI && next->line == prev->line && next->type != T_NEWLINE && next->type != T_DEDENT &&
+        next->type != T_INDENT && next->type != T_EOF) {
+      bool seen = false;
+      for (int i = 0; i < p->ntails; i++) if (p->tails[i]->line == next->line && p->tails[i]->col == next->col) seen = true;
+      if (!seen) {
+        if (p->ntails == p->captails) {
+          int ncap = p->captails ? p->captails * 2 : 4;
+          AxNode **nt = arena_alloc(sizeof(AxNode *) * ncap);
+          if (p->tails) memcpy(nt, p->tails, sizeof(AxNode *) * p->ntails);
+          p->tails = nt;
+          p->captails = ncap;
+        }
+        AxNode *m = node(p, N_EXPRSTMT);
+        m->line = next->line;
+        m->col = next->col;
+        m->flag = n->kind == N_IF;   // a conditional (else a loop)
+        p->tails[p->ntails++] = m;
+      }
+    }
+  }
+  return n;
+}
+
+// `g[r][c]`, `items[i].done`, `a.b[k]`: an assignment target of two or more steps with an index
+// in it (interpreter.js ChainAssign), from the IDENT at the current position. With `incr` (after
+// ++ / --) the target ends the statement; otherwise an assignment operator must follow it.
+// Returns NULL with the position restored when the tokens are not such a target.
+static AxNode *try_chain_target(P *p, bool incr) {
+  int save = p->pos;
+  jmp_buf saved;
+  memcpy(saved, p->bail, sizeof saved);
+  AxNode *volatile n = NULL;
+  if (setjmp(p->bail) == 0) {
+    AxTok *name = advance(p);
+    AxNode *container = node(p, N_IDENT);
+    container->str = tok_name_str(name);
+    AxNode *last = NULL;     // the step not yet folded into the container
+    int steps = 0;
+    bool saw_index = false;
+    while (at(p, T_DOT) || at(p, T_LBRACKET)) {
+      AxNode *step;
+      if (at(p, T_DOT)) {
+        if (peek(p, 1)->type != T_IDENT || peek(p, 2)->type == T_LPAREN) break;
+        advance(p);
+        step = node(p, N_MEMBER);
+        step->str = tok_name_str(advance(p));
+      } else {
+        advance(p);
+        step = node(p, N_INDEX);
+        step->b = parse_expr(p);
+        if (!at(p, T_RBRACKET)) break;
+        advance(p);
+        saw_index = true;
+      }
+      if (last) { last->a = container; container = last; }
+      last = step;
+      steps++;
+    }
+    bool ok = saw_index && steps >= 2 && (incr ? (at(p, T_NEWLINE) || at(p, T_SEMI) || at(p, T_DEDENT) || at(p, T_EOF)) : at_assign_op(p));
+    if (ok) {
+      n = node(p, N_CHAIN_ASSIGN);
+      n->a = container;
+      n->str2 = tok_name_str(name);
+      if (last->kind == N_INDEX) n->c = last->b;
+      else n->str = last->str;
+    }
+  }
+  memcpy(p->bail, saved, sizeof saved);
+  if (!n) p->pos = save;
   return n;
 }
 
@@ -1081,6 +1293,17 @@ static AxNode *parse_stmt_inner(P *p) {
   if (at(p, T_PLUSPLUS) || at(p, T_MINUSMINUS)) {
     int op = at(p, T_PLUSPLUS) ? OP_ADD : OP_SUB;
     advance(p);
+    if (at(p, T_IDENT) && (peek(p, 1)->type == T_DOT || peek(p, 1)->type == T_LBRACKET)) {
+      AxNode *n = try_chain_target(p, true);
+      if (n) {
+        AxNode *one = node(p, N_NUM);
+        one->num = 1;
+        n->b = one;
+        n->op = (uint8_t)op;
+        end_stmt(p);
+        return n;
+      }
+    }
     AxTok *name = expect(p, T_IDENT, "after '++'");
     AxNode *one = node(p, N_NUM);
     one->num = 1;
@@ -1290,6 +1513,17 @@ static AxNode *parse_stmt_inner(P *p) {
       }
       p->pos = save;
     }
+    // a chained target: g[r][c] op= / items[i].field op=
+    if (peek(p, 1)->type == T_DOT || peek(p, 1)->type == T_LBRACKET) {
+      AxNode *n = try_chain_target(p, false);
+      if (n) {
+        AxTokType opt = advance(p)->type;
+        n->op = (uint8_t)(opt == T_ASSIGN ? OP_NONE : compound_op_of(opt));
+        n->b = parse_expr(p);
+        end_stmt(p);
+        return n;
+      }
+    }
     // name = / name op= / name.path = / name[i] =
     if (at_assign_op(p) == false && peek(p, 1)->type == T_DOT) {
       int save = p->pos;
@@ -1344,7 +1578,7 @@ static AxNode *parse_stmt_inner(P *p) {
   }
   AxNode *n = node(p, N_EXPRSTMT);
   n->a = parse_expr(p);
-  end_stmt(p);
+  end_expr_stmt(p, n->a);
   return n;
 }
 
@@ -1864,10 +2098,13 @@ bool ax_parse(AxTokens *toks, AxParseResult *out) {
       perr(&p, "@input: is not supported — use input.move (Vec2), input.jump (bool), input.fire (bool), input.aim (Vec2) directly in blocks");
     if (at(&p, T_AT)) { nl_push(&decls, parse_entity(&p)); skip_newlines(&p); continue; }
     if (at(&p, T_HASH)) { nl_push(&decls, parse_resource(&p)); skip_newlines(&p); continue; }
-    perr(&p, "unexpected %s at the top level", tok_name(peek(&p, 0)->type));
+    perr_hint(&p, "At the top level a program has declarations only: ^main:, ^fn, ^proc, ^type, ^event, ^use, @entities, #resources and ~globals. Indent a statement that belongs inside one of them.",
+              "unexpected %s at the top level", tok_desc(peek(&p, 0)));
   }
   prog->list = decls.items;
   prog->nlist = decls.n;
+  prog->defaults = p.tails;   // the program's AX-SEMI-001 marks (a program node has no defaults)
+  prog->narms = p.ntails;
   out->program = prog;
   return true;
 }

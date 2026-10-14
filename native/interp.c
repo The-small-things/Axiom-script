@@ -391,13 +391,57 @@ AxArr *ax_to_seq(AxVM *vm, AxValue v) {
   }
 }
 
+// The element an array index names (interpreter.js arraySlot): a number rounded down, or text
+// that reads as one; negative counts from the end. False when it names none.
+bool ax_array_slot(uint32_t len, AxValue idx, int64_t *out) {
+  double d;
+  if (idx.t == AX_NUM) d = idx.num;
+  else if (idx.t == AX_STR) {
+    AxStr *s = (AxStr *)idx.o;
+    size_t a, b;
+    ax_trim_bytes(s->data, s->len, true, true, &a, &b);
+    if (a == b) return false;
+    d = ax_to_num(idx);
+  } else return false;
+  if (!isfinite(d)) return false;
+  d = floor(d);
+  if (d < 0) { d += len; if (d < 0) return false; }
+  if (d > 4294967294.0) return false;
+  *out = (int64_t)d;
+  return true;
+}
+
+// `x[i] = v` into an array or a dict (interpreter.js indexWrite); `what` names the target in
+// messages. Takes v.
+void ax_index_write(AxVM *vm, AxValue target, AxValue idx, AxValue v, const char *what) {
+  if (target.t == AX_ARR) {
+    AxArr *a = (AxArr *)target.o;
+    int64_t i;
+    if (!ax_array_slot(a->len, idx, &i)) {
+      ax_release(v);
+      AxStr *k = ax_to_str(idx);
+      char key[200];
+      snprintf(key, sizeof key, "%s", k->data);
+      ax_release(ax_strv(k));
+      ax_throw(vm, "AX-RUNTIME-INDEX", "index %s is not a position in %s (an array of length %u)", key, what, a->len);
+    }
+    ax_arr_set(a, i, v);
+  } else if (target.t == AX_DICT) {
+    AxStr *k = ax_to_str(idx);
+    ax_dict_set((AxDict *)target.o, k, v);
+    ax_release(ax_strv(k));
+  } else {
+    ax_release(v);
+    ax_throw(vm, "AX-RUNTIME-INDEX", "cannot assign into %s by index — %s is not an array or dict", ax_type_name(target), what);
+  }
+}
+
 AxValue ax_index_get(AxVM *vm, AxValue obj, AxValue idx) {
   switch (obj.t) {
     case AX_ARR: {
       AxArr *a = (AxArr *)obj.o;
-      double d = ax_to_num(idx);
-      int64_t i = (int64_t)d;
-      if (i < 0) i += a->len;                     // negative indices count from the end
+      int64_t i;
+      if (!ax_array_slot(a->len, idx, &i)) return ax_null();
       return ax_arr_get(a, i);
     }
     case AX_STR: {
@@ -1324,6 +1368,69 @@ static void assign_member_path(AxVM *vm, AxNode *n, AxScope *scope) {
   ax_release(obj);
 }
 
+// `g[r][c] op= v`, `items[i].done = v` (interpreter.js ChainAssign): the container is read as any
+// expression is, then the last step is written as an index or member assignment.
+static void assign_chain(AxVM *vm, AxNode *n, AxScope *scope) {
+  AxValue obj = eval_node(vm, n->a, scope);
+  AxValue idx = n->c ? eval_node(vm, n->c, scope) : ax_null();
+  AxValue v = eval_node(vm, n->b, scope);
+  char what[160];
+  snprintf(what, sizeof what, "'%s…'", n->str2->data);
+  if (n->c) {
+    if (obj.t == AX_HOST) {
+      ax_engine_index_assign(vm, obj, idx, v, n->op);
+      ax_release(idx);
+      ax_release(obj);
+      return;
+    }
+    if (n->op != OP_NONE) {
+      if (obj.t != AX_ARR && obj.t != AX_DICT) {
+        ax_release(v); ax_release(idx);
+        const char *tn = ax_type_name(obj);
+        ax_throw(vm, "AX-RUNTIME-INDEX", "cannot assign into %s by index — %s is not an array or dict", tn, what);
+      }
+      AxValue cur = ax_index_get(vm, obj, idx);
+      if (n->op == OP_COALESCE) {
+        if (cur.t != AX_NULL) { ax_release(cur); ax_release(v); ax_release(idx); ax_release(obj); return; }
+        ax_release(cur);
+      } else {
+        AxValue combined = binary_op(vm, n->op, cur, v);
+        ax_release(cur);
+        ax_release(v);
+        v = combined;
+      }
+    }
+    ax_index_write(vm, obj, idx, v, what);
+    ax_release(idx);
+    ax_release(obj);
+    return;
+  }
+  AxStr *prop = n->str;
+  bool writable = obj.t == AX_DICT || obj.t == AX_ENTITY || obj.t >= AX_VEC2;
+  if (!writable || obj.t == AX_HOST) {
+    ax_release(v);
+    const char *tn = ax_type_name(obj);
+    ax_release(obj);
+    ax_throw(vm, "AX-RUNTIME-MEMBER", "cannot set .%s on %s — the value before .%s is not a dict, record, vector or entity", prop->data, tn, prop->data);
+  }
+  if (n->op != OP_NONE) {
+    AxValue cur = raw_member(vm, obj, prop);
+    if (n->op == OP_COALESCE) {
+      if (cur.t != AX_NULL) { ax_release(cur); ax_release(v); ax_release(obj); return; }
+      ax_release(cur);
+    } else {
+      AxValue combined = binary_op(vm, n->op, cur, v);
+      ax_release(cur);
+      ax_release(v);
+      v = combined;
+    }
+  }
+  if (obj.t == AX_ENTITY) ax_entity_set((AxEntity *)obj.o, prop, v);
+  else if (obj.t == AX_DICT) ax_dict_set((AxDict *)obj.o, prop, v);
+  else if (!ax_engine_set_member(vm, obj, prop, v)) {}
+  ax_release(obj);
+}
+
 // ^try/^catch/^fin. Kept out of exec_stmt: a function that calls setjmp is compiled
 // pessimistically as a whole (every local may be clobbered), and exec_stmt runs every statement.
 static __attribute__((noinline)) int exec_try(AxVM *vm, AxNode *n, AxScope *scope, AxValue *out) {
@@ -1444,24 +1551,16 @@ static int exec_stmt(AxVM *vm, AxNode *n, AxScope *scope, AxValue *out) {
           v = combined;
         }
       }
-      if (target.t == AX_ARR) {
-        double d = ax_to_num(idx);
-        int64_t i = (int64_t)d;
-        if (i < 0) i += ((AxArr *)target.o)->len;
-        ax_arr_set((AxArr *)target.o, i, v);
-      } else if (target.t == AX_DICT) {
-        AxStr *k = ax_to_str(idx);
-        ax_dict_set((AxDict *)target.o, k, v);
-        ax_release(ax_strv(k));
-      } else {
-        const char *tn = ax_type_name(target);
-        ax_release(v); ax_release(idx); ax_release(target);
-        ax_throw(vm, "AX-RUNTIME-INDEX", "cannot assign into %s by index — '%s' is not an array or dict", tn, n->str->data);
-      }
+      char what[160];
+      snprintf(what, sizeof what, "'%s'", n->str->data);
+      ax_index_write(vm, target, idx, v, what);
       ax_release(idx);
       ax_release(target);
       return AX_FLOW_NORMAL;
     }
+    case N_CHAIN_ASSIGN:
+      assign_chain(vm, n, scope);
+      return AX_FLOW_NORMAL;
     case N_IF: {
       // A conditional opens no scope of its own (as in the reference): a name first assigned
       // inside one is visible after it.

@@ -13,12 +13,64 @@
 //   ^return, ~break, ~continue, !!assert, entity +Mixin and at pose,
 //   ?> raycast and .. range expression operators.
 const { tokenize, TT } = require('./lexer');
+// The compound operator an assignment token stands for (`=` has none).
+const COMPOUND_OPS = { [TT.PLUSEQ]: '+', [TT.MINUSEQ]: '-', [TT.STAREQ]: '*', [TT.SLASHEQ]: '/', [TT.PERCEQ]: '%', [TT.NULLCOALEQ]: '??' };
 
+// v0.9.3: the message is the problem alone (the location travels as line/col, and the checker
+// prefixes "Parse error: "); `hint` is what to change, for message_for_agent, and `fix` a
+// concrete edit when there is one.
 class ParseError extends Error {
-  constructor(msg, tok) {
-    super(`Parse error (line ${tok ? tok.line : '?'}): ${msg}`);
+  constructor(msg, tok, hint, fix) {
+    super(msg);
     this.line = tok ? tok.line : null;
     this.col = tok ? (tok.col ?? null) : null;
+    if (hint) this.hint = hint;
+    if (fix) this.fix = fix;
+  }
+}
+
+// Tokens as a message names them.
+const TOKEN_TEXT = { AT: '@', TILDE: '~', DOLLAR: '$', AMP: '&', BANG: '!', BANGBANG: '!!', QUESTION: '?', CARET: '^',
+  HASH: '#', QMARKEQ: '?!', ARROW: '->', TILDEEQ: '~=', TILDEGT: '~>', COLONCOLON: '::', QMARKGT: '?>', DOTDOT: '..',
+  COLON: ':', LPAREN: '(', RPAREN: ')', LBRACKET: '[', RBRACKET: ']', COMMA: ',', DOT: '.', LBRACE: '{', RBRACE: '}',
+  PLUS: '+', MINUS: '-', STAR: '*', SLASH: '/', PERCENT: '%', PLUSEQ: '+=', MINUSEQ: '-=', STAREQ: '*=', SLASHEQ: '/=',
+  PERCEQ: '%=', PLUSPLUS: '++', MINUSMINUS: '--', STARSTAR: '**', NULLCOAL: '??', NULLCOALEQ: '??=', ANDAND: '&&',
+  OROR: '||', GT: '>', LT: '<', GE: '>=', LE: '<=', EQEQ: '==', NE: '!=', ASSIGN: '=', PIPE: '|', MIDDOT: '·',
+  CROSS: '×', COMPOSE: '∘', SEMICOLON: ';', BACKSLASH: '\\', PIPEGT: '|>', FATARROW: '=>' };
+const TOKEN_WORDS = { NEWLINE: 'the end of the line', EOF: 'the end of the file', INDENT: 'an indented block',
+  DEDENT: 'the end of the block', IDENT: 'a name', NUMBER: 'a number', HEXNUM: 'a number', STRING: 'a string',
+  FSTRING: 'an f-string' };
+function describeType(type) { return TOKEN_TEXT[type] ? `'${TOKEN_TEXT[type]}'` : (TOKEN_WORDS[type] || type.toLowerCase()); }
+function describeToken(tok) {
+  if (!tok) return 'the end of the file';
+  if (tok.type === TT.IDENT) return `the name '${tok.value}'`;
+  if (tok.type === TT.NUMBER || tok.type === TT.HEXNUM) return `the number ${tok.value}`;
+  return describeType(tok.type);
+}
+const ASSIGN_OPS = new Set(['ASSIGN', 'PLUSEQ', 'MINUSEQ', 'STAREQ', 'SLASHEQ', 'PERCEQ', 'NULLCOALEQ']);
+// What to change when `type` was expected and `got` came instead.
+function expectHint(type, got) {
+  if (type === 'COLON' && got && got.type === 'ASSIGN') {
+    return "':' is expected here. In a condition, compare with '==' ('=' assigns); a field, local or global is declared with `~name: value`.";
+  }
+  if (type === 'COLON') return "End the header with ':', then write the body after it on the same line or indented on the lines below.";
+  if (type === 'NEWLINE' && got && ASSIGN_OPS.has(got.type)) {
+    return 'Only a name, optionally followed by .field and [index] steps, can be assigned to. Store anything else in a variable first.';
+  }
+  if (type === 'NEWLINE') return `The statement is complete before ${describeToken(got)}. Split the rest into its own statement, or add the operator or ',' that is missing.`;
+  if (type === 'RPAREN' || type === 'RBRACKET' || type === 'RBRACE') return `Close the ${TOKEN_TEXT[type] === ')' ? '(' : TOKEN_TEXT[type] === ']' ? '[' : '{'} opened earlier on this line, or add the ',' missing between two items.`;
+  if (type === 'INDENT') return 'Indent the body on the lines after the header (two spaces), or put a single statement after the colon.';
+  return `Write ${describeType(type)} here, where ${describeToken(got)} is.`;
+}
+// An expression in plain words, for "cannot be assigned to".
+function describeExpr(e) {
+  switch (e && e.type) {
+    case 'Call': case 'Query': return 'a function call';
+    case 'MethodCall': return 'a method call';
+    case 'NumberLit': case 'StringLit': case 'FString': case 'ArrayLit': return 'a literal';
+    case 'Member': case 'Index': return `a part of ${describeExpr(e.obj)}`;
+    case 'Ident': return `'${e.name}'`;
+    default: return 'an expression';
   }
 }
 
@@ -53,8 +105,23 @@ class Parser {
   atAny(...types) { return types.includes(this.peek().type); }
   advance() { return this.toks[this.pos++]; }
   expect(type, ctx) {
-    if (!this.at(type)) throw new ParseError(`expected ${type}${ctx ? ' ' + ctx : ''}, got ${this.peek().type} (${JSON.stringify(this.peek().value)})`, this.peek());
+    if (!this.at(type)) {
+      const got = this.peek();
+      throw new ParseError(`expected ${describeType(type)}${ctx ? ' ' + ctx : ''}, got ${describeToken(got)}`, got, expectHint(type, got));
+    }
     return this.advance();
+  }
+  // The end of an expression statement. An assignment operator here means the left side is
+  // not a target (a call, a literal, an expression): say so instead of "expected the end of
+  // the line".
+  endExprStmt(expr) {
+    if (this.atAny(TT.ASSIGN, TT.PLUSEQ, TT.MINUSEQ, TT.STAREQ, TT.SLASHEQ, TT.PERCEQ, TT.NULLCOALEQ)) {
+      const what = describeExpr(expr);
+      throw new ParseError(`${what} cannot be assigned to — an assignment target is a name, optionally followed by .field and [index] steps`,
+        this.peek(),
+        'Assign to a variable or to a name.field / name[index] chain (`g[r][c] = v` and `items[i].done = v` work). To store into the result of a call or an expression, put it in a variable first: `t = f(x)`, then `t.field = v`.');
+    }
+    this.expect(TT.NEWLINE);
   }
   // Skip stray NEWLINE tokens (blank statement separators)
   skipNewlines() { while (this.at(TT.NEWLINE)) this.advance(); }
@@ -126,7 +193,7 @@ class Parser {
         } else if (this.at(TT.TILDE) && this.peek(1).type === TT.IDENT) {
           globals.push(this.parseGlobalDecl());
         } else {
-          throw new ParseError(`unexpected top-level token ${this.peek().type}`, this.peek());
+          throw new ParseError(`unexpected ${describeToken(this.peek())} at the top level`, this.peek(), 'At the top level a program has declarations only: ^main:, ^fn, ^proc, ^type, ^event, ^use, @entities, #resources and ~globals. Indent a statement that belongs inside one of them.');
         }
       } catch (err) {
         if (err instanceof ParseError) {
@@ -144,7 +211,9 @@ class Parser {
         // Without skipping these, the loop stops at the next `@` but the INDENT before it was
         // already consumed by the entity's header parse, so the body doesn't parse correctly.
         if (!this.at(TT.EOF)) this.advance();
-        while (!this.at(TT.EOF) && !this.at(TT.AT) && !this.at(TT.CARET) && !this.at(TT.HASH)) {
+        // v0.9.3: only at the start of a line — a `^return` inside the broken body is not a
+        // declaration to restart at.
+        while (!this.at(TT.EOF) && !((this.at(TT.AT) || this.at(TT.CARET) || this.at(TT.HASH) || this.at(TT.TILDE)) && this.peek().col === 1)) {
           this.advance();
         }
       }
@@ -221,7 +290,7 @@ class Parser {
     while (this.at(TT.COMMA)) {
       this.advance();
       const t = this.peek();
-      if (t.type !== TT.STRING) throw new ParseError(`^use expects a quoted path, got ${t.type}`, t);
+      if (t.type !== TT.STRING) throw new ParseError(`^use expects a quoted path, got ${describeToken(t)}`, t, 'Write the path as a string: `^use "lib.ax"`.');
       this.advance();
       paths.push(t.value);
     }
@@ -533,7 +602,7 @@ class Parser {
         this.expect(TT.NEWLINE);
         members.push(...fields);
       } else {
-        throw new ParseError(`unexpected token in mixin body: ${this.peek().type}`, this.peek());
+        throw new ParseError(`unexpected ${describeToken(this.peek())} in a mixin body`, this.peek());
       }
       this.skipNewlines();
     }
@@ -771,7 +840,7 @@ class Parser {
       this.expect(TT.NEWLINE);
       return fields;
     }
-    throw new ParseError(`unexpected token starting a member: ${this.peek().type}`, this.peek());
+    throw new ParseError(`unexpected ${describeToken(this.peek())} starting a member`, this.peek());
   }
 
   // Disambiguate "&physics:" (a block) from a hypothetical bare "&Base" reference — in practice
@@ -939,7 +1008,7 @@ class Parser {
            this.toks[mutEnd].type !== TT.EOF &&
            this.toks[mutEnd].type !== TT.DEDENT) {
       if (this.toks[mutEnd].type === TT.SEMICOLON) {
-        this.toks[mutEnd] = { type: TT.NEWLINE, line: this.toks[mutEnd].line, col: this.toks[mutEnd].col };
+        this.toks[mutEnd] = { type: TT.NEWLINE, line: this.toks[mutEnd].line, col: this.toks[mutEnd].col, semicolon: true };
       }
       mutEnd++;
     }
@@ -965,7 +1034,64 @@ class Parser {
     return { type: 'Block', name, freq, freqUnit, eventArg, body, line, col };
   }
 
+  // v0.9.3: statement-level recovery. A statement that fails to parse is recorded and skipped
+  // — to the end of its line, and the block it opens if it opens one — and the block goes on.
+  // Before, recovery happened only between top-level declarations: a bad line inside a ^fn
+  // made the parser restart at the next `^` (a `^return` in the same body, reported as a
+  // second error) and lost the whole declaration (a bad line in ^main also produced "no ^main").
   parseStmt() {
+    const start = this.pos;
+    try {
+      const st = this.parseStmtInner();
+      // v0.9.3: `?c: a; b` — the one-line body ended at a ';' and the line goes on. `b` is
+      // the next statement, not part of the body (as a line break would make it), which reads
+      // the other way; the checker warns (AX-SEMI-001).
+      if (st && (st.type === 'CondBlock' || st.type === 'WhileLoop' || st.type === 'ForLoop')) {
+        const prev = this.toks[this.pos - 1], next = this.peek();
+        if (prev && prev.semicolon && next && next.line === prev.line &&
+            ![TT.NEWLINE, TT.DEDENT, TT.INDENT, TT.EOF].includes(next.type)) {
+          this._semicolonTails = this._semicolonTails || [];
+          if (!this._semicolonTails.some((t) => t.line === next.line && t.col === next.col)) {
+            this._semicolonTails.push({ kind: st.type === 'CondBlock' ? 'cond' : 'loop', line: next.line, col: next.col });
+          }
+        }
+      }
+      return st;
+    } catch (err) {
+      if (!(err instanceof ParseError) && !(err instanceof TypeError)) throw err;
+      this._parseErrors = this._parseErrors || [];
+      this._parseErrors.push(err instanceof ParseError ? err : new ParseError(err.message, this.toks[start]));
+      this.skipStatement(start);
+      // An inert stand-in: a program with a parse error is reported, never run.
+      return { type: 'ParseErrorStmt', line: this.toks[start].line, col: this.toks[start].col };
+    }
+  }
+  // From an error inside a statement: past the end of its line (a NEWLINE outside any block it
+  // opened) and the indented block after it, if any; never past the end of the enclosing block.
+  skipStatement(start) {
+    if (this.pos <= start) this.pos = start;
+    let depth = 0;
+    while (!this.at(TT.EOF)) {
+      const t = this.peek().type;
+      if (t === TT.INDENT) { depth++; this.advance(); continue; }
+      if (t === TT.DEDENT) { if (depth === 0) return; depth--; this.advance(); if (depth === 0) return; continue; }
+      if (t === TT.NEWLINE && depth === 0) {
+        this.advance();
+        if (this.at(TT.INDENT)) {
+          let d = 0;
+          do {
+            const u = this.advance().type;
+            if (u === TT.INDENT) d++;
+            else if (u === TT.DEDENT) d--;
+          } while (d > 0 && !this.at(TT.EOF));
+        }
+        return;
+      }
+      this.advance();
+    }
+  }
+
+  parseStmtInner() {
     // v0.9.3: `;` ends a statement wherever a line break would (GRAMMAR.md, "Newline &
     // Semicolon Handling") — `x = 1; y = 2` in any body, as the native parser has it. The
     // single-line block rewrite below is applied to the rest of this line: each `;` becomes a
@@ -973,7 +1099,7 @@ class Parser {
     for (let k = this.pos; k < this.toks.length; k++) {
       const t = this.toks[k];
       if (t.type === TT.NEWLINE || t.type === TT.EOF || t.type === TT.DEDENT || t.type === TT.INDENT) break;
-      if (t.type === TT.SEMICOLON) this.toks[k] = { type: TT.NEWLINE, line: t.line, col: t.col };
+      if (t.type === TT.SEMICOLON) this.toks[k] = { type: TT.NEWLINE, line: t.line, col: t.col, semicolon: true };
     }
     // v0.4: !!expr — assert (double-bang)
     // v0.5.1 fix: lexer emits BANGBANG as a single token (lexer.js line 113), so handle both forms.
@@ -1003,6 +1129,15 @@ class Parser {
       const line = this.peek().line, col = this.peek().col;
       const op = this.at(TT.PLUSPLUS) ? '+' : '-';
       this.advance();  // consume ++/--
+      // v0.9.3: `++g[r][c]` and the other chained targets.
+      if (this.at(TT.IDENT) && (this.peek(1).type === TT.DOT || this.peek(1).type === TT.LBRACKET)) {
+        const save = this.pos;
+        // tryChainTarget wants an assignment operator after the target: look past it for the
+        // end of the statement instead.
+        const steps = this.scanChainForIncrement();
+        if (steps) return { type: 'ChainAssign', ...steps, value: { type: 'NumberLit', value: 1 }, compoundOp: op, line, col };
+        this.pos = save;
+      }
       // Parse the target. Reuse parseAssignOrExprStmt's target-parsing logic by dispatching to it
       // and intercepting the result. But that's complex — simpler to inline the three target forms.
       const nameTok = this.expect(TT.IDENT);
@@ -1154,7 +1289,7 @@ class Parser {
       this.expect(TT.NEWLINE);
       return { type: 'ExprStmt', expr, line, col };
     }
-    throw new ParseError(`unexpected statement token ${this.peek().type}`, this.peek());
+    throw new ParseError(`unexpected ${describeToken(this.peek())} at the start of a statement`, this.peek());
   }
 
   // v0.9.0: `^try:` body `^catch e:` handler [`^fin:` cleanup]. The catch variable is optional
@@ -1533,6 +1668,72 @@ class Parser {
   // written exactly this way, with no assignment, so the grammar needs to admit it as parseable
   // even though it's expected to be a compile-time contract violation). Only a bare, un-suffixed
   // IDENT can be an assignment target; anything else backtracks and parses as an ExprStmt.
+  // v0.9.3: an assignment target that goes through more than one step with an index in it —
+  // `g[r][c]`, `items[i].done`, `a.b[k]` — where the existing forms take `name[i]` or
+  // `name.a.b` only. Parsed from the current IDENT: the steps, or null (position restored) when
+  // the tokens are not such a target followed by an assignment operator.
+  tryChainTarget() {
+    const save = this.pos;
+    const steps = [];
+    const nameTok = this.advance();
+    let sawIndex = false;
+    while (this.at(TT.DOT) || this.at(TT.LBRACKET)) {
+      if (this.at(TT.DOT)) {
+        if (this.peek(1).type !== TT.IDENT || this.peek(2).type === TT.LPAREN) break;
+        this.advance();
+        steps.push({ kind: 'member', name: this.advance().value });
+      } else {
+        this.advance();
+        let index;
+        try { index = this.parseExpr(); } catch (e) { this.pos = save; return null; }
+        if (!this.at(TT.RBRACKET)) { this.pos = save; return null; }
+        this.advance();
+        steps.push({ kind: 'index', index });
+        sawIndex = true;
+      }
+    }
+    if (!sawIndex || steps.length < 2 || !this.atAny(TT.ASSIGN, TT.PLUSEQ, TT.MINUSEQ, TT.STAREQ, TT.SLASHEQ, TT.PERCEQ, TT.NULLCOALEQ)) {
+      this.pos = save;
+      return null;
+    }
+    // The container is an ordinary expression (so reading it follows the reading rules); the
+    // last step is the write.
+    let container = { type: 'Ident', name: nameTok.value };
+    for (const st of steps.slice(0, -1)) {
+      container = st.kind === 'member' ? { type: 'Member', obj: container, prop: st.name } : { type: 'Index', obj: container, index: st.index };
+    }
+    return { container, last: steps[steps.length - 1], base: nameTok.value };
+  }
+
+  // `++target` with a chained target: the target, then the end of the statement.
+  scanChainForIncrement() {
+    const save = this.pos;
+    // Pretend an assignment operator follows by checking the chain shape directly.
+    const steps = [];
+    const nameTok = this.advance();
+    let sawIndex = false;
+    while (this.at(TT.DOT) || this.at(TT.LBRACKET)) {
+      if (this.at(TT.DOT)) {
+        if (this.peek(1).type !== TT.IDENT || this.peek(2).type === TT.LPAREN) break;
+        this.advance();
+        steps.push({ kind: 'member', name: this.advance().value });
+      } else {
+        this.advance();
+        const index = this.parseExpr();
+        this.expect(TT.RBRACKET);
+        steps.push({ kind: 'index', index });
+        sawIndex = true;
+      }
+    }
+    if (!sawIndex || steps.length < 2) { this.pos = save; return null; }
+    this.expect(TT.NEWLINE);
+    let container = { type: 'Ident', name: nameTok.value };
+    for (const st of steps.slice(0, -1)) {
+      container = st.kind === 'member' ? { type: 'Member', obj: container, prop: st.name } : { type: 'Index', obj: container, index: st.index };
+    }
+    return { container, last: steps[steps.length - 1], base: nameTok.value };
+  }
+
   parseAssignOrExprStmt() {
     const line = this.peek().line, col = this.peek().col;
     const startPos = this.pos;
@@ -1557,6 +1758,15 @@ class Parser {
       const value = this.parseExpr();
       this.expect(TT.NEWLINE);
       return { type: 'Assign', sigil: '~', target: nameTok.value, op: '=', value, compoundOp, line, col };
+    }
+    if (this.at(TT.IDENT) && (this.peek(1).type === TT.DOT || this.peek(1).type === TT.LBRACKET)) {
+      const chain = this.tryChainTarget();
+      if (chain) {
+        const opTok = this.advance().type;
+        const value = this.parseExpr();
+        this.expect(TT.NEWLINE);
+        return { type: 'ChainAssign', ...chain, value, compoundOp: COMPOUND_OPS[opTok] || null, line, col };
+      }
     }
     const nameTok = this.at(TT.IDENT) ? this.expect(TT.IDENT) : null;
     // v0.4 fix: support obj.field = expr member assignment
@@ -1592,7 +1802,7 @@ class Parser {
       // Not an assignment — backtrack and parse as expression
       this.pos = startPos;
       const expr = this.parseExpr();
-      this.expect(TT.NEWLINE);
+      this.endExprStmt(expr);
       return { type: 'ExprStmt', expr, line, col };
     }
     // v0.8.8: array element compound assign — `arr[i] += val`. Parse the index, then check
@@ -1641,7 +1851,7 @@ class Parser {
     }
     this.pos = startPos; // not an assignment -- reparse the same tokens as a general expression
     const expr = this.parseExpr();
-    this.expect(TT.NEWLINE);
+    this.endExprStmt(expr);
     return { type: 'ExprStmt', expr, line, col };
   }
 
@@ -2246,7 +2456,7 @@ class Parser {
       this.advance();
       return { type: 'Ident', name: tok.value };
     }
-    throw new ParseError(`unexpected token in expression: ${tok.type}`, tok);
+    throw new ParseError((tok.type === TT.NEWLINE || tok.type === TT.EOF) ? `expected an expression, got ${describeToken(tok)}` : `unexpected ${describeToken(tok)} in an expression`, tok, tok.type === TT.ASSIGN ? "'=' assigns, and only as a statement of its own; to compare, use '=='." : (tok.type === TT.NEWLINE || tok.type === TT.EOF) ? 'The expression is unfinished: add what is missing after the last operator, or close the bracket left open.' : `An expression cannot have ${describeToken(tok)} here. Check for a missing operand or operator just before it.`);
   }
 }
 
@@ -2300,6 +2510,7 @@ function parse(source) {
   // (no behavior change for clean programs). If there ARE errors, the program still parses
   // (partially) — the LLM gets all errors in one pass.
   program.parseErrors = p._parseErrors || [];
+  program.semicolonTails = p._semicolonTails || [];
   return program;
 }
 

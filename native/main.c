@@ -184,8 +184,8 @@ int main(int argc, char **argv) {
   memset(&pr, 0, sizeof pr);
   bool lexed = ax_tokenize(source, &toks);
   bool parsed = lexed && ax_parse(&toks, &pr);
-  AxCheck *chk = parsed ? ax_check(pr.program, source, path, toks.version, NULL, 0, 0)
-                        : ax_check(NULL, source, path, NULL, lexed ? pr.err : toks.err, lexed ? pr.err_line : toks.err_line, lexed ? pr.err_col : 0);
+  AxCheck *chk = parsed ? ax_check(pr.program, source, path, toks.version, NULL, NULL, 0, 0)
+                        : ax_check(NULL, source, path, NULL, lexed ? pr.err : toks.err, lexed ? pr.hint : NULL, lexed ? pr.err_line : toks.err_line, lexed ? pr.err_col : 0);
   if (check_only) {
     bool ok = ax_check_ok(chk);
     if (json) ax_check_print_json(chk, stdout);

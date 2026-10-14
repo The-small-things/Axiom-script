@@ -344,7 +344,7 @@ typedef enum {
   N_ARRAY, N_DICT, N_LAMBDA, N_CALL, N_CALLV, N_METHOD, N_MEMBER, N_INDEX,
   N_BINARY, N_UNARY, N_TERNARY, N_PIPE, N_COMPREHENSION, N_VALUE,
   // statements
-  N_ASSIGN, N_DESTRUCTURE, N_MEMBER_ASSIGN, N_INDEX_ASSIGN, N_EXPRSTMT,
+  N_ASSIGN, N_DESTRUCTURE, N_MEMBER_ASSIGN, N_INDEX_ASSIGN, N_CHAIN_ASSIGN, N_EXPRSTMT,
   N_IF, N_MATCH, N_WHILE, N_FOR, N_BREAK, N_CONTINUE, N_RETURN,
   N_TRY, N_THROW, N_ASSERT, N_BLOCK,
   // declarations
@@ -410,6 +410,7 @@ enum {
 typedef struct {
   AxNode *program;
   char err[512];
+  char hint[512];      // what to change, for message_for_agent ("" when there is no specific one)
   int err_line, err_col;
   int nerrors;
 } AxParseResult;
@@ -553,6 +554,8 @@ enum { AX_FLOW_NORMAL = 0, AX_FLOW_BREAK, AX_FLOW_CONTINUE, AX_FLOW_RETURN };
 // Shared helpers used by the standard library.
 AxValue ax_method_call(AxVM *vm, AxValue obj, AxStr *name, AxValue *args, int argc);
 AxValue ax_index_get(AxVM *vm, AxValue obj, AxValue idx);
+bool ax_array_slot(uint32_t len, AxValue idx, int64_t *out);
+void ax_index_write(AxVM *vm, AxValue target, AxValue idx, AxValue v, const char *what);
 AxArr *ax_to_seq(AxVM *vm, AxValue v);   // array view of any iterable; returns +1
 AxValue ax_key_apply(AxVM *vm, AxValue sel, AxValue item, double index);
 bool ax_is_callable(AxValue v);
@@ -631,7 +634,7 @@ bool ax_sandbox_can_read(AxVM *vm, const char *path);
 // check.c — the static checker (checker.js). A parse error, when given, is the only diagnostic.
 typedef struct AxCheck AxCheck;
 AxCheck *ax_check(AxNode *program, const char *source, const char *filename, const char *version,
-                  const char *parse_err, int parse_line, int parse_col);
+                  const char *parse_err, const char *parse_hint, int parse_line, int parse_col);
 bool ax_check_ok(const AxCheck *c);            // nothing fatal or contract-violating
 int  ax_check_count(const AxCheck *c);
 int  ax_check_blocking(const AxCheck *c);

@@ -299,7 +299,7 @@ if (flags.check) {
   }
   if (r.diagnostics.length > 0) {
     for (const d of r.diagnostics) {
-      console.error(`  [${d.error_code}] (${d.severity}) L${d.location?.line}:${d.location?.col} ${d.message_for_human}`);
+      console.error(`  [${d.error_code}] (${d.severity}) L${d.location?.line}${d.location?.col != null ? ":" + d.location.col : ""} ${d.message_for_human}`);
     }
   }
   if (r.ok) {
@@ -314,7 +314,7 @@ if (flags.check) {
 if (!r.ok) {
   console.error(`compile failed:`);
   for (const d of r.diagnostics) {
-    console.error(`  [${d.error_code}] (${d.severity}) L${d.location?.line}:${d.location?.col} ${d.message_for_human}`);
+    console.error(`  [${d.error_code}] (${d.severity}) L${d.location?.line}${d.location?.col != null ? ":" + d.location.col : ""} ${d.message_for_human}`);
   }
   process.exit(1);
 }
