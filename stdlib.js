@@ -26,6 +26,9 @@
 
 const fs = require('fs');
 const path = require('path');
+// Loaded on first use: only a program that asks for keys touches the terminal.
+let _keyboard = null;
+const keyboard = () => _keyboard || (_keyboard = require('./keyboard'));
 
 // A ctx-aware intrinsic: the interpreter appends the evaluation context as the final argument
 // so the function can call back into the language (invoking lambdas, reading the world).
@@ -374,6 +377,10 @@ function stdlibIntrinsics(world, rt) {
       return line.length ? line : null;
     },
     read_stdin: () => { try { return fs.readFileSync(0, 'utf8'); } catch (e) { return ''; } },
+    // Keys without waiting (keyboard.js): the next key pressed, or null when none is waiting;
+    // the keys held down right now.
+    poll_key: () => keyboard().pollKey(),
+    keys_down: () => keyboard().keysDown(),
     args: () => (world.argv || []).slice(),
     env: (name, dflt) => { const v = process.env[String(name)]; return v === undefined ? (dflt === undefined ? null : dflt) : v; },
     eprint: (...vals) => { process.stderr.write(vals.map(v => typeof v === 'string' ? v : rt.stringify(v)).join(' ') + '\n'); return null; },

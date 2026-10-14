@@ -324,11 +324,81 @@ A range printed as `Range` in the JavaScript runtime and as `0..3` natively, and
 it `dict` there. Both now show `0..3` (or `range(1, 10, 2)` with a step) and name the type
 `range`.
 
+### Assignment into nested containers
+
+`g[r][c] = v`, `items[i].done = true`, `cfg.sizes[2] += 1` and `g[r][c]++` were syntax errors;
+an assignment target was a name with at most one `.field` or `[index]`. A target is now a name
+followed by any chain of `.field` and `[index]` steps (GRAMMAR.md `target_step`). Everything but
+the last step is read as an ordinary expression, then the last step is written: the container
+first, then the index, then the value.
+
+Reads and writes follow one index rule in both runtimes. An array index is a number (floored)
+or numeric text; a negative one counts from the end; a read outside the array is null; a write
+past the end grows the array with nulls; a write before the start is `AX-RUNTIME-INDEX`
+("index -9 is not a position in 'g[1]' (an array of length 3)"). A dict key is the display text
+of the index. Writing a field of a value that has no fields is `AX-RUNTIME-MEMBER`. This fixed
+JavaScript-only bugs found on the way: `xs[-1] = v` created an invisible property, `xs[2.5] = v`
+was dropped, a write far past the end left holes rather than nulls, and a dict keyed by a
+number used `String()` rather than its display text.
+
+### Parse errors say what is wrong, once
+
+A parse error printed raw token names (`expected RBRACKET, got NEWLINE`, `unexpected top-level
+token CARET`), a location of "(undefined)", and an agent message that only repeated the error.
+Then the parser lost its place, and one mistake became a cascade — including a false
+`AX-MAIN-001 no ^main` when the broken line was inside `^main`. Now:
+
+- tokens are named in words (`expected ']' to close the list, got the end of the line`);
+- each error carries a fix in `message_for_agent` specific to the mistake — `=` in a condition
+  points at `==`, an assignment to a call result says to store it in a variable first;
+- the JavaScript parser recovers at the next statement (or the next top-level declaration), so
+  every independent mistake is reported once and nothing else is;
+- when a program has parse errors, the checker reports only those.
+
+### `;` after a one-line `?` or loop body: AX-SEMI-001
+
+`?hit: score += 1; lives -= 1` reads as one conditional, but `;` is a line break, so
+`lives -= 1` runs every time. The checker now flags a one-line `?`, `*` or `*for` body that ends
+at `;` with more on the same line (advisory AX-SEMI-001), naming the statement that runs
+unconditionally and the indented form that keeps it inside. The meaning of `;` is unchanged.
+
+### Frames on screen: render3d.js, a window, and keys
+
+The JavaScript runtime's renderer, `render3d.js`, was not in the repository: `--terminal`,
+`--headless` and the window all failed with "could not be loaded". It is now included — a port
+of the native rasterizer, close enough that both runtimes write the same PNG files and the same
+terminal frames byte for byte (`difftest.sh` compares them).
+
+- `--sdl` opens a window through `@kmamal/sdl`, now an optional dependency (`npm install`
+  fetches it where it has prebuilt binaries). Without it, `--sdl` says how to install it
+  instead of "require failed"; with it but no display, it says so, and the automatic mode
+  falls back to the terminal. Arrow keys and F/Enter work in the window, as in the terminal.
+- `--headless` writes `screenshots/` under the current directory, numbered as the native
+  runtime numbers them (frame N is the world after N steps); the window writes PNGs only when
+  `--png-every` asks for them.
+- `poll_key()` returns the next key pressed, or null, without waiting; `keys_down()` lists the
+  keys held now. A `^main` loop can animate and react to keys at once. Keys come from a
+  terminal (switched to unechoed, byte-at-a-time input), a pipe or a file, or — while a world
+  runs — from its window or terminal, so frame code sees the same names. Names: the character
+  itself, or `up down left right enter space tab backspace escape home end insert delete
+  pageup pagedown`, `ctrl+a`… Both runtimes decode the same bytes into the same names.
+  `examples/keys.ax` shows them.
+
+### Driving a program from another one
+
+`examples/bridge.ax` and `examples/bridge_host.js` show the lockstep bridge: the host writes
+one command line per step, the program answers with one line of JSON state. Found while
+writing it: the native `input()` did not flush stdout before waiting, so over a pipe the host
+and the program each waited for the other forever. `input()`, `read_stdin()` and `poll_key()`
+now flush first.
+
 ### Fixed
 
 - The native parser accepted `^fn f(x): stmt` — which parser.js rejects — and the function
   returned null. It is now the same parse error in both (the one-line form is
   `^fn f(x) = expr`).
+- `examples/scene.ax` named itself `tests/render_scene.ax`; the README gave the version as 0.9.0
+  and pointed `npm test` at a `run_all_tests.js` that does not exist.
 
 ## v0.9.2 — The engine in C
 

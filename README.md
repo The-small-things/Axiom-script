@@ -2,7 +2,7 @@
 
 **A general-purpose language written for language models, not for people.**
 
-Version 0.9.0 · reference implementation in Node (no dependencies) · MIT
+Version 0.9.3 · reference implementation in Node (no required dependencies) · MIT
 
 AxiomScript optimises for one measurable thing: **how many tokens it costs a model to write a
 correct program**. Every syntactic decision follows from that. Sigils instead of keywords
@@ -63,7 +63,17 @@ node main.js --eval '^main: print(1+1)'
 node main.js --repl                  # a session: statements run as typed, expressions echo
 node main.js world.ax --sim 120      # step a simulation 120 frames headless, no renderer
 node main.js world.ax --terminal     # render a 3D world as Unicode blocks in the terminal
+node main.js world.ax --headless 60  # step 60 frames, writing PNGs to ./screenshots/
+node main.js world.ax --sdl          # render into a window (needs the optional @kmamal/sdl)
 ```
+
+A world runs in a window when `@kmamal/sdl` is installed (it is an optional dependency, so
+`npm install` fetches it on platforms it has prebuilt binaries for) and a display is
+available; otherwise in the terminal, live from the keyboard when there is one. Scripts read
+keys without waiting with `poll_key()` and `keys_down()` ([`STDLIB.md`](STDLIB.md#keys-without-waiting),
+`examples/keys.ax`). To drive a program from another one — a game engine, a window of your own,
+a test harness — exchange one line per step over stdin and stdout: `examples/bridge.ax` and
+`examples/bridge_host.js` show the pattern.
 
 Sandboxing: `--sandbox` denies file writes and subprocesses; open holes explicitly with
 `--allow-read PATH`, `--allow-write PATH`, `--allow-exec`, `--allow-net`.
@@ -226,7 +236,7 @@ Full detail in [`CHANGES.md`](CHANGES.md).
 |---|---|---|
 | The language | complete | complete |
 | The engine — entities, blocks, events, physics, collisions, navmesh, save/load | complete | complete, same numbers to the bit |
-| Rendering | needs `render3d.js` (not in this repository) | built-in software rasterizer → terminal or PNG |
+| Rendering | software rasterizer (`render3d.js`) → terminal, PNG, or a window with `@kmamal/sdl` | the same rasterizer → terminal or PNG, identical pixels |
 | Start-up | ~45 ms | ~1.6 ms |
 | Simulations (`--sim`) | baseline | 1.7–14× faster |
 | Compute (fib, loops, dictionaries) | baseline | 2.8–5× faster |
@@ -260,7 +270,9 @@ simulation's numbers agree to the last bit, not approximately. See
 * [`CHANGES.md`](CHANGES.md) — version history
 * [`examples/`](examples) — worked programs, each runnable and covered by the test suite:
   `fizzbuzz.ax`, `stats.ax`, `wordcount.ax`, `life.ax`, `calc.ax` (a complete expression
-  interpreter written in AxiomScript), `sim.ax` (entities + script in one program)
+  interpreter written in AxiomScript), `sim.ax` (entities + script in one program),
+  `scene.ax` (a 3D scene to render), `keys.ax` (keys without waiting), `bridge.ax` +
+  `bridge_host.js` (a program driven from another one, a line per step)
 
 ## Tests
 
@@ -270,8 +282,9 @@ node test_v090_general.js     # v0.9.0 language, library, examples, documentatio
 node test_v0817_features.js   # v0.8.17 regression suite
 ```
 
-`npm test` runs the repository's full runner (`run_all_tests.js`), which picks up
-`test_v090_general.js` along with the rest of the `test_*.js` suites.
+`npm test` runs the two suites above; `npm run test:native` builds the C runtime and runs
+`native/difftest.sh`, which compares both runtimes on every test program, example and engine
+test (see [`native/README.md`](native/README.md)).
 
 ## Implementation
 
@@ -283,8 +296,9 @@ node test_v0817_features.js   # v0.8.17 regression suite
 | `interpreter.js` | evaluator, scopes, closures, entity/frame runtime |
 | `stdlib.js` | the standard library |
 | `main.js` | CLI: script mode, headless simulation, terminal and window rendering |
-| `render3d.js`, `terminal.js`, `input_gamepad.js` | the optional rendering and input backends |
+| `render3d.js`, `terminal.js` | the software rasterizer (a port of `native/render.c`) and the terminal display |
+| `keyboard.js` | keys without waiting: `poll_key()` and `keys_down()` |
 | `native/` | the C11 runtime: same language, no Node, ~1.6 ms start-up |
 
-The renderer is optional: with `render3d.js` absent, scripts, functions, checks, and `--sim`
-all still run.
+The renderer loads only when a program needs it: scripts, functions, checks, and `--sim` run
+without it. Gamepads in the window use an `input_gamepad.js` adapter when one is present.

@@ -1,5 +1,6 @@
-// A small scene for the native renderer: `axiom tests/render_scene.ax` draws it in the terminal,
-// `--headless 60` writes PNG frames to screenshots/.
+// A small scene for the renderer (render3d.js, native/render.c — the same pixels in both):
+// `node main.js examples/scene.ax` (or `native/axiom examples/scene.ax`) draws it in the
+// terminal, `--headless 60` writes PNG frames to screenshots/, `--sdl` opens a window.
 #Mesh3D Cube: "box.glb"
 #Mesh3D Ball: "sphere.glb"
 #Mesh3D Ground: "plane"

@@ -23,4 +23,10 @@ void ax_kbd_restore(void);                      // also runs at exit
 void ax_kbd_poll(AxKbd *k, double now);         // read whatever keys are waiting
 void ax_kbd_feed(AxKbd *k, const unsigned char *bytes, int n, double now);
 void ax_kbd_state(const AxKbd *k, double now, double *mx, double *my, bool *jump, bool *fire);
+
+// Keys without waiting (kbd.c; keyboard.js is the reference): poll_key() and keys_down().
+bool ax_keys_poll(double now, char out[16]);                // the next key's name, if one waits
+int ax_keys_down(double now, char out[][16], int cap);      // the keys held now
+void ax_keys_feed(const unsigned char *bytes, int n, double now);
+void ax_keys_external(void);                    // a live world's terminal owns stdin
 #endif

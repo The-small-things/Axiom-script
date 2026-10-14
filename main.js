@@ -257,7 +257,7 @@ if (flags.repl) {
 const WIDTH = flags.width || 640;
 const HEIGHT = flags.height || 480;
 const PNG_EVERY = flags.pngEvery || 30;
-const SHOT_DIR = path.join(__dirname, 'screenshots');
+const SHOT_DIR = path.join(process.cwd(), 'screenshots');
 
 // --- Determine source text ---
 // v0.8.15: source can come from (1) --eval 'string', (2) --stdin, or (3) a file argument.
@@ -510,30 +510,43 @@ if (flags.sim) {
 }
 
 // --- Mode detection ---
-// The ONLY allowed external dep per the v0.6 spec is @kmamal/sdl. If it's installed and the
-// platform has a display, we open a window and stream pixels via `window.render(...)`. If
-// anything fails (no display, native binding, etc.), we fall back to headless PNG dump.
-function trySDL() {
+// The ONLY allowed external dep per the v0.6 spec is @kmamal/sdl (an optionalDependency: a
+// plain `npm install` fetches it where it has prebuilt binaries). If it loads and a window
+// opens, frames go to the window; if not, --sdl says why and stops, and the automatic choice
+// falls back to the terminal.
+let sdl = null, sdlWindow = null, sdlError = null;
+if (!flags.terminal && !flags.headless) {
   try {
-    const sdl = require('@kmamal/sdl');
-    // Sanity-check the API surface we need.
-    if (!sdl || !sdl.video || typeof sdl.video.createWindow !== 'function') return null;
-    return sdl;
+    sdl = require('@kmamal/sdl');
+    if (!sdl || !sdl.video || typeof sdl.video.createWindow !== 'function') {
+      sdlError = 'the installed @kmamal/sdl does not have the API this runtime drives (sdl.video.createWindow)';
+      sdl = null;
+    }
   } catch (e) {
-    return null;
+    sdlError = e && e.code === 'MODULE_NOT_FOUND' && /@kmamal\/sdl/.test(e.message)
+      ? `it needs the optional package @kmamal/sdl, which is not installed — run \`npm install @kmamal/sdl\` in ${__dirname} (or \`npm install\` there, which fetches it on platforms it has prebuilt binaries for)`
+      : `@kmamal/sdl could not be loaded: ${e && e.message ? e.message : e}`;
+    sdl = null;
+  }
+  if (sdl) {
+    try {
+      sdlWindow = sdl.video.createWindow({ title: `AxiomScript — ${path.basename(sourceLabel)}`, width: WIDTH, height: HEIGHT });
+    } catch (e) {
+      sdlError = `@kmamal/sdl is installed but could not open a window (${e && e.message ? e.message : e}) — is there a display?`;
+      sdl = null;
+    }
   }
 }
-
-const sdl = trySDL();
+if (flags.sdl && !flags.terminal && !sdl) {
+  console.error(`--sdl: ${sdlError}`);
+  console.error('--terminal draws the same frames in this terminal, and --headless N writes them to PNG files.');
+  process.exit(1);
+}
 // v0.8.16: HEADLESS is now only true when --headless is explicitly passed (or when both
 // SDL and --terminal are unavailable AND we somehow fell through to this branch — which
 // shouldn't happen because TERMINAL takes precedence). The terminal branch below handles
 // the no-SDL-no-headless case.
 const HEADLESS = flags.headless || (!sdl && !flags.sdl && !flags.terminal);
-if (flags.sdl && !sdl) {
-  console.error(`--sdl requested but @kmamal/sdl could not be loaded: ${sdl === null ? 'require failed' : 'bad API surface'}`);
-  process.exit(1);
-}
 
 // v0.8.16: terminal mode resolution. --terminal takes priority over both --headless and --sdl.
 // When no render-mode flag is explicitly given AND SDL is unavailable, fall back to terminal
@@ -581,6 +594,10 @@ if (TERMINAL) {
     require('readline').emitKeypressEvents(process.stdin);
     process.stdin.setRawMode(true);
     process.stdin.on('keypress', (str, key) => feedKey(kb, str, key, nowS()));
+    // The same bytes, as key names for poll_key() / keys_down() in frame code.
+    const keyboard = require('./keyboard');
+    keyboard.useExternal();
+    process.stdin.on('data', (b) => keyboard.feedBytes(b));
     process.on('exit', () => { try { process.stdin.setRawMode(false); } catch (e) { /* closed */ } });
   }
   if (live) process.stdout.write('\x1b[2J\x1b[?25l');
@@ -698,7 +715,9 @@ if (TERMINAL) {
     w.update(1 / 60);
     // v0.8.15: in --json mode, skip PNG dumping (the JSON output has no PNG field; PNGs are
     // for human/visual debugging only).
-    if (!flags.json && (f % PNG_EVERY === 0 || f === framesRun - 1)) dumpFrame(f);
+    // v0.9.3: frame N is the world after N steps, saved every --png-every steps and after the
+    // last one — the native runtime's numbering, so both write the same files.
+    if (!flags.json && ((f + 1) % PNG_EVERY === 0 || f === framesRun - 1)) dumpFrame(f + 1);
   }
   if (flags.json) {
     // Emit JSON state to stdout. Vec3/Vec2/Quat/Atom are serialized via a replacer.
@@ -780,15 +799,37 @@ if (TERMINAL) {
   //   window.render(width, height, stride, format, buffer) — pushes RGBA pixels
   //   window.on('keyDown'/'keyUp'/'close', handler) — events
   //   window.destroy() / .destroyGently() — close
-  console.log(`\nMode: SDL window @ ${WIDTH}×${HEIGHT}. WASD moves input, Space jumps, ESC quits.`);
-  const window = sdl.video.createWindow({ title: `AxiomScript v0.8.17 — ${path.basename(sourceLabel)}`, width: WIDTH, height: HEIGHT });
+  if (!flags.json) console.log(`\nMode: SDL window @ ${WIDTH}×${HEIGHT}. WASD/arrows move, Space jumps, F/Enter fires, Esc quits.`);
+  const window = sdlWindow;
   let frameNum = 0;
   let running = true;
   const keyState = new Set();
   // @kmamal/sdl's SCANCODE enum is at sdl.keyboard.SCANCODE; keyDown events carry `scancode`.
   const SCAN = sdl.keyboard.SCANCODE;
-  window.on('keyDown', (e) => { keyState.add(e.scancode); if (e.scancode === SCAN.ESCAPE) running = false; });
-  window.on('keyUp',   (e) => { keyState.delete(e.scancode); });
+  // Key names for poll_key() / keys_down() (keyboard.js): the terminal's names for SDL's keys.
+  // A window reports releases, so keys_down() is exact here.
+  const keyboard = require('./keyboard');
+  keyboard.useExternal();
+  const SDL_KEY_NAMES = { return: 'enter', pageUp: 'pageup', pageDown: 'pagedown' };
+  const heldName = new Map();   // scancode → the name its keyDown pushed
+  const sdlKeyName = (e) => {
+    if (!e.key) return null;
+    let name = SDL_KEY_NAMES[e.key] || e.key;
+    if (name.length === 1 && e.shift) name = name.toUpperCase();
+    if (e.ctrl && /^[a-z]$/i.test(name)) name = 'ctrl+' + name.toLowerCase();
+    return name;
+  };
+  window.on('keyDown', (e) => {
+    keyState.add(e.scancode);
+    if (e.scancode === SCAN.ESCAPE) running = false;
+    const name = sdlKeyName(e);
+    if (name) { heldName.set(e.scancode, name); keyboard.pushKey(name, true); }
+  });
+  window.on('keyUp', (e) => {
+    keyState.delete(e.scancode);
+    const name = heldName.get(e.scancode);
+    if (name) { heldName.delete(e.scancode); keyboard.releaseKey(name); }
+  });
   window.on('close',  () => { running = false; });
   // v0.8.1: subscribe to controller connect/disconnect events if the SDL binding exposes them.
   // We track connected controllers in a Set so we can poll them each frame. The polling itself
@@ -820,11 +861,12 @@ if (TERMINAL) {
     if (!running) { try { window.destroy(); } catch (e) {} process.exit(0); return; }
     // Input: WASD → input.move (Vec2 x=right, y=forward), Space → jump
     let x = 0, y = 0, jump = false;
-    if (keyState.has(SCAN.W)) y += 1;
-    if (keyState.has(SCAN.S)) y -= 1;
-    if (keyState.has(SCAN.A)) x -= 1;
-    if (keyState.has(SCAN.D)) x += 1;
+    if (keyState.has(SCAN.W) || keyState.has(SCAN.UP)) y += 1;
+    if (keyState.has(SCAN.S) || keyState.has(SCAN.DOWN)) y -= 1;
+    if (keyState.has(SCAN.A) || keyState.has(SCAN.LEFT)) x -= 1;
+    if (keyState.has(SCAN.D) || keyState.has(SCAN.RIGHT)) x += 1;
     if (keyState.has(SCAN.SPACE)) jump = true;
+    w.input.fire = keyState.has(SCAN.F) || keyState.has(SCAN.RETURN);
     // v0.8.1: poll gamepads. If a controller is connected and the keyboard is idle this frame,
     // the controller's LeftStick axes drive input.move and ButtonSouth drives input.jump.
     const gp = pollGamepadToInput(sdl, prevJumpPressed);
@@ -846,7 +888,7 @@ if (TERMINAL) {
     const buf = Buffer.from(pixels.buffer, pixels.byteOffset, pixels.byteLength);
     window.render(WIDTH, HEIGHT, WIDTH * 4, 'rgba32', buf);
     frameNum++;
-    if (frameNum % PNG_EVERY === 0) dumpFrame(frameNum);
+    if (flags.pngEvery && frameNum % PNG_EVERY === 0) dumpFrame(frameNum);   // only when asked for
     // Frame pacing
     const now = process.hrtime.bigint();
     const dt = now - lastTime;

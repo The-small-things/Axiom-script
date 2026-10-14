@@ -243,16 +243,60 @@ else
 fi
 rm -rf "$TDIR"
 
-# Rendering has no JavaScript counterpart (render3d.js is not part of the code base), so this is
-# a smoke test: the scene renders, and the PNG is a valid image that is not just sky.
+# Rendering: render3d.js is a port of render.c, so the same world gives the same pixels — the
+# PNG files byte for byte (examples/scene.ax over 30 frames, and a .glb model), and the terminal
+# frames byte for byte (plain, colour and subpixel).
 RDIR=$(mktemp -d)
-if (cd "$RDIR" && "$NATIVE" "$ROOT/examples/scene.ax" --headless 30 --png-every 30 --width 160 --height 120 > /dev/null) \
-   && node -e "const b=require('fs').readFileSync('$RDIR/screenshots/frame_00030.png'); process.exit(b.slice(1,4).toString()==='PNG' && b.length > 50000 ? 0 : 1)"; then
-  pass=$((pass + 1)); printf 'OK   render examples/scene.ax to PNG\n'
+mkdir -p "$RDIR/js" "$RDIR/c" "$RDIR/gjs" "$RDIR/gc"
+rok=1
+(cd "$RDIR/js" && $NODE_RUN "$ROOT/examples/scene.ax" --no-restack --headless 30 --png-every 10 --width 160 --height 120 > /dev/null) || rok=0
+(cd "$RDIR/c" && "$NATIVE" "$ROOT/examples/scene.ax" --headless 30 --png-every 10 --width 160 --height 120 > /dev/null) || rok=0
+for n in 00010 00020 00030; do cmp -s "$RDIR/js/screenshots/frame_$n.png" "$RDIR/c/screenshots/frame_$n.png" || rok=0; done
+(cd "$RDIR/gjs" && $NODE_RUN "$ROOT/native/tests/glb/scene.ax" --no-restack --headless 2 --width 120 --height 90 > /dev/null) || rok=0
+(cd "$RDIR/gc" && "$NATIVE" "$ROOT/native/tests/glb/scene.ax" --headless 2 --width 120 --height 90 > /dev/null) || rok=0
+cmp -s "$RDIR/gjs/screenshots/frame_00002.png" "$RDIR/gc/screenshots/frame_00002.png" || rok=0
+for opts in "" "--subpixel" "--ascii"; do
+  for ct in "" truecolor; do
+    COLORTERM=$ct $NODE_RUN "$ROOT/examples/scene.ax" --no-restack --terminal 6 --term-fps 60 $opts > "$RDIR/t_js.txt" 2>/dev/null || rok=0
+    COLORTERM=$ct "$NATIVE" "$ROOT/examples/scene.ax" --terminal 6 --term-fps 60 $opts > "$RDIR/t_c.txt" 2>/dev/null || rok=0
+    cmp -s "$RDIR/t_js.txt" "$RDIR/t_c.txt" || rok=0
+  done
+done
+if [ $rok = 1 ]; then
+  pass=$((pass + 1)); printf 'OK   rendering identical to render3d.js (PNG files and terminal frames)\n'
 else
-  fail=$((fail + 1)); printf 'FAIL render examples/scene.ax\n'
+  fail=$((fail + 1)); printf 'FAIL rendering differs from render3d.js\n'
 fi
 rm -rf "$RDIR"
+
+# Keys without waiting: the bytes of a key stream decoded into the same names (poll_key,
+# keys_down) by ^main and by frame code; and the lockstep bridge, driven line by line.
+KDIR=$(mktemp -d)
+printf 'ab\033[A\033[3~\033x\r\n\tZ\001\034\000 \303\251\342\202\254\360\237\230\200\377\303(\355\240\200\177\033[15~\033[1;5C\033OP\033[\n' > "$KDIR/script.in"
+printf 'wasd\033[Dq' > "$KDIR/world.in"
+printf 'right\nright\njump\nright\n\nleft\nquit\nright\n' > "$KDIR/bridge.in"
+kok=1
+for t in "script.ax:script.in:" "world.ax:world.in:--sim 10" "../../../examples/bridge.ax:bridge.in:"; do
+  f=${t%%:*}; rest=${t#*:}; in=${rest%%:*}; extra=${rest#*:}
+  $NODE_RUN "$ROOT/native/tests/keys/$f" --no-restack $extra < "$KDIR/$in" > "$KDIR/js.txt" 2>/dev/null; kj=$?
+  "$NATIVE" "$ROOT/native/tests/keys/$f" $extra < "$KDIR/$in" > "$KDIR/c.txt" 2>/dev/null; kc=$?
+  if [ "$kj" != "$kc" ] || ! cmp -s "$KDIR/js.txt" "$KDIR/c.txt" || [ ! -s "$KDIR/js.txt" ]; then
+    kok=0; printf '  %s differs\n' "$f"; diff "$KDIR/js.txt" "$KDIR/c.txt" | head -6
+  fi
+done
+mkdir "$KDIR/fuzz"
+node "$ROOT/native/tests/keys/gen.js" "$KDIR/fuzz" 40
+for in in "$KDIR"/fuzz/*.in; do
+  $NODE_RUN "$ROOT/native/tests/keys/script.ax" --no-restack < "$in" > "$KDIR/js.txt" 2>/dev/null
+  "$NATIVE" "$ROOT/native/tests/keys/script.ax" < "$in" > "$KDIR/c.txt" 2>/dev/null
+  cmp -s "$KDIR/js.txt" "$KDIR/c.txt" || { kok=0; printf '  random stream %s differs\n' "$(basename "$in")"; }
+done
+if [ $kok = 1 ]; then
+  pass=$((pass + 1)); printf 'OK   poll_key / keys_down (and 40 random key streams) and the stdin bridge identical\n'
+else
+  fail=$((fail + 1)); printf 'FAIL poll_key / keys_down\n'
+fi
+rm -rf "$KDIR"
 
 # The library sweep: every library function and common method called with every argument
 # shape, sensible or not (tests/libsweep/gen.js); each call's result or error must match.

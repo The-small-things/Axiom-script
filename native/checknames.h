@@ -29,12 +29,12 @@ static const char *const CHECK_KNOWN_NAMES[] = {
   "re_split", "b64_encode", "b64_decode", "hash", "to_json", "from_json", "now", "time",
   "date_iso", "sleep", "read", "read_lines", "read_json", "write", "write_json", "append",
   "file_exists", "ls", "mkdir", "rm", "is_dir", "path_join", "input", "read_stdin",
-  "args", "env", "eprint", "exit", "sh", "map", "filter", "reduce",
-  "each", "find", "apply", "compose", "partial", "memo", "check", "check_eq",
-  "sort", "patrol_point", "observe", "nearest", "exists", "path", "raycast", "block_cell",
-  "unblock_cell", "is_blocked",
+  "poll_key", "keys_down", "args", "env", "eprint", "exit", "sh", "map",
+  "filter", "reduce", "each", "find", "apply", "compose", "partial", "memo",
+  "check", "check_eq", "sort", "patrol_point", "observe", "nearest", "exists", "path",
+  "raycast", "block_cell", "unblock_cell", "is_blocked",
 };
-#define CHECK_KNOWN_NAMES_N 234
+#define CHECK_KNOWN_NAMES_N 236
 
 // Entity base types the engine implements natively: sealed ones admit only their declared
 // actions and queries (NULL-terminated lists).

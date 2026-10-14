@@ -1,7 +1,8 @@
 // render.c — a small software rasterizer for the native engine.
 //
-// The JavaScript runtime delegates drawing to render3d.js, which is not part of this code base,
-// so there is no reference to port here; this is new code, written to the same contract:
+// Written first, in C, to the contract main.js drew by (render3d.js was not part of the code
+// base then); render3d.js is now a line-for-line port of this file, and difftest.sh holds the
+// two to the same pixels. The contract:
 // every frame, `!mesh(#Res, color: 0xRRGGBB)` commands collected from &render blocks are drawn
 // through the first &Camera entity (its pose, `~target`, `~fov`) and lit by the first &Light
 // (`~dir`, `~intensity`, `~ambient`). The output is an RGBA buffer, which term.c turns into

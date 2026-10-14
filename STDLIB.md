@@ -166,11 +166,34 @@ Gated in sandbox mode: reads need `--allow-read PATH`, writes need `--allow-writ
 | `path_join(a, b, …)` | platform-correct path joining |
 | `input(prompt?)` | one line from stdin (null at end of input) |
 | `read_stdin()` | all of stdin as one string |
+| `poll_key()` | the next key pressed, or null — never waits (see below) |
+| `keys_down()` | the keys held down now, oldest press first |
 | `args()` | the program's arguments (everything after `--` on the command line) |
 | `env(name, dflt?)` | environment variable |
 | `print(…)` `eprint(…)` | write a line to stdout / stderr |
 | `exit(code)` | stop the program with an exit code |
 | `sh(cmd)` | run a shell command, returns `{out, code}` |
+
+### Keys without waiting
+
+`poll_key()` and `keys_down()` read keys from a terminal (switched to unechoed, byte-at-a-time
+input for the rest of the run; Ctrl-C still interrupts), from a pipe or a file on stdin, or —
+while a world runs in the terminal or a window — from there, so frame code sees them too. A key
+is named by its character (`"a"`, `"A"`, `"é"`, `"?"`) or one of `space enter tab backspace
+escape up down left right home end insert delete pageup pagedown`, and Ctrl with a letter is
+`"ctrl+a"`… A terminal reports presses but not releases, so `keys_down()` counts a key as held
+for 0.35 s after its last press (auto-repeat renews it); a window reports releases, and the
+list is exact. Read keys with `poll_key()` or lines with `input()`, not both from one stdin.
+
+```
+^main:
+  x = 0
+  k = null
+  *k != "q":
+    k = poll_key()
+    ?k == "left": x -= 1
+    // ... animate, draw, sleep(0.02)
+```
 
 ## Functions and testing
 

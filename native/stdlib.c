@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <math.h>
 #include "jsmath.h"
+#include "term.h"
 #include <time.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -2564,9 +2565,12 @@ NATIVE(n_input) {
   if (argc > 0 && args[0].t != AX_NULL) {
     AxStr *p = arg_str(args[0]);
     ax_write(vm, 1, p->data, p->len);
-    fflush(stdout);
     ax_release(ax_strv(p));
   }
+  // What was printed reaches the reader before this waits on it: a host driving the program
+  // over a pipe sees each reply before it has to send the next line (stdout to a pipe is
+  // otherwise block-buffered, and both sides would wait forever).
+  fflush(stdout);
   char *line = NULL;
   size_t cap = 0;
   ssize_t n = getline(&line, &cap, stdin);
@@ -2577,6 +2581,7 @@ NATIVE(n_input) {
   return v;
 }
 NATIVE(n_read_stdin) {
+  fflush(stdout);
   SB sb = {0};
   sb_add(&sb, "", 0);
   char buf[4096];
@@ -2585,6 +2590,21 @@ NATIVE(n_read_stdin) {
   AxValue v = ax_strv(ax_utf8_repair(sb.buf, sb.len));
   free(sb.buf);
   return v;
+}
+// Keys without waiting (kbd.c): the next key pressed, or null; the keys held down now.
+static double mono_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (double)ts.tv_sec + ts.tv_nsec / 1e9; }
+NATIVE(n_poll_key) {
+  fflush(stdout);   // a polling loop's output appears as it goes, as with input()
+  char name[16];
+  if (!ax_keys_poll(mono_now(), name)) return ax_null();
+  return ax_strv(ax_str_new(name, strlen(name)));
+}
+NATIVE(n_keys_down) {
+  char names[64][16];
+  int n = ax_keys_down(mono_now(), names, 64);
+  AxArr *a = ax_arr_new((uint32_t)n);
+  for (int i = 0; i < n; i++) ax_arr_push(a, ax_strv(ax_str_new(names[i], strlen(names[i]))));
+  return ax_arrv(a);
 }
 NATIVE(n_args) { ax_retain(ax_arrv(vm->argv)); return ax_arrv(vm->argv); }
 NATIVE(n_env) {
@@ -3468,6 +3488,7 @@ void ax_stdlib_install(AxVM *vm) {
   def(vm, "mkdir", n_mkdir, 1, 1);        def(vm, "rm", n_rm, 1, 1);
   def(vm, "path_join", n_path_join, 1, -1);
   def(vm, "input", n_input, 0, 1);        def(vm, "read_stdin", n_read_stdin, 0, 0);
+  def(vm, "poll_key", n_poll_key, 0, 0);  def(vm, "keys_down", n_keys_down, 0, 0);
   def(vm, "args", n_args, 0, 0);          def(vm, "env", n_env, 1, 2);
   def(vm, "exit", n_exit, 0, 1);          def(vm, "sh", n_sh, 1, 1);
 

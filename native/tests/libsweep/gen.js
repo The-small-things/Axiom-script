@@ -10,7 +10,7 @@ const path = require('path');
 const src = fs.readFileSync(path.join(__dirname, '..', '..', 'checknames.h'), 'utf8');
 const names = [...src.match(/CHECK_KNOWN_NAMES\[\] = \{([\s\S]*?)\};/)[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
 // Side effects, the clock, randomness and the terminal: nothing to compare.
-const SKIP = new Set(['exit', 'sleep', 'sh', 'rm', 'mkdir', 'write', 'append', 'write_json', 'input', 'read_stdin',
+const SKIP = new Set(['exit', 'sleep', 'sh', 'rm', 'mkdir', 'write', 'append', 'write_json', 'input', 'read_stdin', 'poll_key', 'keys_down',
   'print', 'eprint', 'clock', 'now', 'time', 'date_iso', 'random', 'randomRange', 'randomInt', 'random_int',
   'random_range', 'rand', 'shuffle', 'sample', 'choice', 'pick', 'seed', 'gauss', 'uuid', 'ls', 'read', 'read_lines',
   'read_json', 'env', 'args', 'noise', 'timestamp', 'today', 'perf_now', 'time_ms', 'uid']);
