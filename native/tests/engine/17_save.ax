@@ -1,0 +1,23 @@
+@Hero at v3(1, 2, 3)
+  ~hp: 10
+  ~items: ["sword"]
+  ~mood: calm
+  ~cd: 2s
+  ~phase: 0
+  &tick(4hz):
+    phase += 1
+    ?phase == 2:
+      !save("slot1")
+      hp = 3
+      items.push("shield")
+      mood = angry
+      pose.pos = v3(9, 9, 9)
+      tag = "temp"
+    ?phase == 4:
+      !load("slot1")
+    ?phase == 6:
+      !load("missing_slot_xyz")
+
+@Other
+  ~n: 0
+  &tick(1hz): n += 1

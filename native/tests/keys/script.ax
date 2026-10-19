@@ -1,0 +1,11 @@
+// poll_key() and keys_down() with stdin from a file: every byte decoded into a key name the
+// same way, in the same order, by both runtimes (difftest.sh writes the bytes).
+^main:
+  got = []
+  k = poll_key()
+  *k != null:
+    got.push(k)
+    k = poll_key()
+  print(len(got), got)
+  print(keys_down())
+  print(poll_key(), input())

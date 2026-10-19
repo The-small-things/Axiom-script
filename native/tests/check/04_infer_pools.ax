@@ -1,0 +1,12 @@
+^type Bullet: x, y
+@A
+  $b: Grid(3) ~ Uniform infer: exact, $c: Grid(2) ~ Uniform infer: kalman
+  $d: Grid(3) ~ Uniform infer: mcmc(5)
+  ~bullets: &Pool(Bullet, 32)
+  ~ghosts: &Pool(Ghost, 8)
+  ~v: &Vec(Bullet, 4)
+  &tick(1hz):
+    !spawn(bullets, Bullet(1, 2))
+    !spawn(bullets, Bullet(1))
+    !spawn(bullets, Ghost(1, 2))
+    !spawn(v, Bullet(1, 2, 3))

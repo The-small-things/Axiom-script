@@ -1,0 +1,33 @@
+// Entities and a script in one program: ^main seeds the world, the &tick blocks simulate it.
+// Nothing here needs a display — `--sim N` steps N frames headless.
+// Run: node main.js examples/sim.ax --sim 120
+^event Caught:
+  who:: #Entity
+
+@Mouse
+  ~x: 0
+  ~speed: 1.5
+  ~state: fleeing
+  &tick(30hz):
+    ?state == fleeing:
+      x += speed * dt
+    ?x > 20:
+      x = 20
+
+@Cat
+  ~x: -5
+  ~speed: 2.0
+  ~caught: false
+  &tick(30hz):
+    gap = #Mouse.x - x
+    ?abs(gap) < 0.3:
+      ?!caught:
+        caught = true
+        ^Caught(who: self)
+    ?!caught:
+      x += sign(gap) * speed * dt
+  &on(Caught):
+    !log("cat caught the mouse")
+
+^main:
+  print("chase starting: cat at -5, mouse at 0")

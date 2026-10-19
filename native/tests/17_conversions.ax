@@ -1,0 +1,15 @@
+// Conversions and small numeric functions, exactly as the reference computes them: int/float
+// are parseInt/parseFloat (NaN when there is no number), to_fixed is toFixed, the bitwise
+// functions are 32-bit, chr/ord work in UTF-16 code units, sets compare by displayed text.
+^main:
+  print(int("42"), int("  -7abc"), int("12.9"), int("0x1f"), int("abc"), int(""), int("12345678901234567890"), int([5, 2]))
+  print(float("3.5kg"), float(" .5"), float("-.5e1"), float("1e"), float("Infinity!"), float("abc"), float("0x10"), float("1e400"))
+  print(parse_int("ff", 16), parse_int("0x1f", 16), parse_int("z", 36), parse_int("12", 2), parse_int(" 101 ", 2), parse_int("x"), parse_int("7", 0))
+  print(to_fixed(2.5, 0), to_fixed(-2.5, 0), to_fixed(0.125, 2), to_fixed(1e21, 2), to_fixed(1.005, 2), to_fixed(12.3456), to_fixed(-0.0001, 2), to_fixed(5, 2.7))
+  print(is_nan(0 / 0), is_nan("abc"), is_finite(5), is_finite("5"), is_finite(1 / 0), is_int(5), is_int(5.5), is_int("5"))
+  print(bor(2 ** 31, 0), shl(1, 40), shr(-1, 28), band(2 ** 40 + 3, 7), bnot(2 ** 32), bxor(-1, 2 ** 32 + 1), to_hex(-1), to_hex(2 ** 33 + 10), to_bin(-5))
+  print(gcd(2 ** 32 + 6, 4), gcd(-12, 18), gcd(12.7, 8))
+  print(chr(65), chr(233), chr(8364), chr(65536 + 66), ord("A"), ord("é"), ord("€"), ord(""), ord("😀"))
+  print([1, "1", 2, 1].uniq(), union([1, 1, 2], [2, "3", 3]), intersect([1, 2, 2, "3"], [3, 2]), difference([1, "2", 3], [2]))
+  print(deep_eq({a: 1, b: 2}, {a: 1, b: 2}), deep_eq({a: 1, b: 2}, {b: 2, a: 1}), deep_eq(0 / 0, 0 / 0), deep_eq([1, [2]], [1, [2]]))
+  print(range(3), range(1, 10, 2), range(5, 0, -1), 0..4, type(range(2)), f"{range(2)}", str(range(0, 1, 0.25)))

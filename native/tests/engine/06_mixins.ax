@@ -1,0 +1,15 @@
+^mix Stats: ~hp: 100, max: 100, regen: 1
+^mix Tagged:
+  ~label: "none"
+  &tick(2hz):
+    label = f"hp={hp}"
+
+@Hero +Stats, Tagged ~speed: 3; &tick(10hz): hp -= 1; speed += 0.5
+  ~hp!: 50
+  ~x,y,z: 0
+  ~alpha: 1, beta: 2, gamma
+  &physics: x += speed * dt
+  &render:
+    y = x * 2
+
+@Plain ~n: 1; &tick(1hz): n *= 2

@@ -1,0 +1,18 @@
+// Files, JSON round-trip, environment.
+^main(argv):
+  dir = env("AXIOM_TEST_DIR", "/tmp")
+  path = f"{dir}/axiom_native_test.txt"
+  jpath = f"{dir}/axiom_native_test.json"
+  write(path, "hello")
+  append(path, "!")
+  print(read(path))
+  print(read(f"{dir}/definitely_missing_file.txt", "fallback"))
+  write_json(jpath, {n: 42, xs: [1, 2]})
+  print(read_json(jpath).n, read_json(jpath).xs)
+  print(file_exists(path), file_exists(f"{dir}/nope"))
+  print(len(read_lines(path)))
+  rm(path)
+  rm(jpath)
+  print(file_exists(path))
+  print(env("AXIOM_UNSET_VAR", "dflt"))
+  print(len(args()) >= 0)

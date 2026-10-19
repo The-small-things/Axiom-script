@@ -1,0 +1,14 @@
+// big(x) in entity fields: digit strings in the state dump; a save holding one is not written.
+@Counter
+  ~n: big(1)
+  ~steps: 0
+  ~hist: []
+  &tick(60hz):
+    n = n * big(3)
+    steps += 1
+    ?steps % 20 == 0:
+      hist.push(n)
+      !log(f"step {steps}: {n}")
+    ?steps == 30: !save("slot1")
+    ?n > big(10) ** big(30) && steps < 200:
+      !log(f"passed 1e30 at {steps}")

@@ -1,0 +1,23 @@
+// .glb meshes: from a file (two meshes, three primitives) and inline. Each registers #X and
+// #X_0, #X_1, …; a mesh that does not load stays a plain descriptor with no _0.
+#Mesh3D Model: "tests/engine/model.glb"
+#Mesh3D Pyramid: base64("Z2xURgIAAABYAwAAeAIAAEpTT057ImFzc2V0Ijp7InZlcnNpb24iOiIyLjAifSwiYnVmZmVycyI6W3siYnl0ZUxlbmd0aCI6MTk2fV0sImJ1ZmZlclZpZXdzIjpbeyJidWZmZXIiOjAsImJ5dGVPZmZzZXQiOjAsImJ5dGVMZW5ndGgiOjYwfSx7ImJ1ZmZlciI6MCwiYnl0ZU9mZnNldCI6NjAsImJ5dGVMZW5ndGgiOjYwfSx7ImJ1ZmZlciI6MCwiYnl0ZU9mZnNldCI6MTIwLCJieXRlTGVuZ3RoIjo0MH0seyJidWZmZXIiOjAsImJ5dGVPZmZzZXQiOjE2MCwiYnl0ZUxlbmd0aCI6MzZ9XSwiYWNjZXNzb3JzIjpbeyJidWZmZXJWaWV3IjowLCJjb21wb25lbnRUeXBlIjo1MTI2LCJjb3VudCI6NSwidHlwZSI6IlZFQzMifSx7ImJ1ZmZlclZpZXciOjEsImNvbXBvbmVudFR5cGUiOjUxMjYsImNvdW50Ijo1LCJ0eXBlIjoiVkVDMyJ9LHsiYnVmZmVyVmlldyI6MiwiY29tcG9uZW50VHlwZSI6NTEyNiwiY291bnQiOjUsInR5cGUiOiJWRUMyIn0seyJidWZmZXJWaWV3IjozLCJjb21wb25lbnRUeXBlIjo1MTIzLCJjb3VudCI6MTgsInR5cGUiOiJTQ0FMQVIifV0sIm1lc2hlcyI6W3sicHJpbWl0aXZlcyI6W3siYXR0cmlidXRlcyI6eyJQT1NJVElPTiI6MCwiTk9STUFMIjoxLCJURVhDT09SRF8wIjoyfSwiaW5kaWNlcyI6MywibWF0ZXJpYWwiOjB9XX1dfSAgIMQAAABCSU4AAAAAAAAAgD8AAAAAAACAvwAAAAAAAIC/AACAPwAAAAAAAIC/AACAPwAAAAAAAIA/AACAvwAAAAAAAIA/AAAAAAAAgD8AAAAAMzMzv5qZmT4zMzO/MzMzP5qZmT4zMzO/MzMzP5qZmT4zMzM/MzMzv5qZmT4zMzM/AAAAPwAAAAAAAAAAAACAPwAAgD8AAIA/AAAAAAAAgD8AAIA/zczMPQAAAQACAAAAAgADAAAAAwAEAAAABAABAAEAAwACAAEABAADAA==")
+#Mesh3D Missing: "tests/engine/nope.glb"
+@Viewer
+  ~done: false
+  &tick(60hz):
+    ?!done:
+      done = true
+      print(#Model, #Model_0, #Model_1, #Model_2, #Pyramid, #Pyramid_0)
+      m = #Model
+      m1 = #Model_1
+      m2 = #Model_2
+      p = #Pyramid
+      p0 = #Pyramid_0
+      x = #Missing
+      print(m.glb, m.material, m1.material, m2.material, m2.path, p.inline, p.path, p0.path, p0.material, x.glb, x.path)
+      print(keys(m), keys(m1), keys(p0), keys(x))
+      print(len(m.vertices), len(m.indices), m.indices[5], m.vertices[1], len(p0.vertices), p0.vertices[3])
+      print(#Missing_0)
+  &render:
+    !mesh(#Model_0, color: 0x88ccff)

@@ -1,0 +1,1030 @@
+// value.c — the value model: refcounting, strings, arrays, dicts, ranges, functions.
+//
+// Two decisions shape everything here.
+//
+// 1. Numbers are doubles, exactly as in the JavaScript reference. A native implementation that
+//    used 64-bit integers would disagree with the reference on overflow, division, and NaN, and
+//    a program that behaves differently on the two runtimes is worse than a slower one.
+//
+// 2. Dictionaries preserve insertion order. `keys()`, `items()` and iteration are observable,
+//    programs depend on their order, and the reference implementation inherits JavaScript's
+//    insertion order — so the native one has to reproduce it rather than pick its own.
+
+#include "axiom.h"
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <stdio.h>
+
+// ---------------------------------------------------------------------------------------------
+// Allocation helpers
+// ---------------------------------------------------------------------------------------------
+
+static void *xalloc(size_t n) {
+  void *p = calloc(1, n);
+  if (!p) { fprintf(stderr, "axiom: out of memory\n"); exit(70); }
+  return p;
+}
+
+static void *xrealloc(void *p, size_t n) {
+  void *q = realloc(p, n);
+  if (!q) { fprintf(stderr, "axiom: out of memory\n"); exit(70); }
+  return q;
+}
+
+uint32_t ax_hash_bytes(const char *p, size_t n) {
+  // FNV-1a, matching the `hash()` intrinsic so both runtimes agree.
+  uint32_t h = 0x811c9dc5u;
+  for (size_t i = 0; i < n; i++) { h ^= (uint8_t)p[i]; h *= 0x01000193u; }
+  return h;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Interning
+// ---------------------------------------------------------------------------------------------
+//
+// Every identifier, dictionary key, and field name is interned, so scope lookups and dict
+// probes compare pointers instead of bytes. The table owns one reference to each entry and is
+// never shrunk; identifiers in a program are a bounded set.
+
+typedef struct {
+  AxStr **slots;
+  uint32_t cap, len;
+} InternTable;
+
+static InternTable g_intern;
+
+static void intern_grow(void) {
+  uint32_t ncap = g_intern.cap ? g_intern.cap * 2 : 1024;
+  AxStr **ns = xalloc(sizeof(AxStr *) * ncap);
+  for (uint32_t i = 0; i < g_intern.cap; i++) {
+    AxStr *s = g_intern.slots[i];
+    if (!s) continue;
+    uint32_t j = s->hash & (ncap - 1);
+    while (ns[j]) j = (j + 1) & (ncap - 1);
+    ns[j] = s;
+  }
+  free(g_intern.slots);
+  g_intern.slots = ns;
+  g_intern.cap = ncap;
+}
+
+static AxStr *str_alloc(const char *data, size_t len) {
+  AxStr *s = xalloc(sizeof(AxStr) + len + 1);
+  s->hdr.rc = 1;
+  s->hdr.type = AX_STR;
+  if (len && data) memcpy(s->data, data, len);
+  s->ascii = ax_bytes_ascii(s->data, len);
+  if (!s->ascii) len = ax_wtf8_normalize(s->data, len);   // one form per unit sequence (ustr.c)
+  s->len = (uint32_t)len;
+  s->data[len] = '\0';
+  s->hash = ax_hash_bytes(s->data, len);
+  s->interned = false;
+  s->ix = NULL;
+  return s;
+}
+
+AxStr *ax_str_new(const char *data, size_t len) { return str_alloc(data, len); }
+AxStr *ax_str_newz(const char *cstr) { return str_alloc(cstr, strlen(cstr)); }
+
+AxStr *ax_intern(const char *data, size_t len) {
+  if (len && memchr(data, 0xED, len)) {
+    // Look up the normalized form, the one a string with these units would hold.
+    char *tmp = malloc(len);
+    memcpy(tmp, data, len);
+    size_t n = ax_wtf8_normalize(tmp, len);
+    AxStr *r = n == len ? NULL : ax_intern(tmp, n);
+    free(tmp);
+    if (r) return r;
+  }
+  if (!g_intern.cap) intern_grow();
+  if (g_intern.len * 4 >= g_intern.cap * 3) intern_grow();
+  uint32_t h = ax_hash_bytes(data, len);
+  uint32_t i = h & (g_intern.cap - 1);
+  while (g_intern.slots[i]) {
+    AxStr *s = g_intern.slots[i];
+    if (s->hash == h && s->len == len && memcmp(s->data, data, len) == 0) {
+      s->hdr.rc++;
+      return s;
+    }
+    i = (i + 1) & (g_intern.cap - 1);
+  }
+  AxStr *s = str_alloc(data, len);
+  s->interned = true;
+  s->hdr.rc = 2;   // one reference held by the table, one returned to the caller
+  g_intern.slots[i] = s;
+  g_intern.len++;
+  return s;
+}
+
+AxStr *ax_internz(const char *cstr) { return ax_intern(cstr, strlen(cstr)); }
+
+// ---------------------------------------------------------------------------------------------
+// Refcounting
+// ---------------------------------------------------------------------------------------------
+
+static void obj_free(AxObj *o);
+
+void ax_retain(AxValue v) {
+  if (ax_is_obj(v) && v.o) v.o->rc++;
+}
+
+void ax_release(AxValue v) {
+  if (!ax_is_obj(v) || !v.o) return;
+  if (--v.o->rc == 0) obj_free(v.o);
+}
+
+static void obj_free(AxObj *o) {
+  switch (o->type) {
+    case AX_STR: {
+      AxStr *s = (AxStr *)o;
+      if (s->interned) { s->hdr.rc = 1; return; }   // the intern table keeps it alive
+      if (s->ix) ax_str_index_free(s);
+      free(s);
+      return;
+    }
+    case AX_ARR: {
+      AxArr *a = (AxArr *)o;
+      for (uint32_t i = 0; i < a->len; i++) ax_release(a->items[i]);
+      free(a->items);
+      free(a);
+      return;
+    }
+    case AX_DICT: {
+      AxDict *d = (AxDict *)o;
+      for (uint32_t i = 0; i < d->len; i++) {
+        if (d->entries[i].dead) continue;
+        AxValue kv; kv.t = AX_STR; kv.o = (AxObj *)d->entries[i].key;
+        ax_release(kv);
+        ax_release(d->entries[i].val);
+      }
+      free(d->entries);
+      free(d->index);
+      if (d->type_tag) { AxValue tv; tv.t = AX_STR; tv.o = (AxObj *)d->type_tag; ax_release(tv); }
+      free(d);
+      return;
+    }
+    case AX_FN: {
+      AxFn *f = (AxFn *)o;
+      if (f->entity) { AxValue ev; ev.t = AX_ENTITY; ev.o = (AxObj *)f->entity; ax_release(ev); }
+      if (f->native) { if (f->has_bound) ax_release(f->bound); }
+      if (!f->native) {
+        for (int i = 0; i < f->nparams; i++) {
+          AxValue pv; pv.t = AX_STR; pv.o = (AxObj *)f->params[i];
+          ax_release(pv);
+        }
+        free(f->params);
+        free(f->defaults);
+        if (!f->is_expr) free(f->body);   // make_closure's BODY node
+        if (f->scope) ax_scope_release(f->scope);
+        if (f->has_bound) ax_release(f->bound);
+      }
+      free(f);
+      return;
+    }
+    case AX_RANGE: case AX_BIG: free(o); return;
+    case AX_XFORM: {
+      AxXform *x = (AxXform *)o;
+      ax_release(x->pos); ax_release(x->rot); ax_release(x->scl); ax_release(x->vel);
+      free(x);
+      return;
+    }
+    case AX_SHAPE: {
+      AxShape *sh = (AxShape *)o;
+      AxValue kv; kv.t = AX_STR; kv.o = (AxObj *)sh->kind;
+      ax_release(kv);
+      for (int i = 0; i < sh->nparams; i++) ax_release(sh->params[i]);
+      free(sh);
+      return;
+    }
+    case AX_ENTITY: {
+      AxEntity *e = (AxEntity *)o;
+      ax_release(ax_dictv(e->fields));
+      ax_release(ax_dictv(e->locals));
+      ax_release(e->patrol);
+      free(e);
+      return;
+    }
+    case AX_HOST: ax_host_free((AxHost *)o); return;
+    default: free(o); return;
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Strings
+// ---------------------------------------------------------------------------------------------
+
+AxValue ax_strv(AxStr *s) { AxValue v; v.t = AX_STR; v.o = (AxObj *)s; return v; }
+AxValue ax_atom(AxStr *s) { AxValue v; v.t = AX_ATOM; v.o = (AxObj *)s; return v; }
+AxValue ax_str_from(const char *cstr) { return ax_strv(ax_str_newz(cstr)); }
+AxValue ax_atomz(const char *cstr) { return ax_atom(ax_internz(cstr)); }
+
+AxStr *ax_str_concat(AxStr *a, AxStr *b) {
+  AxStr *s = xalloc(sizeof(AxStr) + a->len + b->len + 1);
+  s->hdr.rc = 1;
+  s->hdr.type = AX_STR;
+  s->interned = false;
+  s->ix = NULL;
+  s->len = a->len + b->len;
+  memcpy(s->data, a->data, a->len);
+  memcpy(s->data + a->len, b->data, b->len);
+  s->ascii = a->ascii && b->ascii;
+  // A high surrogate at the end of a meeting a low one at the start of b make one character.
+  if (!s->ascii && a->len >= 3 && b->len >= 3 && (uint8_t)b->data[0] == 0xED && (uint8_t)a->data[a->len - 3] == 0xED)
+    s->len = (uint32_t)ax_wtf8_normalize(s->data, s->len);
+  s->data[s->len] = '\0';
+  s->hash = ax_hash_bytes(s->data, s->len);
+  return s;
+}
+
+bool ax_str_eq(const AxStr *a, const AxStr *b) {
+  if (a == b) return true;
+  if (!a || !b) return false;
+  return a->len == b->len && a->hash == b->hash && memcmp(a->data, b->data, a->len) == 0;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Arrays
+// ---------------------------------------------------------------------------------------------
+
+AxArr *ax_arr_new(uint32_t cap) {
+  AxArr *a = xalloc(sizeof(AxArr));
+  a->hdr.rc = 1;
+  a->hdr.type = AX_ARR;
+  a->cap = cap;
+  if (cap) a->items = xalloc(sizeof(AxValue) * cap);
+  return a;
+}
+
+AxValue ax_arrv(AxArr *a) { AxValue v; v.t = AX_ARR; v.o = (AxObj *)a; return v; }
+
+void ax_arr_push(AxArr *a, AxValue v) {
+  if (a->len == a->cap) {
+    a->cap = a->cap ? a->cap * 2 : 8;
+    a->items = xrealloc(a->items, sizeof(AxValue) * a->cap);
+  }
+  a->items[a->len++] = v;
+}
+
+AxValue ax_arr_get(AxArr *a, int64_t i) {
+  if (i < 0 || (uint64_t)i >= a->len) return ax_null();
+  return ax_copy(a->items[i]);
+}
+
+void ax_arr_set(AxArr *a, int64_t i, AxValue v) {
+  if (i < 0) { ax_release(v); return; }
+  while ((uint64_t)i >= a->len) ax_arr_push(a, ax_null());   // grow with nulls, as JS does
+  ax_release(a->items[i]);
+  a->items[i] = v;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Dictionaries — insertion-ordered, with a hash index once they grow
+// ---------------------------------------------------------------------------------------------
+
+#define DICT_INDEX_MIN 8
+
+AxDict *ax_dict_new(void) {
+  AxDict *d = xalloc(sizeof(AxDict));
+  d->hdr.rc = 1;
+  d->hdr.type = AX_DICT;
+  return d;
+}
+
+AxValue ax_dictv(AxDict *d) { AxValue v; v.t = AX_DICT; v.o = (AxObj *)d; return v; }
+
+static void dict_reindex(AxDict *d) {
+  uint32_t cap = DICT_INDEX_MIN;
+  while (cap < d->len * 2) cap *= 2;
+  free(d->index);
+  d->index = xalloc(sizeof(int32_t) * cap);
+  for (uint32_t i = 0; i < cap; i++) d->index[i] = -1;
+  d->index_cap = cap;
+  for (uint32_t e = 0; e < d->len; e++) {
+    if (d->entries[e].dead) continue;
+    uint32_t i = d->entries[e].key->hash & (cap - 1);
+    while (d->index[i] >= 0) i = (i + 1) & (cap - 1);
+    d->index[i] = (int32_t)e;
+  }
+}
+
+static int32_t dict_find(const AxDict *d, const AxStr *key) {
+  if (!d->index) {
+    for (uint32_t i = 0; i < d->len; i++) {
+      if (!d->entries[i].dead && ax_str_eq(d->entries[i].key, key)) return (int32_t)i;
+    }
+    return -1;
+  }
+  uint32_t i = key->hash & (d->index_cap - 1);
+  while (d->index[i] >= 0) {
+    int32_t e = d->index[i];
+    if (!d->entries[e].dead && ax_str_eq(d->entries[e].key, key)) return e;
+    i = (i + 1) & (d->index_cap - 1);
+  }
+  return -1;
+}
+
+static bool key_as_index(const AxStr *k, uint32_t *out) {
+  if (!k->len || k->len > 10) return false;
+  if (k->data[0] == '0' && k->len > 1) return false;   // "01" is not canonical
+  uint64_t v = 0;
+  for (uint32_t i = 0; i < k->len; i++) {
+    if (k->data[i] < '0' || k->data[i] > '9') return false;
+    v = v * 10 + (uint64_t)(k->data[i] - '0');
+    if (v > 4294967294ull) return false;
+  }
+  *out = (uint32_t)v;
+  return true;
+}
+
+// KEY ORDER.
+//
+// The reference implementation stores dictionaries as JavaScript objects, and JavaScript's own
+// key order is observable to every program that prints one or iterates it: array-index keys
+// (canonical non-negative integers) come first in ascending numeric order, and every other key
+// follows in insertion order. `group_by(xs, \n: n % 2)` builds exactly such a dictionary, so a
+// native runtime that used plain insertion order would print different output for the same
+// program.
+//
+// Rather than sorting on every iteration, the entries array is kept in that order as keys are
+// added: a string key appends (the common case, O(1)); an integer-like key is placed among the
+// leading integer-like keys, which costs a shift but is rare.
+void ax_dict_set(AxDict *d, AxStr *key, AxValue v) {
+  int32_t e = dict_find(d, key);
+  if (e >= 0) {
+    ax_release(d->entries[e].val);
+    d->entries[e].val = v;
+    return;
+  }
+  if (d->len == d->cap) {
+    d->cap = d->cap ? d->cap * 2 : 8;
+    d->entries = xrealloc(d->entries, sizeof(AxDictEntry) * d->cap);
+    memset(d->entries + d->len, 0, sizeof(AxDictEntry) * (d->cap - d->len));
+  }
+  AxValue kv; kv.t = AX_STR; kv.o = (AxObj *)key;
+  ax_retain(kv);
+
+  uint32_t idx_val;
+  uint32_t pos = d->len;
+  bool shifted = false;
+  if (key_as_index(key, &idx_val)) {
+    pos = 0;
+    while (pos < d->len) {
+      if (d->entries[pos].dead) { pos++; continue; }
+      uint32_t other;
+      if (!key_as_index(d->entries[pos].key, &other)) break;   // string keys start here
+      if (other > idx_val) break;
+      pos++;
+    }
+    if (pos < d->len) {
+      memmove(d->entries + pos + 1, d->entries + pos, sizeof(AxDictEntry) * (d->len - pos));
+      shifted = true;
+    }
+  }
+  d->entries[pos].key = key;
+  d->entries[pos].val = v;
+  d->entries[pos].dead = false;
+  d->len++;
+  d->live++;
+  if (shifted) { dict_reindex(d); return; }   // every index after `pos` moved
+  if (d->len >= DICT_INDEX_MIN && (!d->index || d->len * 2 > d->index_cap)) dict_reindex(d);
+  else if (d->index) {
+    uint32_t i = key->hash & (d->index_cap - 1);
+    while (d->index[i] >= 0) i = (i + 1) & (d->index_cap - 1);
+    d->index[i] = (int32_t)pos;
+  }
+}
+
+bool ax_dict_get(AxDict *d, const AxStr *key, AxValue *out) {
+  int32_t e = dict_find(d, key);
+  if (e < 0) return false;
+  *out = ax_copy(d->entries[e].val);
+  return true;
+}
+
+bool ax_dict_has(AxDict *d, const AxStr *key) { return dict_find(d, key) >= 0; }
+
+void ax_dict_del(AxDict *d, const AxStr *key) {
+  int32_t e = dict_find(d, key);
+  if (e < 0) return;
+  AxValue kv; kv.t = AX_STR; kv.o = (AxObj *)d->entries[e].key;
+  ax_release(kv);
+  ax_release(d->entries[e].val);
+  d->entries[e].dead = true;
+  d->entries[e].key = NULL;
+  d->entries[e].val = ax_null();
+  d->live--;
+  if (d->index) dict_reindex(d);
+}
+
+uint32_t ax_dict_count(const AxDict *d) { return d->live; }
+
+// ---------------------------------------------------------------------------------------------
+// Functions and ranges
+// ---------------------------------------------------------------------------------------------
+
+AxValue ax_native(const char *name, AxNativeFn fn, int min_args, int max_args) {
+  AxFn *f = xalloc(sizeof(AxFn));
+  f->hdr.rc = 1;
+  f->hdr.type = AX_FN;
+  f->native = true;
+  f->fn = fn;
+  f->name = name;
+  f->min_args = min_args;
+  f->max_args = max_args;
+  AxValue v; v.t = AX_FN; v.o = (AxObj *)f;
+  return v;
+}
+
+AxValue ax_fnv(AxFn *f) { AxValue v; v.t = AX_FN; v.o = (AxObj *)f; return v; }
+
+AxValue ax_range(double lo, double hi, double step) {
+  AxRange *r = xalloc(sizeof(AxRange));
+  r->hdr.rc = 1;
+  r->hdr.type = AX_RANGE;
+  r->lo = lo; r->hi = hi;
+  r->step = step == 0 ? 1 : step;   // as the reference's Range: only 0 means "no step"
+  AxValue v; v.t = AX_RANGE; v.o = (AxObj *)r;
+  return v;
+}
+
+bool ax_is_callable(AxValue v) { return v.t == AX_FN; }
+
+// ---------------------------------------------------------------------------------------------
+// Predicates, comparison, rendering
+// ---------------------------------------------------------------------------------------------
+
+bool ax_truthy(AxValue v) {
+  switch (v.t) {
+    case AX_NULL: return false;
+    case AX_BOOL: return v.b;
+    case AX_NUM:  return v.num != 0 && !isnan(v.num);
+    case AX_STR:  return ((AxStr *)v.o)->len > 0;
+    case AX_ARR:  return ((AxArr *)v.o)->len > 0;
+    case AX_BIG:  return !ax_big_is_zero((AxBig *)v.o);
+    // A vector is "true" when it is meaningfully non-zero, as in the reference — which is what
+    // makes `?input.move:` read as "is the stick being pushed".
+    case AX_VEC2: { AxVec *q = (AxVec *)v.o; return hypot(q->x, q->y) > 0.1; }
+    case AX_VEC3: { AxVec *q = (AxVec *)v.o; return sqrt(q->x * q->x + q->y * q->y + q->z * q->z) > 0.1; }
+    default:      return true;   // atoms, dicts, functions, ranges, engine objects
+  }
+}
+
+static bool equals_depth(AxValue a, AxValue b, int depth) {
+  if (a.t != b.t) return false;
+  switch (a.t) {
+    case AX_NULL: return true;
+    case AX_BOOL: return a.b == b.b;
+    case AX_NUM:  return a.num == b.num;
+    case AX_STR:
+    case AX_ATOM: return ax_str_eq((AxStr *)a.o, (AxStr *)b.o);
+    case AX_FN:   return a.o == b.o;
+    case AX_BIG:  return ax_big_cmp((AxBig *)a.o, (AxBig *)b.o) == 0;
+    case AX_VEC2: { AxVec *x = (AxVec *)a.o, *y = (AxVec *)b.o; return x->x == y->x && x->y == y->y; }
+    case AX_VEC3: { AxVec *x = (AxVec *)a.o, *y = (AxVec *)b.o; return x->x == y->x && x->y == y->y && x->z == y->z; }
+    case AX_QUAT: { AxVec *x = (AxVec *)a.o, *y = (AxVec *)b.o; return x->x == y->x && x->y == y->y && x->z == y->z && x->w == y->w; }
+    case AX_MAT4: case AX_XFORM: case AX_TIMER: case AX_SHAPE: case AX_ENTITY: case AX_HOST:
+      return a.o == b.o;
+    case AX_RANGE: {
+      AxRange *x = (AxRange *)a.o, *y = (AxRange *)b.o;
+      return x->lo == y->lo && x->hi == y->hi && x->step == y->step;
+    }
+    case AX_ARR: {
+      // Structural, like the reference implementation: [1,2] == [1,2].
+      if (a.o == b.o) return true;
+      if (depth > 32) return false;
+      AxArr *x = (AxArr *)a.o, *y = (AxArr *)b.o;
+      if (x->len != y->len) return false;
+      for (uint32_t i = 0; i < x->len; i++) if (!equals_depth(x->items[i], y->items[i], depth + 1)) return false;
+      return true;
+    }
+    case AX_DICT: {
+      if (a.o == b.o) return true;
+      if (depth > 32) return false;
+      AxDict *x = (AxDict *)a.o, *y = (AxDict *)b.o;
+      if (ax_dict_count(x) != ax_dict_count(y)) return false;
+      for (uint32_t i = 0; i < x->len; i++) {
+        if (x->entries[i].dead) continue;
+        AxValue ov;
+        if (!ax_dict_get(y, x->entries[i].key, &ov)) return false;
+        bool same = equals_depth(x->entries[i].val, ov, depth + 1);
+        ax_release(ov);
+        if (!same) return false;
+      }
+      return true;
+    }
+    default: return false;
+  }
+}
+
+bool ax_equals(AxValue a, AxValue b) { return equals_depth(a, b, 0); }
+
+int ax_compare(AxValue a, AxValue b) {
+  if (a.t == AX_NUM && b.t == AX_NUM) return a.num < b.num ? -1 : (a.num > b.num ? 1 : 0);
+  if (a.t == AX_BOOL || b.t == AX_BOOL) {
+    // A boolean against anything orders both sides by plain truthiness (every array, dict and
+    // vector counts as true here), as the reference's comparison does.
+    int x = a.t == AX_ARR || a.t == AX_VEC2 || a.t == AX_VEC3 ? 1 : ax_truthy(a);
+    int y = b.t == AX_ARR || b.t == AX_VEC2 || b.t == AX_VEC3 ? 1 : ax_truthy(b);
+    return x - y;
+  }
+  AxStr *sa = ax_to_str(a), *sb = ax_to_str(b);
+  int c = ax_str_cmp(sa, sb);
+  ax_release(ax_strv(sa));
+  ax_release(ax_strv(sb));
+  return c < 0 ? -1 : (c > 0 ? 1 : 0);
+}
+
+// Number formatting has to match JavaScript's, or the two runtimes print different output for
+// the same program: shortest round-tripping decimal, no trailing ".0", exponent form only at
+// the same thresholds.
+// Number#toString (ECMAScript Number::toString): the shortest digits that read back as the
+// same double, placed by the spec's rules — plain notation for exponents in [-6, 21), exponent
+// notation outside. For a normal double the shortest digits come from printf at 15, 16 or 17
+// significant digits:
+// if the shortest form has at most 15 digits, the correctly rounded 15-digit form IS it (the
+// double lies within half an ulp of it, far inside half a unit of the 15th digit); if not, the
+// correctly rounded 16- or 17-digit form is the closest candidate of that length, which is the
+// one the spec picks.
+static void fmt_num(double d, char *buf, size_t n) {
+  if (isnan(d)) { snprintf(buf, n, "NaN"); return; }
+  if (isinf(d)) { snprintf(buf, n, d > 0 ? "Infinity" : "-Infinity"); return; }
+  if (d == 0) { snprintf(buf, n, "0"); return; }
+  double a = fabs(d);
+  char out[64];
+  size_t o = 0;
+  if (d < 0) out[o++] = '-';
+  if (a < 9007199254740992.0 && a == floor(a)) {
+    // An integer below 2^53 prints as itself.
+    char rev[24];
+    int k = 0;
+    unsigned long long u = (unsigned long long)a;
+    while (u) { rev[k++] = (char)('0' + u % 10); u /= 10; }
+    while (k) out[o++] = rev[--k];
+    out[o] = '\0';
+    snprintf(buf, n, "%s", out);
+    return;
+  }
+  char tmp[48];
+  // (A subnormal's ulp is far coarser than 1e-16 of its value, so the 15-digit shortcut does
+  // not hold there: search every length.)
+  for (int prec = a < 2.2250738585072014e-308 ? 1 : 15; prec <= 17; prec++) {
+    snprintf(tmp, sizeof tmp, "%.*e", prec - 1, a);
+    if (prec == 17 || strtod(tmp, NULL) == a) break;
+    if (prec == 16) {
+      // At a power of two the interval below is half the one above, so the closest 16-digit
+      // form can miss while its neighbour on the wide side reads back: try that neighbour.
+      char *ep = strchr(tmp, 'e');
+      long long m = 0;
+      for (char *q = tmp; q < ep; q++) if (*q >= '0' && *q <= '9') m = m * 10 + (*q - '0');
+      int ex = atoi(ep + 1);
+      long long alt = strtod(tmp, NULL) < a ? m + 1 : m - 1;
+      char cand[48];
+      snprintf(cand, sizeof cand, "%lld", alt);
+      if (strlen(cand) == 16) {
+        char sci[64];
+        snprintf(sci, sizeof sci, "%c.%se%+d", cand[0], cand + 1, ex);
+        if (strtod(sci, NULL) == a) { memcpy(tmp, sci, strlen(sci) + 1 < sizeof tmp ? strlen(sci) + 1 : sizeof tmp); break; }
+      }
+    }
+  }
+  char digits[24];
+  int k = 0;
+  const char *p = tmp;
+  for (; *p && *p != 'e'; p++) if (*p >= '0' && *p <= '9') digits[k++] = *p;
+  int e10 = atoi(p + 1);
+  while (k > 1 && digits[k - 1] == '0') k--;
+  int ne = e10 + 1;   // the spec's n: the decimal point sits after n digits
+  if (k <= ne && ne <= 21) {
+    for (int i = 0; i < k; i++) out[o++] = digits[i];
+    for (int i = k; i < ne; i++) out[o++] = '0';
+  } else if (0 < ne && ne <= 21) {
+    for (int i = 0; i < ne; i++) out[o++] = digits[i];
+    out[o++] = '.';
+    for (int i = ne; i < k; i++) out[o++] = digits[i];
+  } else if (-6 < ne && ne <= 0) {
+    out[o++] = '0';
+    out[o++] = '.';
+    for (int i = 0; i < -ne; i++) out[o++] = '0';
+    for (int i = 0; i < k; i++) out[o++] = digits[i];
+  } else {
+    out[o++] = digits[0];
+    if (k > 1) {
+      out[o++] = '.';
+      for (int i = 1; i < k; i++) out[o++] = digits[i];
+    }
+    o += (size_t)snprintf(out + o, sizeof out - o, "e%c%d", ne - 1 < 0 ? '-' : '+', ne - 1 < 0 ? 1 - ne : ne - 1);
+  }
+  out[o] = '\0';
+  snprintf(buf, n, "%s", out);
+}
+
+void ax_fmt_num(double d, char *buf, size_t n) { fmt_num(d, buf, n); }
+
+void ax_str_append(char **buf, size_t *len, size_t *cap, const char *s, size_t n);
+static void str_append(char **buf, size_t *len, size_t *cap, const char *s, size_t n) {
+  if (*len + n + 1 > *cap) {
+    while (*len + n + 1 > *cap) *cap = *cap ? *cap * 2 : 64;
+    *buf = xrealloc(*buf, *cap);
+  }
+  memcpy(*buf + *len, s, n);
+  *len += n;
+  (*buf)[*len] = '\0';
+}
+
+static void render(AxValue v, char **buf, size_t *len, size_t *cap, int depth) {
+  char tmp[64];
+  switch (v.t) {
+    case AX_NULL: str_append(buf, len, cap, "null", 4); return;
+    case AX_BOOL: str_append(buf, len, cap, v.b ? "true" : "false", v.b ? 4 : 5); return;
+    case AX_NUM: fmt_num(v.num, tmp, sizeof tmp); str_append(buf, len, cap, tmp, strlen(tmp)); return;
+    case AX_STR:
+    case AX_ATOM: { AxStr *s = (AxStr *)v.o; str_append(buf, len, cap, s->data, s->len); return; }
+    case AX_ARR: {
+      if (depth > 16) { str_append(buf, len, cap, "[...]", 5); return; }
+      AxArr *a = (AxArr *)v.o;
+      str_append(buf, len, cap, "[", 1);
+      for (uint32_t i = 0; i < a->len; i++) {
+        if (i) str_append(buf, len, cap, ",", 1);
+        render(a->items[i], buf, len, cap, depth + 1);
+      }
+      str_append(buf, len, cap, "]", 1);
+      return;
+    }
+    case AX_DICT: {
+      // A dict shows as its JSON (JSON.stringify's, `__type` first for a record); a resource
+      // or draw descriptor ({kind, name, …}) shows as its name.
+      AxDict *d = (AxDict *)v.o;
+      AxStr *kk = ax_internz("kind"), *kn = ax_internz("name");
+      AxValue kind, name;
+      bool hk = ax_dict_get(d, kk, &kind), hn = ax_dict_get(d, kn, &name);
+      ax_release(ax_strv(kk)); ax_release(ax_strv(kn));
+      if (hk && hn && kind.t == AX_STR && name.t == AX_STR) {
+        AxStr *ns = (AxStr *)name.o;
+        str_append(buf, len, cap, ns->data, ns->len);
+        ax_release(kind); ax_release(name);
+        return;
+      }
+      if (hk) ax_release(kind);
+      if (hn) ax_release(name);
+      // `try { JSON.stringify(v) } catch { String(v) }`: a dict holding a big shows as an object.
+      char *json = NULL;
+      if (ax_json_write_checked(v, 0, &json)) str_append(buf, len, cap, json, strlen(json));
+      else str_append(buf, len, cap, "[object Object]", 15);
+      free(json);
+      return;
+    }
+    case AX_FN: {
+      AxFn *f = (AxFn *)v.o;
+      const char *nm = f->name ? f->name : "fn";
+      str_append(buf, len, cap, "<fn ", 4);
+      str_append(buf, len, cap, nm, strlen(nm));
+      str_append(buf, len, cap, ">", 1);
+      return;
+    }
+    case AX_RANGE: {
+      // As the source that makes it: `0..3`, or `range(0, 10, 2)` with a step.
+      AxRange *r = (AxRange *)v.o;
+      bool stepped = r->step != 1;
+      if (stepped) str_append(buf, len, cap, "range(", 6);
+      fmt_num(r->lo, tmp, sizeof tmp); str_append(buf, len, cap, tmp, strlen(tmp));
+      str_append(buf, len, cap, stepped ? ", " : "..", 2);
+      fmt_num(r->hi, tmp, sizeof tmp); str_append(buf, len, cap, tmp, strlen(tmp));
+      if (stepped) {
+        str_append(buf, len, cap, ", ", 2);
+        fmt_num(r->step, tmp, sizeof tmp); str_append(buf, len, cap, tmp, strlen(tmp));
+        str_append(buf, len, cap, ")", 1);
+      }
+      return;
+    }
+    case AX_BIG: {
+      char *digits = ax_big_to_cstr((AxBig *)v.o);
+      str_append(buf, len, cap, digits, strlen(digits));
+      free(digits);
+      return;
+    }
+    default: ax_render_engine(v, buf, len, cap); return;
+  }
+}
+
+// String(v) for an array: elements joined by ",", null as nothing, nested arrays flattened the
+// same way — what parseInt(xs) and `big < xs` see in the reference.
+static void js_join(AxValue v, char **buf, size_t *len, size_t *cap, int depth) {
+  AxArr *a = (AxArr *)v.o;
+  for (uint32_t i = 0; i < a->len; i++) {
+    if (i) str_append(buf, len, cap, ",", 1);
+    AxValue e = a->items[i];
+    if (e.t == AX_NULL) continue;
+    if (e.t == AX_ARR && depth < 32) { js_join(e, buf, len, cap, depth + 1); continue; }
+    render(e, buf, len, cap, 0);
+  }
+}
+
+AxStr *ax_js_string(AxValue v) {
+  if (v.t != AX_ARR) return ax_to_str(v);
+  char *buf = NULL;
+  size_t len = 0, cap = 0;
+  str_append(&buf, &len, &cap, "", 0);
+  js_join(v, &buf, &len, &cap, 0);
+  AxStr *s = ax_str_new(buf, len);
+  free(buf);
+  return s;
+}
+
+AxStr *ax_to_str(AxValue v) {
+  if (v.t == AX_STR) { ax_retain(v); return (AxStr *)v.o; }
+  char *buf = NULL;
+  size_t len = 0, cap = 0;
+  str_append(&buf, &len, &cap, "", 0);
+  render(v, &buf, &len, &cap, 0);
+  AxStr *s = ax_str_new(buf, len);
+  free(buf);
+  return s;
+}
+
+const char *ax_type_name(AxValue v) {
+  switch (v.t) {
+    case AX_NULL: return "null";
+    case AX_BOOL: return "boolean";
+    case AX_NUM: return "number";
+    case AX_STR: return "string";
+    case AX_ATOM: return "atom";
+    case AX_ARR: return "array";
+    case AX_DICT: {
+      AxStr *t = ((AxDict *)v.o)->type_tag;   // a record is its ^type
+      return t ? t->data : "dict";
+    }
+    case AX_FN: return "fn";
+    case AX_RANGE: return "range";
+    case AX_BIG: return "bigint";
+    case AX_VEC2: return "vec2";
+    case AX_VEC3: return "vec3";
+    case AX_QUAT: return "quat";
+    case AX_MAT4: return "mat4";
+    case AX_XFORM: return "transform";
+    case AX_ENTITY: return "entity";
+    default: return "dict";   // timers, colliders, pools: plain objects in the reference
+  }
+}
+
+// StringToNumber: the whole text, less surrounding white space, must be a numeric literal —
+// decimal (sign, digits, fraction, exponent), Infinity, or 0x/0o/0b digits; "" is 0.
+static double string_to_number(const char *s, size_t len) {
+  size_t i = 0, j = len, w;
+  while (i < j && (w = ax_js_space(s, i, len))) i += w;
+  size_t end = i;
+  for (size_t k = i; k < j;) {
+    if ((w = ax_js_space(s, k, len))) { k += w; continue; }
+    k++;
+    end = k;
+  }
+  j = end;
+  if (i == j) return 0;
+  if (j - i > 2 && s[i] == '0' && strchr("xXoObB", s[i + 1])) {
+    unsigned radix = (s[i + 1] | 0x20) == 'x' ? 16 : (s[i + 1] | 0x20) == 'o' ? 8 : 2;
+    for (size_t k = i + 2; k < j; k++) {
+      char c = s[k];
+      unsigned d = c >= '0' && c <= '9' ? (unsigned)(c - '0') : (c | 0x20) >= 'a' && (c | 0x20) <= 'f' ? (unsigned)((c | 0x20) - 'a' + 10) : 99;
+      if (d >= radix) return NAN;
+    }
+    AxBig *b = ax_big_parse_digits(s + i + 2, j - i - 2, radix);
+    double d = ax_big_to_double(b);
+    free(b);
+    return d;
+  }
+  size_t k = i;
+  bool neg = false;
+  if (s[k] == '+' || s[k] == '-') { neg = s[k] == '-'; k++; }
+  if (j - k == 8 && !strncmp(s + k, "Infinity", 8)) return neg ? -INFINITY : INFINITY;
+  size_t digits = 0;
+  while (k < j && s[k] >= '0' && s[k] <= '9') { k++; digits++; }
+  if (k < j && s[k] == '.') { k++; while (k < j && s[k] >= '0' && s[k] <= '9') { k++; digits++; } }
+  if (!digits) return NAN;
+  if (k < j && (s[k] == 'e' || s[k] == 'E')) {
+    k++;
+    if (k < j && (s[k] == '+' || s[k] == '-')) k++;
+    size_t e = 0;
+    while (k < j && s[k] >= '0' && s[k] <= '9') { k++; e++; }
+    if (!e) return NAN;
+  }
+  if (k != j) return NAN;
+  char buf[128];
+  char *text = j - i < sizeof buf ? buf : xalloc(j - i + 1);
+  memcpy(text, s + i, j - i);
+  text[j - i] = '\0';
+  double d = strtod(text, NULL);
+  if (text != buf) free(text);
+  return d;
+}
+
+// Number(v), as JavaScript computes it.
+double ax_to_num(AxValue v) {
+  switch (v.t) {
+    case AX_NUM: return v.num;
+    case AX_BOOL: return v.b ? 1 : 0;
+    case AX_NULL: return 0;
+    case AX_TIMER: return ((AxTimer *)v.o)->remaining;   // a timer reads as its remaining time
+    case AX_BIG: return ax_big_to_double((AxBig *)v.o);   // Number(big)
+    case AX_STR: { AxStr *s = (AxStr *)v.o; return string_to_number(s->data, s->len); }
+    case AX_ARR: {
+      // An array through its text: [] is 0, [5] is 5, [1, 2] is NaN.
+      AxStr *s = ax_js_string(v);
+      double d = string_to_number(s->data, s->len);
+      ax_release(ax_strv(s));
+      return d;
+    }
+    default: return NAN;
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Scopes
+// ---------------------------------------------------------------------------------------------
+//
+// A scope is a small open-addressed map keyed by interned name pointers, so a lookup is a hash
+// of a pointer and a pointer comparison. Frames are usually tiny (a couple of parameters and
+// locals), which is why the table starts at 8 slots and never shrinks.
+
+// Frames are made and dropped on every call and block, so released ones are kept for reuse.
+#define SCOPE_POOL 256
+static AxScope *scope_pool[SCOPE_POOL];
+static int scope_pooled;
+
+AxScope *ax_scope_new(AxScope *parent, bool fn_root) {
+  AxScope *s;
+  if (scope_pooled) {
+    s = scope_pool[--scope_pooled];
+    memset(s->ikeys, 0, sizeof s->ikeys);
+    s->len = 0;
+  } else {
+    s = xalloc(sizeof(AxScope));
+  }
+  s->hdr.rc = 1;
+  s->hdr.type = 200;   // not a user-visible value type
+  s->parent = parent;
+  if (parent) parent->hdr.rc++;
+  s->fn_root = fn_root;
+  s->builtin = false;
+  s->keys = s->ikeys;
+  s->vals = s->ivals;
+  s->cap = AX_SCOPE_INLINE;
+  return s;
+}
+
+void ax_scope_release(AxScope *s) {
+  while (s) {
+    if (--s->hdr.rc > 0) return;
+    for (uint32_t i = 0; i < s->cap; i++) {
+      if (!s->keys[i]) continue;
+      AxValue kv; kv.t = AX_STR; kv.o = (AxObj *)s->keys[i];
+      ax_release(kv);
+      ax_release(s->vals[i]);
+    }
+    if (s->keys != s->ikeys) { free(s->keys); free(s->vals); }
+    AxScope *parent = s->parent;
+    if (scope_pooled < SCOPE_POOL) scope_pool[scope_pooled++] = s;
+    else free(s);
+    s = parent;   // iteratively, so a long chain of frames cannot overflow the C stack
+  }
+}
+
+// Drops every binding while the scope itself lives on. Freeing a VM clears its globals and
+// builtins first: a declared function refers back to the scope that holds it, a cycle that
+// reference counting alone would never free.
+void ax_scope_clear(AxScope *s) {
+  for (uint32_t i = 0; i < s->cap; i++) {
+    if (!s->keys[i]) continue;
+    AxValue kv; kv.t = AX_STR; kv.o = (AxObj *)s->keys[i];
+    AxValue v = s->vals[i];
+    s->keys[i] = NULL;
+    s->vals[i] = ax_null();
+    s->len--;
+    ax_release(kv);
+    ax_release(v);
+  }
+}
+
+static void scope_grow(AxScope *s) {
+  uint32_t ncap = s->cap ? s->cap * 2 : 8;
+  AxStr **nk = xalloc(sizeof(AxStr *) * ncap);
+  AxValue *nv = xalloc(sizeof(AxValue) * ncap);
+  for (uint32_t i = 0; i < s->cap; i++) {
+    if (!s->keys[i]) continue;
+    uint32_t j = (uint32_t)(((uintptr_t)s->keys[i] >> 4) & (ncap - 1));
+    while (nk[j]) j = (j + 1) & (ncap - 1);
+    nk[j] = s->keys[i];
+    nv[j] = s->vals[i];
+  }
+  if (s->keys != s->ikeys) { free(s->keys); free(s->vals); }
+  s->keys = nk;
+  s->vals = nv;
+  s->cap = ncap;
+}
+
+// Every key is interned (ax_scope_declare sees to it), so an interned name is found by pointer
+// alone; only a name built at run time needs the string comparison.
+static int32_t scope_slot(AxScope *s, AxStr *name) {
+  uint32_t i = (uint32_t)(((uintptr_t)name >> 4) & (s->cap - 1));
+  uint32_t probes = 0;
+  bool by_value = !name->interned;
+  while (s->keys[i]) {
+    if (s->keys[i] == name || (by_value && ax_str_eq(s->keys[i], name))) return (int32_t)i;
+    i = (i + 1) & (s->cap - 1);
+    if (++probes > s->cap) break;
+  }
+  return -1;
+}
+
+// Look in ONE frame, without walking the chain — used by call resolution, which needs to step
+// frame by frame to find the nearest callable binding.
+bool ax_scope_lookup_local(AxScope *s, AxStr *name, AxValue *out) {
+  int32_t i = scope_slot(s, name);
+  if (i < 0) return false;
+  *out = ax_copy(s->vals[i]);
+  return true;
+}
+
+bool ax_scope_lookup(AxScope *s, AxStr *name, AxValue *out) {
+  for (AxScope *p = s; p; p = p->parent) {
+    int32_t i = scope_slot(p, name);
+    if (i >= 0) { *out = ax_copy(p->vals[i]); return true; }
+  }
+  return false;
+}
+
+bool ax_scope_set_existing(AxScope *s, AxStr *name, AxValue v) {
+  for (AxScope *p = s; p; p = p->parent) {
+    if (p->builtin) break;   // the library is read-only: assigning `sum = 3` makes a new binding
+    int32_t i = scope_slot(p, name);
+    if (i >= 0) { ax_release(p->vals[i]); p->vals[i] = v; return true; }
+  }
+  return false;
+}
+
+void ax_scope_declare(AxScope *s, AxStr *name, AxValue v) {
+  if (!name->interned) {                    // keys are always interned
+    AxStr *in = ax_intern(name->data, name->len);
+    in->hdr.rc--;                            // the intern table keeps it; the retain below is ours
+    name = in;
+  }
+  int32_t i = scope_slot(s, name);
+  if (i >= 0) { ax_release(s->vals[i]); s->vals[i] = v; return; }
+  if (s->len * 4 >= s->cap * 3) scope_grow(s);
+  uint32_t j = (uint32_t)(((uintptr_t)name >> 4) & (s->cap - 1));
+  while (s->keys[j]) j = (j + 1) & (s->cap - 1);
+  AxValue kv; kv.t = AX_STR; kv.o = (AxObj *)name;
+  ax_retain(kv);
+  s->keys[j] = name;
+  s->vals[j] = v;
+  s->len++;
+}
+
+void ax_str_append(char **buf, size_t *len, size_t *cap, const char *s, size_t n) { str_append(buf, len, cap, s, n); }
+
+// ---------------------------------------------------------------------------------------------
+// Engine value constructors
+// ---------------------------------------------------------------------------------------------
+
+static AxValue vec_new(uint8_t t, double x, double y, double z, double w) {
+  AxVec *v = xalloc(sizeof(AxVec));
+  v->hdr.rc = 1;
+  v->hdr.type = t;
+  v->x = x; v->y = y; v->z = z; v->w = w;
+  AxValue out; out.t = t; out.o = (AxObj *)v;
+  return out;
+}
+AxValue ax_vec2(double x, double y) { return vec_new(AX_VEC2, x, y, 0, 0); }
+AxValue ax_vec3(double x, double y, double z) { return vec_new(AX_VEC3, x, y, z, 0); }
+AxValue ax_quat(double x, double y, double z, double w) { return vec_new(AX_QUAT, x, y, z, w); }
+
+AxValue ax_mat4_new(const double *d) {
+  AxMat4 *m = xalloc(sizeof(AxMat4));
+  m->hdr.rc = 1;
+  m->hdr.type = AX_MAT4;
+  if (d) memcpy(m->d, d, sizeof m->d);
+  AxValue out; out.t = AX_MAT4; out.o = (AxObj *)m;
+  return out;
+}
+
+AxValue ax_xform_new(void) {
+  AxXform *x = xalloc(sizeof(AxXform));
+  x->hdr.rc = 1;
+  x->hdr.type = AX_XFORM;
+  x->pos = ax_vec3(0, 0, 0);
+  x->rot = ax_quat(0, 0, 0, 1);
+  x->scl = ax_vec3(1, 1, 1);
+  x->vel = ax_vec3(0, 0, 0);
+  AxValue out; out.t = AX_XFORM; out.o = (AxObj *)x;
+  return out;
+}
+
+AxValue ax_timer_new(double remaining, const char *unit) {
+  AxTimer *t = xalloc(sizeof(AxTimer));
+  t->hdr.rc = 1;
+  t->hdr.type = AX_TIMER;
+  t->remaining = remaining;
+  t->total = remaining;
+  snprintf(t->unit, sizeof t->unit, "%s", unit ? unit : "s");
+  AxValue out; out.t = AX_TIMER; out.o = (AxObj *)t;
+  return out;
+}

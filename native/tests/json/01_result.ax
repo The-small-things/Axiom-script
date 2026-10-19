@@ -1,0 +1,4 @@
+^type P: x, y
+^main:
+  print("a", 1)
+  ^return {p: P(1, 2), f: \v: v, s: "x", n: null, arr: [1, idle, v3(1,2,3)], nan: 0/0, inf: 1/0}

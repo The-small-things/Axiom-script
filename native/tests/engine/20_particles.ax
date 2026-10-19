@@ -1,0 +1,17 @@
+// A particle-filter belief and patrol_point() under seed(): reproducible, and identical on
+// both runtimes.
+~SEED: seed(42)
+
+@Tracker at v3(3, 2, 0)
+  $belief: Grid(8, 6) ~ Uniform infer: particle(40)
+  ~guess: null
+  ~draw: null
+  ~target: null
+  ~hot: false
+  &tick(5hz):
+    ^emit ears.level(0.3 + random() * 0.4)
+    belief ~= observe(noise: ears.level)
+    guess = belief ~> argmax
+    draw = belief ~> sample
+    hot = belief.any(>0.1)
+    target = patrol_point()

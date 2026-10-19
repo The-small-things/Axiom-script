@@ -1,0 +1,23 @@
+@Hunter at v3(2, 3, 0)
+  $belief: Grid(6, 5) ~ Uniform infer: exact(0)
+  ~best: null
+  ~peak: 0
+  ~hot: false
+  ~obs: 0
+  &tick(4hz):
+    obs += 1
+    ^emit audio.ambient(0.2 + (obs % 4) * 0.15)
+    belief ~= observe(noise: audio.ambient)
+    best = belief ~> argmax
+    peak = belief[best]
+    hot = belief.any(>0.05)
+
+@Scout at v3(4, 0, 4)
+  $grid: Grid(10, 10) infer: exact(0)
+  ~seen: null
+  ~b: null
+  &tick(2hz):
+    v = vision_cells(pose.pos, v3(0, 0, 1), #Hunter.pos, 6, 45)
+    grid ~= observe(vision: v)
+    b = grid ~> argmax
+    seen = v.seenCell

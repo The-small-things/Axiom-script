@@ -1,0 +1,25 @@
+@Drop &Body3D
+  ~hit: sphere(0.3)
+  ~age: 0
+  &physics:
+    age += dt
+    ?age > 1.5:
+      !despawn(self)
+  &on(Collide):
+    pose.vel = pose.vel * 0.5
+
+@Cloud at v3(0, 6, 0)
+  ~made: 0
+  ~alive: 0
+  &physics:
+    ?made < 40:
+      made += 1
+      !spawn(#Drop, at: v3(made % 5 * 0.4, 6 + made % 3, made % 7 * 0.2))
+  &tick(5hz):
+    alive = 0
+    near = ?nearest(#Drop, 100)
+    ?near != null:
+      alive = 1
+
+@Floor at v3(0, -0.5, 0)
+  ~hit: box(v3(20, 1, 20))

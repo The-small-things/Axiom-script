@@ -1,0 +1,6 @@
+^fn inner(a):
+  ^return a.nope()
+^main:
+  print("start")
+  y = 1
+  inner(5)

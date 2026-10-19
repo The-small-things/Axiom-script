@@ -1,0 +1,22 @@
+^fn two(a, b) = a + b
+^fn opt(a, b = 1) = a + b
+^fn var(a):
+  ^return len(args)
+^proc act(a):
+  print(a)
+@A
+  &tick(1hz):
+    x = two(1)
+    y = two(1, 2, 3)
+    z = opt(1)
+    w = opt()
+    v = opt(1, 2, 3)
+    u = var(1, 2, 3)
+    t = var()
+    !act()
+    !act(1, 2)
+    ?true:
+      s = two()
+^main:
+  r = two(1)
+  ?true: q = two(1, 2, 3, 4)

@@ -1,0 +1,7 @@
+// Keys reach frame code too: a &tick block polls them while the world runs.
+@Reader
+  ~seen: []
+  &tick(60hz):
+    k = poll_key()
+    ?k != null: seen.push(k)
+    ?k == "q": print("quit after", len(seen), "keys:", seen)

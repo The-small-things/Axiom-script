@@ -1,0 +1,21 @@
+// A text-processing CLI: read a file (or stdin), count words, print the top N.
+// Run: node main.js examples/wordcount.ax -- examples/wordcount.ax 5
+^fn top_words(text, n = 10):
+  counts = {}
+  *w in words(lower_clean(text)):
+    ?len(w) > 2:
+      counts[w] ??= 0
+      counts[w] += 1
+  ^return take(sorted(items(counts), \e: -e[1]), n)
+
+^fn lower_clean(text) = re_sub(text.lower(), "[^a-z0-9\\s]", " ")
+
+^main(argv):
+  src = len(argv) > 0 ? read(argv[0]) : read_stdin()
+  ?is_null(src):
+    eprint(f"cannot read {argv[0]}")
+    ^return 1
+  n = len(argv) > 1 ? parse_int(argv[1]) : 10
+  *word, count in top_words(src, n):
+    print(f"{count}\t{word}")
+  ^return 0

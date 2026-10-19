@@ -1,0 +1,24 @@
+// Edge cases the two runtimes must agree on.
+^main:
+  print(len([]), len(""), len({}), sum([]), mean([]), median([]))
+  print(first([]), last([]), max([]), min([]))
+  print(null == null, null ?? 5, is_null(null))
+  print("" == "", [] == [], {} == {})
+  print(0 == false, "1" == 1)
+  print([1,2,3][5], "abc"[9])
+  print([1,2,3][-1], "abc"[-1])
+  print(1 / 0, -1 / 0, 0 / 0)
+  print(str(null), str(true), str([1,[2]]), str({a: 1}))
+  print(type(null), type(1), type("s"), type([]), type({}), type(idle))
+  d = {}
+  d["k"] ??= 0
+  d["k"] += 1
+  print(d)
+  xs = []
+  xs.push(1, 2)
+  print(xs, xs.pop(), xs)
+  nested = {a: {b: {c: 1}}}
+  nested.a.b.c += 1
+  print(nested.a.b.c)
+  print("a" + 1, 1 + "a", [1] + [2])
+  print(true && false, true || false, !true)

@@ -1,0 +1,13 @@
+^type P: x:: number, y:: string, z:: bool, w:: list, v:: dict, u:: fn, t:: Entity
+^fn n() -> number = "s"
+^fn s() -> str:
+  ?true:
+    ^return 1
+  ^return "ok"
+^fn b() -> bool = [1]
+^fn nothing() -> weird = 1
+^main:
+  a = P(1, "two", true, [1], {a: 1}, \x: x, 1)
+  b = P("one", 2, 1, {}, [], 5, 1)
+  c = P(y: 3, x: "4")
+  d = P(f"{1}")

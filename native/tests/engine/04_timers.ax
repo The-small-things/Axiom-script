@@ -1,0 +1,30 @@
+@Gun
+  ~cd: 0.5s
+  ~shots: 0
+  ~reload: 250ms
+  ~state: idle
+  ~t: 0
+  &physics:
+    t += dt
+    ?cd <= 0:
+      shots += 1
+      cd = 0.5
+    state -> firing if shots > 2 -> idle
+
+@Mover at v3(0, 0, 0)
+  ~target: v3(10, 0, 0)
+  ~started: false
+  ~val: 0
+  &tick(10hz):
+    ?!started:
+      started = true
+      !tween(pose.pos, v3(4, 2, 0), 1s, inout)
+      !tween(val, 10, 500ms, linear)
+      !tween(pose.scl, v3(2, 2, 2), 0.3s)
+
+@Machine
+  ~mode: a
+  ~n: 0
+  &tick(4hz):
+    n += 1
+    mode -> b if n == 2 -> c(n) if n == 5 -> self

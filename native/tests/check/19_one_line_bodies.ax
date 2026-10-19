@@ -1,0 +1,5 @@
+// A function's one-line form is `^fn f(x) = expr`; `^fn f(x): stmt` is a parse error in both
+// runtimes, while ^main and blocks take a statement after ':'.
+^fn double(n): n * 2
+
+^main: print(double(3))

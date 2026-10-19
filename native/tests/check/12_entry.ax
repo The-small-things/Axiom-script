@@ -1,0 +1,2 @@
+^fn lib_only(x) = x
+^type T: a

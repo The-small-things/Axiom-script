@@ -1,0 +1,16 @@
+// Keys without waiting: poll_key() returns the next key pressed, or null, and never blocks, so
+// a loop keeps running between key presses. keys_down() lists the keys held right now. Run it
+// in a terminal; q quits.
+//   node main.js examples/keys.ax
+^main:
+  print("press keys (arrows, letters…); q quits")
+  x = 10
+  frames = 0
+  k = null
+  *k != "q":
+    k = poll_key()
+    ?k == "left": x -= 1
+    ?k == "right": x += 1
+    ?k != null: print(f"frame {frames}: {k}  x={x}  held={keys_down()}")
+    frames += 1
+    sleep(0.02)

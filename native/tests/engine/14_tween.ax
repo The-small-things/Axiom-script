@@ -1,0 +1,12 @@
+@T
+  ~stats: {x: 0, y: 0}
+  ~v: v3(0, 0, 0)
+  ~n: 0
+  ~go: true
+  &tick(20hz):
+    ?go:
+      go = false
+      !tween(stats.x, 100, 1s, in)
+      !tween(v, v3(3, 3, 3), 400ms, bounce)
+      !tween(n, 7, 0.5s, elastic)
+      !tween(pose.rot, euler(0, 1, 0), 0.5s)

@@ -1,0 +1,66 @@
+// 120 bodies in a walled pen: spheres, boxes and capsules (some tilted), static walls and
+// pillars, collision layers/masks, a body that goes NaN, and one that is huge. Exercises the
+// native broadphase against the reference's all-pairs pass: every push, bounce and Collide
+// event must come out the same. The NaN body is kept to its own layer, so it poisons only
+// itself, its companion and the static walls it touches.
+~N: 120
+@Floor at v3(0, -0.5, 0)
+  ~hit: box(v3(40, 1, 40))
+@WallE at v3(12, 2, 0)
+  ~hit: box(v3(1, 4, 24))
+@WallW at v3(-12, 2, 0)
+  ~hit: box(v3(1, 4, 24))
+@WallN at v3(0, 2, 12)
+  ~hit: box(v3(24, 4, 1))
+@WallS at v3(0, 2, -12)
+  ~hit: box(v3(24, 4, 1))
+@Pillar at v3(3, 2, 3)
+  ~hit: capsule(0.8, 3)
+@Giant &Body3D at v3(0, 30, 0)
+  ~hit: sphere(6)
+  ~mass: 50
+  ~collision_layer: 1
+  ~collision_mask: 7
+@Ghost &Body3D at v3(5, 5, 5)
+  ~hit: sphere(0.5)
+  ~collision_layer: 8
+  ~collision_mask: 8
+  ~t: 0
+  &physics:
+    t += 1
+    ?t == 90: pose.pos = v3(0 / 0, 1, 1)
+    ?t == 150: pose.pos = v3(-5, 5, -5)
+@Moth &Body3D at v3(5, 6, 5)
+  ~hit: sphere(0.5)
+  ~collision_layer: 8
+  ~collision_mask: 8
+@Ball &Body3D
+  ~hit: sphere(0.5)
+  ~collision_layer: 1
+  ~collision_mask: 7
+  ~hits: 0
+  &on(Collide):
+    hits += 1
+@Crate &Body3D
+  ~hit: box(v3(0.9, 0.9, 0.9))
+  ~collision_layer: 2
+  ~collision_mask: 3
+@Pill &Body3D
+  ~hit: capsule(0.3, 0.8)
+  ~collision_layer: 4
+  ~collision_mask: 5
+@Spawner
+  ~done: false
+  ~seedv: 7
+  &tick(60hz):
+    ?!done:
+      done = true
+      *k in 0..N:
+        seedv = (seedv * 1103515245 + 12345) % 2147483648
+        x = (seedv % 2000) / 100 - 10
+        seedv = (seedv * 1103515245 + 12345) % 2147483648
+        z = (seedv % 2000) / 100 - 10
+        y = 1 + (k % 7) * 1.3
+        ?k % 3 == 0: !spawn(#Ball, at: v3(x, y, z))
+        ?k % 3 == 1: !spawn(#Crate, at: v3(x, y, z))
+        ?k % 3 == 2: !spawn(#Pill, at: v3(x, y, z))

@@ -1,0 +1,24 @@
+// One display rule for f-strings, print, str() and "text" + v; equality and membership for
+// every type; a library function's bare name is an atom that is still callable.
+^type P: name, age
+
+^fn twice(x) = x * 2
+
+^main:
+  p = P("Ann", 3)
+  d = {name: "x", n: 1, tags: ["a", "b"], who: idle}
+  print(f"{p} | {d} | {[1, "a", d]}")
+  print(str(p), str([1, "a"]), str(idle), str(2.5), str(null), str(true))
+  print("v=" + [1, 2], [3] + "w", "n" + 1.5, "x" + null, "a" + idle, "d" + d)
+  f = \x: x
+  print(f"{f} {len} {twice}")
+  print(to_json(p), to_json(d), to_json([idle, 1]))
+  state = sleep
+  print(state == sleep, type(sleep), type(twice), sleep == idle)
+  print(map([-1, 2, -3], abs), [-1, 2].map(abs), [1, 2] |> map(twice), [4, 9] |> map(sqrt))
+  print(sort_by([-3, 1, -2], abs), count([idle, busy, idle], idle))
+  v = v3(1, 2, 3)
+  w = v3(1, 2, 3)
+  print(v == w, v != w, v == v3(0, 0, 0), v == null, null == v, v in [v3(0, 0, 0), w])
+  print("at " + v, v + " end", f"{v}", str(v2(1, 2)))
+  print(q(v3(0, 1, 0), 0) == q(v3(0, 1, 0), 0), v2(1, 2) == v3(1, 2, 0))

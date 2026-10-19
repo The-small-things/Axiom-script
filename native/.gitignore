@@ -1,0 +1,9 @@
+*.o
+axiom
+screenshots/
+saves/
+libaxiom.a
+tests/api/apitest
+*.wasm
+!tests/**/*.wasm
+wasm/obj/

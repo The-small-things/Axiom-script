@@ -1,0 +1,7 @@
+^use "lib/util.ax", "lib/chain"
+^use "lib/missing.ax"
+^use "lib/broken.ax"
+^fn util(x) = x
+~SHARED: 2
+^main:
+  print(util(1), deep(), SHARED)

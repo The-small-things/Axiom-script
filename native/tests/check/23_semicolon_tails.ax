@@ -1,0 +1,15 @@
+// AX-SEMI-001: a statement after ';' on the line of a one-line ? or loop body is not part of it.
+^main:
+  x = 1
+  y = 0
+  ?x == 2: y = 10; x = 99
+  i = 0
+  *i < 3: i = i + 1; print(i)
+  ?x == 1: y = 1;
+  ?x > 0: y = 5
+  ?!: y = 6; print("else")
+  print(f"x={x} y={y}")
+
+@Ticker:
+  ~n: 0
+  &tick: ?n < 3: n = n + 1; n = n * 2

@@ -1,0 +1,19 @@
+~SCALE: 3
+
+^fn double(x) = x * 2
+
+@Counter
+  ~n: double(SCALE)
+  ~log_n: 0
+  &tick(3hz):
+    n += 1
+    ?n % 4 == 0:
+      print(f"n is {n}")
+      !d("dbg", n)
+
+^main:
+  print("setup")
+  total = 0
+  *i in 0..4:
+    total += i
+  print(f"total {total}")

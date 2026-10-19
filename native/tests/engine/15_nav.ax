@@ -1,0 +1,28 @@
+@Nav &NavMesh3D
+  ~source: "tests/engine/level.nav"
+
+@Tower &NavMesh3D
+  ~source: "tests/engine/towers.nav"
+
+@Agent at v3(0.5, 0, 0.5)
+  ~route: []
+  ~route2: []
+  ~up: []
+  ~blocked: false
+  ~ray: null
+  ~ray2: null
+  ~none: null
+  ~step: 0
+  &tick(2hz):
+    step += 1
+    route = ?path(#Nav, pose.pos, v3(11.5, 0, 7.5))
+    ?step == 2:
+      r = ?block_cell(#Nav, 6, 2)
+    ?step == 3:
+      r = ?unblock_cell(#Nav, v3(6.5, 0, 2.5))
+    blocked = ?is_blocked(#Nav, 6, 2)
+    route2 = ?path(#Nav, v3(2.5, 0, 2.5), v3(8.5, 0, 4.5))
+    ray = ?raycast(#Nav, v3(0.5, 0, 0.5), v3(1, 0, 0.3), 20)
+    ray2 = ?raycast(#Nav, v3(0.5, 0, 6.5), v3(1, 0, 0), 20)
+    none = ?path(#Nav, v3(1.5, 0, 1.5), v3(3.5, 0, 3.5))
+    up = ?path(#Tower, v3(0.5, 0, 5.5), v3(2.5, 3, 1.5))

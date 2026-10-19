@@ -1,0 +1,10 @@
+// Rows that start with a wall ('#') are grid rows, not comments.
+@Nav &NavMesh3D
+  ~source: "tests/engine/walls.nav"
+
+@Walker
+  ~route: []
+  ~wall: false
+  &tick(1hz):
+    route = ?path(#Nav, v3(1.5, 0, 1.5), v3(4.5, 0, 3.5))
+    wall = ?is_blocked(#Nav, 0, 0)

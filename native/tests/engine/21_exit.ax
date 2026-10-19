@@ -1,0 +1,7 @@
+@A
+  ~n: 0
+  &tick(60hz):
+    n += 1
+    ?n == 3:
+      print("exiting")
+      exit(4)

@@ -1,0 +1,21 @@
+@Broken
+  ~n: 0
+  ~after: 0
+  &tick(2hz):
+    n += 1
+    ?n == 2:
+      x = nothing_here(1)
+    after += 1
+  &tick(1hz):
+    ?n == 3:
+      v = v3(1, 2, 3) + "a" * [1]
+      q = v3(1, 2, 3) == 2
+
+@Thrower
+  ~caught: 0
+  &tick(1hz):
+    ^try:
+      ^throw {code: "E_X", msg: "boom"}
+    ^catch e:
+      caught += 1
+    !nope(1)

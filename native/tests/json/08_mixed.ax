@@ -1,0 +1,14 @@
+// A fault after output, in a nested loop, with a caught error before it.
+^fn risky(n):
+  ?n > 2: ^throw {msg: "too big", n: n}
+  ^return n * 10
+^main:
+  ^try:
+    risky(5)
+  ^catch e:
+    print("caught", e.msg)
+  total = 0
+  *i in 0..4:
+    total += risky(i)
+    print("i", i, total)
+  ^return total

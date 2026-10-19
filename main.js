@@ -1,0 +1,903 @@
+#!/usr/bin/env node
+// main.js — AxiomScript v0.8.17 runtime
+//
+// Loads and compiles a .ax file, runs the game loop, and renders frames.
+//
+// Mode 1 (preferred, when SDL is available): opens a 640×480 window via @kmamal/sdl,
+//   runs at 60Hz, pushes RGBA pixels via `window.render(width, height, stride, 'rgba32', buffer)`.
+//   WASD/Space keyboard input → world.input. ESC quits.
+//
+// Mode 2 (headless fallback, used in CI / sandboxes without a display):
+//   runs N frames, dumps a PNG per `--png-every` frames (default 30) and a final PNG.
+//   Input is a recorded sequence or zero (Vec2(0,0), jump=false) by default.
+//
+// Mode 3 (v0.8.16: terminal rendering, --terminal / -t):
+//   runs at 15 fps, renders each frame as Unicode block characters with 24-bit ANSI
+//   color directly to stdout. Auto-detects terminal capabilities; falls back to ASCII
+//   density characters ( .:-=+#@) when truecolor/Unicode is unavailable.
+//   Overrides --headless and --sdl when specified. Default mode when no SDL and no
+//   --headless is given: try SDL → terminal → headless PNG.
+//
+// The rasterizer (render3d.js) "owns the renderer" — SDL/terminal are just "monitor cables".
+//
+// Usage:
+//   node main.js world.ax                  # auto-detect mode (SDL if available, else terminal)
+//   node main.js world.ax --terminal 60    # force terminal mode, run 60 frames
+//   node main.js world.ax --ascii          # force ASCII density mode (implies --terminal)
+//   node main.js world.ax --no-color       # force no-color terminal mode
+//   node main.js world.ax --headless 60    # headless, run 60 frames, save final PNG
+//   node main.js world.ax --sdl            # force SDL window (errors out if SDL unavailable)
+//   node main.js world.ax --png-every 30   # in either mode, save a PNG every 30 frames
+//   node main.js world.ax --input script.txt  # headless mode: per-step input from a file
+//   node main.js world.ax --json --terminal # terminal renders to stdout during run; JSON dump emitted after final frame
+//   node main.js prog.ax --run             # v0.9.0: run ^main as a script and exit
+//   node main.js world.ax --sim 120        # v0.9.0: step 120 frames headless, no renderer
+//   node main.js prog.ax -- a b            # v0.9.0: everything after -- is the program's args()
+//   node main.js prog.ax --no-restack      # v0.9.0: skip the larger-stack re-exec
+//
+// Output: writes PNGs to ./screenshots/frame_NNNNN.png (headless mode only)
+
+const fs = require('fs');
+const path = require('path');
+
+// v0.9.0: RECURSION HEADROOM.
+//
+// Node's default stack allows only a few hundred nested AxiomScript calls — the interpreter
+// uses several host frames per language call — which is far too shallow for a general-purpose
+// language: a recursive descent parser, a tree walk, or a quicksort on a few thousand items
+// all exceed it. Since a program cannot raise its own stack after start-up, the CLI re-executes
+// itself once with a larger one. The child is marked with an environment variable so this
+// happens exactly once; `--no-restack` (or AXIOM_NO_RESTACK=1) opts out.
+//
+// If the larger stack is refused by the OS (a thread-stack ulimit below the request, which
+// shows up as a SIGSEGV on start-up), the run is retried with the default stack rather than
+// failing — a shallower limit is better than no run at all.
+const RESTACK_KB = 6000;
+if (!process.env.AXIOM_NO_RESTACK
+    && !process.argv.includes('--no-restack')
+    && !process.execArgv.some(a => a.startsWith('--stack-size'))) {
+  const { spawnSync } = require('child_process');
+  const childArgs = [`--stack-size=${RESTACK_KB}`, __filename, ...process.argv.slice(2)];
+  const childEnv = Object.assign({}, process.env, { AXIOM_NO_RESTACK: '1' });
+  const res = spawnSync(process.execPath, childArgs, { stdio: 'inherit', env: childEnv });
+  if (!(res.signal === 'SIGSEGV' || res.signal === 'SIGBUS' || res.error)) {
+    process.exit(res.status === null ? 1 : res.status);
+  }
+  // Fall through and run in-process with the default stack.
+  process.env.AXIOM_NO_RESTACK = '1';
+}
+const { compile } = require('./checker');
+const { World, Vec2 } = require('./interpreter');
+// v0.9.0: the renderer and the gamepad adapter are loaded ON DEMAND. A script (`^main`) must
+// run with nothing but the language present — requiring a rasterizer to print a number was the
+// clearest sign the runtime assumed every program was a game.
+let _render3d = null;
+function renderer() {
+  if (_render3d) return _render3d;
+  try { _render3d = require('./render3d'); }
+  catch (e) {
+    console.error(`this mode needs the renderer (render3d.js), which could not be loaded: ${e.message}`);
+    console.error(`use --sim N to step the simulation headless, --run for script mode, or --check to validate without executing.`);
+    process.exit(1);
+  }
+  return _render3d;
+}
+const rasterizeFrame = (...a) => renderer().rasterizeFrame(...a);
+const savePNG = (...a) => renderer().savePNG(...a);
+// v0.8.16: terminal rendering backend — converts the RGBA pixel buffer to Unicode
+// block characters with 24-bit ANSI color. Pure post-process on rasterizeFrame output.
+const { renderToTerminal, detectColorSupport } = require('./terminal');
+// v0.8.1: gamepad input adapter — polls @kmamal/sdl controllers (if any connected) and merges
+// LeftStick → input.move, ButtonSouth → input.jump, alongside the existing keyboard polling.
+let _gamepad = null;
+function gamepad() {
+  if (_gamepad) return _gamepad;
+  try { _gamepad = require('./input_gamepad'); }
+  catch (e) { _gamepad = { pollGamepadToInput: () => null, mergeKeyboardGamepad: (kb) => kb }; }
+  return _gamepad;
+}
+const pollGamepadToInput = (...a) => gamepad().pollGamepadToInput(...a);
+const mergeKeyboardGamepad = (...a) => gamepad().mergeKeyboardGamepad(...a);
+
+// v0.8.15: serialize AxiomScript runtime values for --json output. Plain numbers/strings/bools
+// pass through. Vec3/Vec2/Quat become arrays. Atom becomes {atom: name}. EntityInstance becomes
+// its tag name. Everything else falls back to a string representation.
+function serializeForJson(v) {
+  if (v === null || v === undefined) return null;
+  if (typeof v === 'number' || typeof v === 'string' || typeof v === 'boolean') return v;
+  if (typeof v === 'function') return '<fn>';
+  if (Array.isArray(v)) return v.map(serializeForJson);
+  // Duck-type Vec3/Vec2/Quat by checking for the x/y/z props (avoids importing the classes).
+  if (typeof v === 'object') {
+    if (v.constructor && v.constructor.name === 'Vec3') return [v.x, v.y, v.z];
+    if (v.constructor && v.constructor.name === 'Vec2') return [v.x, v.y];
+    if (v.constructor && v.constructor.name === 'Quat') return [v.x, v.y, v.z, v.w];
+    if (v.constructor && v.constructor.name === 'Atom') return { atom: v.name };
+    if (v.constructor && v.constructor.name === 'EntityInstance') return { entity: v._tagName || v.decl.name };
+    if (v.__timer) return { timer: { remaining: v.remaining, total: v.total } };
+    if (v.__hud) return { hud: { kind: v.kind, pos: v.pos ? [v.pos.x, v.pos.y, v.pos.z] : null } };
+    // v0.9.2: a function in the state dump is a marker, not its syntax tree.
+    if (v.__callable) return '<fn>';
+    // Plain object — serialize own enumerable props.
+    const out = {};
+    for (const [k, val] of Object.entries(v)) {
+      try { out[k] = serializeForJson(val); } catch (e) { out[k] = String(val); }
+    }
+    return out;
+  }
+  return String(v);
+}
+
+// --- Argument parsing ---
+// v0.8.15: added --check (parse-only, no World creation), --json (structured state output),
+// --eval 'source' (inline source instead of file), --stdin (read source from stdin).
+// These support LLM codegen pipelines and IDE/CI integration.
+const args = process.argv.slice(2);
+const flags = {};
+let inlineSource = null;
+let positionalFile = null;
+for (let i = 0; i < args.length; i++) {
+  const a = args[i];
+  // v0.8.17: accept both --long and -short flags. Previously only --long flags were parsed;
+  // -t/-A/-C were listed in the conditionals but never matched (a.startsWith('--') excluded them).
+  if (a.startsWith('--') || /^-[a-zA-Z]+$/.test(a)) {
+    if (a === '--headless') { flags.headless = true; flags.framesGiven = true; flags.frames = parseInt(args[++i], 10) || 60; }
+    else if (a === '--sdl') { flags.sdl = true; }
+    // v0.8.16: terminal rendering backend. --terminal/-t overrides --headless and --sdl.
+    // Optional frame count arg matches --headless convention (parseInt(args[++i]) || 60).
+    // If the next arg is non-numeric (e.g. a filename), don't consume it.
+    else if (a === '--terminal' || a === '-t') {
+      flags.terminal = true;
+      const next = args[i + 1];
+      if (next !== undefined && /^\d+$/.test(next)) { flags.frames = parseInt(args[++i], 10); flags.framesGiven = true; }
+      else { flags.frames = 60; }
+    }
+    // v0.8.16: --ascii/-A forces ASCII density mode (implies --terminal). Pure flag, no arg.
+    else if (a === '--ascii' || a === '-A') { flags.terminal = true; flags.ascii = true; }
+    // v0.8.16: --no-color/-C forces no-color mode (overrides COLORTERM=truecolor detection). Pure flag, no arg.
+    else if (a === '--no-color' || a === '-C') { flags.noColor = true; }
+    // v0.8.17: --subpixel/-S — enable sub-pixel half-block rendering (▌▐). Implies --terminal.
+    // Each logical cell becomes 2 terminal columns, doubling horizontal resolution.
+    // Silently ignored in ASCII mode (ASCII can't do half-blocks — a warning is emitted at render time).
+    else if (a === '--subpixel' || a === '-S') { flags.terminal = true; flags.subpixel = true; }
+    // v0.8.17: --term-fps N — tune terminal animation frame rate. Default 15; clamped to [1, 60].
+    // Useful for fast terminals (kitty, alacritty → 30+ fps) and slow SSH (→ 5 fps).
+    // The flag is purely additive — without it, terminal mode uses 15 fps (backward compat).
+    else if (a === '--term-fps') {
+      const n = parseInt(args[++i], 10);
+      if (isNaN(n)) { console.warn('--term-fps requires a numeric argument; ignoring.'); }
+      else { flags.termFps = n; }
+    }
+    else if (a === '--png-every') { flags.pngEvery = parseInt(args[++i], 10) || 30; }
+    else if (a === '--width') { flags.width = parseInt(args[++i], 10) || 640; }
+    else if (a === '--height') { flags.height = parseInt(args[++i], 10) || 480; }
+    else if (a === '--input') { flags.inputScript = args[++i]; }
+    // v0.8.7: sandbox mode.
+    else if (a === '--sandbox') { flags.sandbox = true; }
+    else if (a === '--allow-net') { flags.allowNet = true; }
+    else if (a === '--allow-read') { flags.allowReadPaths = flags.allowReadPaths || []; flags.allowReadPaths.push(args[++i]); }
+    // v0.9.0: the stdlib can write files and run commands, so the sandbox needs gates for both.
+    else if (a === '--allow-write') { flags.allowWritePaths = flags.allowWritePaths || []; flags.allowWritePaths.push(args[++i]); }
+    else if (a === '--allow-exec') { flags.allowExec = true; }
+    // v0.9.0: --run forces script mode (execute ^main, then exit) even when the program also
+    // declares entities. Without it, a program with a ^main runs ^main and then starts the
+    // frame loop only if it has entities to simulate.
+    else if (a === '--run' || a === '-r') { flags.run = true; }
+    // v0.9.3: --repl — an interactive session (or a scripted one over a pipe); see repl.js.
+    else if (a === '--repl') { flags.repl = true; }
+    else if (a === '--no-restack') { /* handled before start-up; accepted here so it is not "unknown" */ }
+    else if (a === '--help' || a === '-h') { flags.help = true; }
+    else if (a === '--version' || a === '-v') { flags.version = true; }
+    // v0.9.0: --sim N steps the simulation N frames with NO rendering at all. Game logic can
+    // then be exercised (and asserted on, with --json) on a machine with no display and no
+    // rasterizer — the same way a script runs.
+    else if (a === '--sim') { flags.sim = true; flags.framesGiven = true; flags.frames = parseInt(args[++i], 10) || 60; }
+    // v0.9.0: everything after `--` is the program's own argv, readable with args().
+    else if (a === '--') { flags.scriptArgs = args.slice(i + 1); i = args.length; }
+    // v0.8.15: --check (parse-only, no World creation). For linting/CI/IDE. Exits 0 if no
+    // fatal/contract_violation diagnostics, 1 otherwise. Diagnostics go to stderr.
+    else if (a === '--check') { flags.check = true; }
+    // v0.8.15: --json (structured state output). After running --headless N frames, output a
+    // JSON object to stdout with entities, log, diagnostics, frames_run, sim_time. No PNG output.
+    else if (a === '--json') { flags.json = true; }
+    // v0.8.15: --eval 'source' — inline source. Skips file reading. Useful for LLM codegen
+    // pipelines that would otherwise write to a temp file.
+    else if (a === '--eval') { inlineSource = args[++i]; if (!inlineSource) { console.error('--eval requires a source string argument'); process.exit(1); } }
+    // v0.8.15: --stdin — read source from stdin. If neither --eval nor a file arg nor --stdin
+    // is given, defaults to 'world.ax' (backward compat).
+    else if (a === '--stdin') { flags.stdin = true; }
+    else console.warn(`unknown flag: ${a}`);
+  } else {
+    // First non-flag argument is the .ax file (backward compat).
+    if (!positionalFile) positionalFile = a;
+  }
+}
+// v0.9.0: `--help` / `--version`. A CLI with no usage output forces a model to guess flags
+// from documentation it may not have been given; printing them costs one line each.
+if (flags.help) {
+  console.log(`AxiomScript ${require('./package.json').version} — a language designed to be written by LLMs.
+
+usage: axiom <file.ax> [options] [-- program args]
+
+  <file.ax>              program to run (default: world.ax); '-' is not special, use --stdin
+  --eval '<source>'      run inline source instead of a file
+  --stdin                read the program from standard input
+  -- a b c               everything after -- is passed to the program, readable with args()
+
+running
+  --run, -r              script mode: run ^main and exit (even if the program has entities)
+  --sim N                step a simulation N frames headless, no renderer
+  --check                parse and check only; exit 1 if anything blocks
+  --repl                 interactive session: statements run as typed, expressions echo
+  --json                 machine-readable output (result, log, diagnostics, entity state)
+  --no-restack           skip the larger-stack re-exec (lowers the recursion limit)
+
+rendering (only for programs with entities)
+  --terminal, -t [N]     render to the terminal with Unicode blocks
+  --ascii, -A            ASCII density mode          --no-color, -C   disable colour
+  --subpixel, -S         half-block horizontal detail  --term-fps N   terminal frame rate
+  --sdl                  force an SDL window         --headless N     N frames, PNG output
+  --width N --height N   resolution                  --png-every N    PNG dump interval
+  --input FILE           scripted input for headless runs
+
+sandbox
+  --sandbox              deny file writes, subprocesses, and unlisted reads
+  --allow-read PATH      permit reads under PATH     --allow-write PATH  permit writes
+  --allow-exec           permit sh()                 --allow-net         permit network use
+
+docs: README.md (language tour) · STDLIB.md (library) · GRAMMAR.md (full grammar)`);
+  process.exit(0);
+}
+if (flags.version) { console.log(require('./package.json').version); process.exit(0); }
+if (flags.repl) {
+  require('./repl').startRepl();
+  return;   // the session runs on stdin events; nothing below applies (CommonJS allows this)
+}
+
+const WIDTH = flags.width || 640;
+const HEIGHT = flags.height || 480;
+const PNG_EVERY = flags.pngEvery || 30;
+const SHOT_DIR = path.join(process.cwd(), 'screenshots');
+
+// --- Determine source text ---
+// v0.8.15: source can come from (1) --eval 'string', (2) --stdin, or (3) a file argument.
+// Priority: --eval > --stdin > file. If none, default to 'world.ax' (backward compat).
+let src;
+let sourceLabel;
+if (inlineSource !== null) {
+  src = inlineSource;
+  sourceLabel = '<eval>';
+} else if (flags.stdin) {
+  // Read all of stdin synchronously. Simplest approach: use fs.readFileSync(0).
+  try {
+    src = fs.readFileSync(0, 'utf8');
+  } catch (e) {
+    console.error(`--stdin: failed to read from stdin: ${e.message}`);
+    process.exit(1);
+  }
+  sourceLabel = '<stdin>';
+} else {
+  const axFile = positionalFile || 'world.ax';
+  if (!fs.existsSync(axFile)) {
+    console.error(`axiom file not found: ${axFile}`);
+    process.exit(1);
+  }
+  src = fs.readFileSync(axFile, 'utf8');
+  sourceLabel = axFile;
+}
+
+// --- Compile ---
+// v0.9.0: pass the source path so `^use "lib.ax"` resolves relative to the importing file.
+const r = compile(src, { filename: sourceLabel === '<eval>' || sourceLabel === '<stdin>' ? null : sourceLabel });
+
+// --- --check mode: print diagnostics, exit 0/1, no World creation ---
+if (flags.check) {
+  // v0.9.3: --check --json prints {ok, diagnostics} to stdout and nothing else.
+  if (flags.json) {
+    console.log(JSON.stringify({ ok: r.ok, diagnostics: r.diagnostics }, null, 2));
+    process.exit(r.ok ? 0 : 1);
+  }
+  if (r.diagnostics.length > 0) {
+    for (const d of r.diagnostics) {
+      console.error(`  [${d.error_code}] (${d.severity}) L${d.location?.line}${d.location?.col != null ? ":" + d.location.col : ""} ${d.message_for_human}`);
+    }
+  }
+  if (r.ok) {
+    console.error(`OK: ${sourceLabel} compiles clean (${r.diagnostics.length} advisory diagnostics).`);
+    process.exit(0);
+  } else {
+    console.error(`FAIL: ${sourceLabel} has ${r.diagnostics.filter(d => d.severity === 'fatal' || d.severity === 'contract_violation').length} blocking diagnostic(s).`);
+    process.exit(1);
+  }
+}
+
+if (!r.ok) {
+  console.error(`compile failed:`);
+  for (const d of r.diagnostics) {
+    console.error(`  [${d.error_code}] (${d.severity}) L${d.location?.line}${d.location?.col != null ? ":" + d.location.col : ""} ${d.message_for_human}`);
+  }
+  process.exit(1);
+}
+// v0.9.3: exit(n) ends the program wherever it is called — a global initializer, ^main, or a
+// frame block in any run mode — so it is handled once, here, rather than in every loop.
+let w;
+process.on('uncaughtException', (err) => {
+  if (err && err.__exit !== undefined) {
+    if (process.stdout.isTTY) process.stdout.write('\x1b[0m');
+    if (w) flushRuntimeDiagnostics(w);
+    process.exit(err.__exit);
+  }
+  console.error(err && err.stack ? err.stack : String(err));
+  process.exit(1);
+});
+w = new World().loadProgram(r.program, src);
+// v0.8.15: suppress console.log from !log/!print when --json is active (would corrupt JSON output)
+if (flags.json) w._suppressConsole = true;
+// v0.8.7: activate sandbox mode if --sandbox was passed.
+if (flags.sandbox) {
+  w.setSandbox({
+    allowNet: !!flags.allowNet,
+    allowReadPaths: flags.allowReadPaths || [],
+    allowWritePaths: flags.allowWritePaths || [],
+    allowExec: !!flags.allowExec,
+  });
+  // In --json mode, suppress the sandbox log line (it would corrupt JSON output).
+  if (!flags.json) {
+    console.log(`Sandbox mode ACTIVE: !play stubbed, !save/!load in-memory only, network ${flags.allowNet ? 'allowed' : 'blocked'}, fs reads ${flags.allowReadPaths ? 'limited to: ' + flags.allowReadPaths.join(', ') : 'blocked'}`);
+  }
+}
+// v0.9.0: SCRIPT MODE.
+//
+// A program with a `^main:` runs it once, immediately, before any frame loop. If the program
+// declares no entities (or --run was passed), that is the whole program: ^main returns, the
+// process exits with its return value as the exit code, and no renderer is ever loaded. This
+// is what makes AxiomScript usable for CLI tools, data processing, and mathematics — the
+// simulation loop became opt-in rather than mandatory.
+//
+// A program with BOTH a ^main and entities runs ^main as setup and then enters the loop, which
+// is the natural shape for a game that needs to build a level or load data before the first
+// frame.
+const scriptArgv = flags.scriptArgs || [];
+if (w.mainDecl) {
+  const loopFollows = !flags.run && w.entities.length > 0;
+  if (!flags.json && loopFollows) {
+    console.log(`Loaded ${sourceLabel}: running ^main, then ${w.entities.length} entities`);
+  }
+  // The script's outcome. With --json it is one object — including when ^main faulted or
+  // called exit() — so a caller always gets the log and the diagnostics.
+  const finishScript = (code, result) => {
+    flushRuntimeDiagnostics(w);
+    if (flags.json) {
+      console.log(JSON.stringify({
+        main_result: serializeForJson(result),
+        log: w.log.map(l => l.msg).filter(Boolean),
+        diagnostics: w.runtimeDiagnostics,
+        exit_code: code,
+      }, null, 2));
+    }
+    process.exit(code);
+  };
+  try {
+    w.runMain(scriptArgv);
+  } catch (err) {
+    // exit() is an ordinary control-flow signal, not a failure.
+    if (err && err.__exit !== undefined) finishScript(err.__exit, null);
+    const f = w.mainFault;
+    if (!flags.json) {
+      console.error(`${sourceLabel}:${(f && f.location.line) || '?'}: runtime error [${f ? f.error_code : 'AX-RUNTIME-000'}]: ${err && err.message ? err.message : err}`);
+    }
+    finishScript(1, null);
+  }
+  if (!loopFollows) finishScript(w.exitCode || 0, w.mainResult);
+} else if (flags.run) {
+  console.error(`--run needs a '^main:' entry point; ${sourceLabel} has none.`);
+  process.exit(1);
+}
+
+// Runtime diagnostics are worth printing even when the program "succeeded" — they are the
+// checker's runtime counterpart and each one names a bug the program did not notice.
+function flushRuntimeDiagnostics(world) {
+  if (flags.json) return;
+  for (const d of world.runtimeDiagnostics || []) {
+    if (d === world.mainFault) continue;      // already reported with its line
+    console.error(`  [${d.error_code}] ${d.message_for_human}`);
+  }
+}
+
+// In --json mode, suppress the "Loaded ..." log line (it would corrupt JSON output).
+if (!flags.json && !w.mainDecl) {
+  console.log(`Loaded ${sourceLabel}: ${w.entities.length} entities (${w.entities.map(e => e._tagName).join(', ')}), version ${r.program.version || '(none)'}`);
+}
+
+// --- Input script (for headless mode) ---
+// Each line of the input file is "WASD" or "W" or "WD" or "SPACE" applied for one update step.
+// Lines that start with `#` are comments. Empty lines = no input for that step.
+let inputSteps = [];
+if (flags.inputScript && fs.existsSync(flags.inputScript)) {
+  inputSteps = fs.readFileSync(flags.inputScript, 'utf8')
+    .split('\n')
+    .map(l => l.trim())
+    .filter(l => l.length > 0 && !l.startsWith('#'));
+}
+
+function applyInput(step) {
+  if (!step) { w.input.move.x = 0; w.input.move.y = 0; w.input.jump = false; w.input.fire = false; return; }
+  let x = 0, y = 0, jump = false, fire = false;
+  for (const c of step.toUpperCase()) {
+    if (c === 'W') y += 1;
+    else if (c === 'S') y -= 1;
+    else if (c === 'A') x -= 1;
+    else if (c === 'D') x += 1;
+    else if (c === ' ') jump = true;
+    else if (c === 'F') fire = true;          // v0.9.3
+  }
+  w.input.move.x = x;
+  w.input.move.y = y;
+  w.input.jump = jump;
+  w.input.fire = fire;
+}
+
+// v0.9.3: live keyboard input for terminal mode (native/kbd.c has the same rules). A terminal
+// reports presses, never releases, so a movement key counts as held for 0.35 s after its last
+// press (auto-repeat renews it while the key is down); jump and fire are taps held for 0.12 s,
+// long enough for a 60 Hz step to see them. A direction cancels its opposite.
+function feedKey(kb, str, key, now) {
+  const name = key && key.name ? key.name : (str || '').toLowerCase();
+  const HOLD = 0.35, TAP = 0.12;
+  if ((key && key.ctrl && (name === 'c' || name === 'd')) || name === 'q' || name === 'escape') { kb.quit = true; return; }
+  if (name === 'w' || name === 'up') { kb.up = now + HOLD; kb.down = 0; }
+  else if (name === 's' || name === 'down') { kb.down = now + HOLD; kb.up = 0; }
+  else if (name === 'a' || name === 'left') { kb.left = now + HOLD; kb.right = 0; }
+  else if (name === 'd' || name === 'right') { kb.right = now + HOLD; kb.left = 0; }
+  else if (name === 'space') kb.jump = now + TAP;
+  else if (name === 'f' || name === 'return' || name === 'enter') kb.fire = now + TAP;
+}
+function applyKeys(kb, now) {
+  w.input.move.x = (kb.right > now ? 1 : 0) - (kb.left > now ? 1 : 0);
+  w.input.move.y = (kb.up > now ? 1 : 0) - (kb.down > now ? 1 : 0);
+  w.input.jump = kb.jump > now;
+  w.input.fire = kb.fire > now;
+}
+
+// --- Frame output ---
+function ensureShotDir() { if (!fs.existsSync(SHOT_DIR)) fs.mkdirSync(SHOT_DIR, { recursive: true }); }
+
+function dumpFrame(frameNum) {
+  ensureShotDir();
+  // v0.8.15 fix: removed w.stepRender(1/60) — w.update() already calls stepRender internally.
+  // Calling it again here caused &render: blocks, animations, and tweens to run 2x on PNG frames.
+  // The draw list is already populated by w.update(); rasterizeFrame reads it directly.
+  const { pixels } = rasterizeFrame(w, WIDTH, HEIGHT);
+  const fname = `frame_${String(frameNum).padStart(5, '0')}.png`;
+  const fpath = path.join(SHOT_DIR, fname);
+  savePNG(pixels, WIDTH, HEIGHT, fpath);
+  console.log(`  frame ${frameNum} → ${fpath}`);
+  return fpath;
+}
+
+// v0.9.0: --sim — headless simulation with no renderer.
+if (flags.sim) {
+  const dt = 1 / 60;
+  let framesRun = flags.frames, exitCode = null;
+  for (let i = 0; i < flags.frames; i++) {
+    applyInput(inputSteps[i]);
+    try { w.update(dt); }
+    catch (err) {
+      // v0.9.3: exit(n) in a frame block ends the run; the state at that point is still dumped.
+      if (!(err && err.__exit !== undefined)) throw err;
+      framesRun = i + 1;
+      exitCode = err.__exit;
+      break;
+    }
+  }
+  flushRuntimeDiagnostics(w);
+  if (flags.json) {
+    console.log(JSON.stringify({
+      frames_run: framesRun,
+      sim_time: w._simTime,
+      entities: w.entities.map(e => ({
+        tag: e._tagName,
+        fields: Object.fromEntries([...e.fields.entries()].map(([k, v]) => [k, serializeForJson(v)])),
+        pos: serializeForJson(e.locals.get('pose') ? e.locals.get('pose').pos : null),
+      })),
+      log: w.log.map(l => l.msg).filter(Boolean),
+      diagnostics: w.runtimeDiagnostics,
+    }, null, 2));
+  }
+  // v0.9.3: only a fault fails the run; an advisory (the renderer being absent, a save loaded
+  // across an added field) is reported but does not.
+  process.exit(exitCode !== null ? exitCode : w.runtimeDiagnostics.some(d => d.severity === 'fatal') ? 1 : 0);
+}
+
+// --- Mode detection ---
+// The ONLY allowed external dep per the v0.6 spec is @kmamal/sdl (an optionalDependency: a
+// plain `npm install` fetches it where it has prebuilt binaries). If it loads and a window
+// opens, frames go to the window; if not, --sdl says why and stops, and the automatic choice
+// falls back to the terminal.
+let sdl = null, sdlWindow = null, sdlError = null;
+if (!flags.terminal && !flags.headless) {
+  try {
+    sdl = require('@kmamal/sdl');
+    if (!sdl || !sdl.video || typeof sdl.video.createWindow !== 'function') {
+      sdlError = 'the installed @kmamal/sdl does not have the API this runtime drives (sdl.video.createWindow)';
+      sdl = null;
+    }
+  } catch (e) {
+    sdlError = e && e.code === 'MODULE_NOT_FOUND' && /@kmamal\/sdl/.test(e.message)
+      ? `it needs the optional package @kmamal/sdl, which is not installed — run \`npm install @kmamal/sdl\` in ${__dirname} (or \`npm install\` there, which fetches it on platforms it has prebuilt binaries for)`
+      : `@kmamal/sdl could not be loaded: ${e && e.message ? e.message : e}`;
+    sdl = null;
+  }
+  if (sdl) {
+    try {
+      sdlWindow = sdl.video.createWindow({ title: `AxiomScript — ${path.basename(sourceLabel)}`, width: WIDTH, height: HEIGHT });
+    } catch (e) {
+      sdlError = `@kmamal/sdl is installed but could not open a window (${e && e.message ? e.message : e}) — is there a display?`;
+      sdl = null;
+    }
+  }
+}
+if (flags.sdl && !flags.terminal && !sdl) {
+  console.error(`--sdl: ${sdlError}`);
+  console.error('--terminal draws the same frames in this terminal, and --headless N writes them to PNG files.');
+  process.exit(1);
+}
+// v0.8.16: HEADLESS is now only true when --headless is explicitly passed (or when both
+// SDL and --terminal are unavailable AND we somehow fell through to this branch — which
+// shouldn't happen because TERMINAL takes precedence). The terminal branch below handles
+// the no-SDL-no-headless case.
+const HEADLESS = flags.headless || (!sdl && !flags.sdl && !flags.terminal);
+
+// v0.8.16: terminal mode resolution. --terminal takes priority over both --headless and --sdl.
+// When no render-mode flag is explicitly given AND SDL is unavailable, fall back to terminal
+// mode (rather than headless PNG dump) so the user sees live animation on any tty.
+const TERMINAL = flags.terminal || (!flags.headless && !flags.sdl && !sdl);
+if (flags.terminal && (flags.headless || flags.sdl)) {
+  // Explicit --terminal wins; warn that --headless/--sdl is being ignored.
+  if (!flags.json) console.warn('--terminal overrides --headless/--sdl');
+}
+
+if (TERMINAL) {
+  // v0.8.16: Terminal rendering mode.
+  // Renders each frame as Unicode block characters with 24-bit ANSI color directly to stdout.
+  // Auto-detects terminal capabilities (truecolor, 256-color, no color) via env vars.
+  // Falls back to ASCII density characters when Unicode is unavailable or --ascii is passed.
+  // 15 fps target (physics still simulates at 60 Hz). Default resolution: 160×120.
+  const TERM_WIDTH = flags.width || 160;
+  const TERM_HEIGHT = flags.height || 120;
+  // v0.8.17: --subpixel + --ascii warning. Sub-pixel uses ▌▐ half-blocks which ASCII mode
+  // can't render. Emit a warning so the user knows the flag is being ignored.
+  if (flags.subpixel && flags.ascii && !flags.json) {
+    console.warn('--subpixel ignored in ASCII mode (half-block characters unavailable).');
+  }
+  // v0.9.3: LIVE — a person at the keyboard. With stdin and stdout both terminals, no --input
+  // script and no frame count, the program runs in real time until q / Esc / Ctrl-C and the
+  // keys drive `input`. A keyboard attached to a run with a frame count still drives input.
+  const keys = !flags.inputScript && !flags.json && !!process.stdin.isTTY && !!process.stdout.isTTY;
+  const live = keys && !flags.framesGiven;
+  if (!flags.json) {
+    const modeLabel = flags.ascii ? 'ASCII' : (detectColorSupport().mode + (flags.subpixel ? '+subpixel' : ''));
+    console.error(`\nMode: terminal @ ${TERM_WIDTH}×${TERM_HEIGHT} (${modeLabel}, ${flags.noColor ? 'no color' : (detectColorSupport().color ? 'color' : 'no color')}).`);
+    const fpsPreview = flags.termFps !== undefined ? Math.max(1, Math.min(60, flags.termFps)) : 15;
+    if (live) console.error(`Running live @ ${fpsPreview} fps: WASD/arrows move, space jump, F fire, q quit.`);
+    else console.error(`Running ${flags.frames || 60} frames @ ${fpsPreview} fps target.`);
+  }
+  const nowS = () => performance.now() / 1000;
+  const kb = { up: 0, down: 0, left: 0, right: 0, jump: 0, fire: 0, quit: false };
+  const restoreKeys = () => {
+    if (!keys) return;
+    try { process.stdin.setRawMode(false); } catch (e) { /* already closed */ }
+    process.stdin.pause();
+    process.stdout.write('\x1b[0m\x1b[?25h\n');
+  };
+  if (keys) {
+    require('readline').emitKeypressEvents(process.stdin);
+    process.stdin.setRawMode(true);
+    process.stdin.on('keypress', (str, key) => feedKey(kb, str, key, nowS()));
+    // The same bytes, as key names for poll_key() / keys_down() in frame code.
+    const keyboard = require('./keyboard');
+    keyboard.useExternal();
+    process.stdin.on('data', (b) => keyboard.feedBytes(b));
+    process.on('exit', () => { try { process.stdin.setRawMode(false); } catch (e) { /* closed */ } });
+  }
+  if (live) process.stdout.write('\x1b[2J\x1b[?25l');
+  const colorSupport = detectColorSupport();
+  const termOptions = {
+    mode: flags.ascii ? 'ascii' : colorSupport.mode,
+    color: flags.noColor ? false : colorSupport.color,
+    // v0.8.17: sub-pixel mode (▌▐ left/right half-blocks). Ignored when mode === 'ascii'.
+    subpixel: !!flags.subpixel && !flags.ascii,
+    // Use a smaller terminal viewport than the actual stdout size so the render fits.
+    termWidth: Math.min(process.stdout.columns || 80, 80),
+    termHeight: Math.min((process.stdout.rows || 24) - 2, 40),  // leave 2 rows for prompt
+    isTTY: process.stdout.isTTY,
+  };
+  const framesRun = flags.frames || 60;
+  // v0.8.17: --term-fps flag. Default 15; clamped to [1, 60]. Warns if clamped.
+  // Without the flag, behavior is unchanged (15 fps — backward compat with v0.8.16).
+  let TARGET_FPS = flags.termFps !== undefined ? flags.termFps : 15;
+  if (TARGET_FPS < 1) { console.warn(`--term-fps ${TARGET_FPS} below minimum; clamped to 1.`); TARGET_FPS = 1; }
+  if (TARGET_FPS > 60) { console.warn(`--term-fps ${TARGET_FPS} above maximum; clamped to 60.`); TARGET_FPS = 60; }
+  const FRAME_MS = 1000 / TARGET_FPS;
+  let frameNum = 0;
+  let tLast = nowS(), acc = 0;
+  function terminalLoop() {
+    if ((!live && frameNum >= framesRun) || kb.quit) {
+      // Final frame: reset attributes + newline so the shell prompt doesn't pick up the last color.
+      if (keys) restoreKeys(); else process.stdout.write('\x1b[0m\n');
+      if (kb.quit) { flushRuntimeDiagnostics(w); process.exit(0); }
+      if (flags.json) {
+        // v0.8.16: --json + --terminal interaction. During the run, terminal frames went to
+        // stdout. After the final frame resets the terminal, the JSON state dump is emitted
+        // to stdout (so it doesn't interleave with the animation).
+        const state = {
+          entities: w.entities.map(e => {
+            const pose = e.locals.get('pose');
+            const fields = {};
+            for (const [k, v] of e.fields) fields[k] = serializeForJson(v);
+            const poseObj = pose ? {
+              pos: pose.pos ? [pose.pos.x, pose.pos.y, pose.pos.z] : null,
+              vel: pose.vel ? [pose.vel.x, pose.vel.y, pose.vel.z] : null,
+              rot: pose.rot ? [pose.rot.x, pose.rot.y, pose.rot.z, pose.rot.w] : null,
+              scl: pose.scl ? [pose.scl.x, pose.scl.y, pose.scl.z] : null,
+            } : null;
+            return {
+              name: e._tagName || e.decl.name,
+              base: e.decl.base || null,
+              alive: !e._despawned,
+              pos: poseObj ? poseObj.pos : null,
+              pose: poseObj,
+              fields,
+            };
+          }),
+          log: w.log.map(l => ({
+            type: l.type,
+            msg: l.msg !== undefined ? l.msg : (l.snd !== undefined ? l.snd : null),
+            entity: l.entity || null,
+            block: l.block || null,
+            t: l.t !== undefined ? l.t : null,
+          })),
+          diagnostics: w.runtimeDiagnostics.map(d => ({
+            code: d.error_code,
+            severity: d.severity,
+            message: d.message_for_human,
+            line: d.location?.line || null,
+            entity: d.location?.entity || null,
+            block: d.location?.block || null,
+          })),
+          compile_diagnostics: r.diagnostics.map(d => ({
+            code: d.error_code,
+            severity: d.severity,
+            message: d.message_for_human,
+            line: d.location?.line || null,
+          })),
+          frames_run: framesRun,
+          sim_time: w._simTime,
+          version: r.program.version || null,
+        };
+        process.stdout.write(JSON.stringify(state, null, 2) + '\n');
+      }
+      process.exit(0);
+      return;
+    }
+    const tFrame = nowS();
+    if (keys) applyKeys(kb, tFrame);
+    else applyInput(inputSteps[frameNum] || '');
+    if (live) {
+      // Real time: as many 60 Hz steps as the wall clock says (at most a quarter second's
+      // worth, so a stall does not turn into a burst).
+      acc = Math.min(0.25, acc + tFrame - tLast);
+      tLast = tFrame;
+      while (acc >= 1 / 60) { w.update(1 / 60); acc -= 1 / 60; }
+    } else {
+      // Simulate at 60 Hz physics. Terminal renders at 15 fps but physics stays smooth.
+      w.update(1 / 60);
+    }
+    const { pixels } = rasterizeFrame(w, TERM_WIDTH, TERM_HEIGHT);
+    const frame = renderToTerminal(pixels, TERM_WIDTH, TERM_HEIGHT, termOptions);
+    process.stdout.write(live ? frame + '\x1b[0m\x1b[KWASD/arrows move  space jump  F fire  q quit' : frame);
+    frameNum++;
+    setTimeout(terminalLoop, Math.max(0, FRAME_MS - (nowS() - tFrame) * 1000));
+  }
+  terminalLoop();
+} else if (HEADLESS) {
+  // v0.8.15: --json mode suppresses all human-readable output and emits a JSON object at the end.
+  // The JSON includes entity state, log entries, diagnostics, frames_run, and sim_time.
+  // Used by ALMS (AxiomScript LLM Management System) and other tooling that needs structured
+  // state output for inspection/serialization.
+  if (!flags.json) {
+    console.log(`\nMode: headless ${sdl ? '(SDL installed but display not available / forced via --headless)' : '(no @kmamal/sdl available; install with `npm install @kmamal/sdl` for windowed mode)'}.`);
+    console.log(`Running ${flags.frames || 60} frames @ ${WIDTH}×${HEIGHT}, saving PNG every ${PNG_EVERY} frames.`);
+  }
+  const framesRun = flags.frames || 60;
+  for (let f = 0; f < framesRun; f++) {
+    applyInput(inputSteps[f] || '');
+    w.update(1 / 60);
+    // v0.8.15: in --json mode, skip PNG dumping (the JSON output has no PNG field; PNGs are
+    // for human/visual debugging only).
+    // v0.9.3: frame N is the world after N steps, saved every --png-every steps and after the
+    // last one — the native runtime's numbering, so both write the same files.
+    if (!flags.json && ((f + 1) % PNG_EVERY === 0 || f === framesRun - 1)) dumpFrame(f + 1);
+  }
+  if (flags.json) {
+    // Emit JSON state to stdout. Vec3/Vec2/Quat/Atom are serialized via a replacer.
+    const state = {
+      entities: w.entities.map(e => {
+        const pose = e.locals.get('pose');
+        const fields = {};
+        for (const [k, v] of e.fields) {
+          fields[k] = serializeForJson(v);
+        }
+        // v0.8.15: include full pose (pos, vel, rot, scl) in JSON output. ALMS needs this
+        // for state inspection — previously only `pos` was serialized as a flat array, and
+        // vel/rot/scl were invisible. Now all four Transform components are included.
+        const poseObj = pose ? {
+          pos: pose.pos ? [pose.pos.x, pose.pos.y, pose.pos.z] : null,
+          vel: pose.vel ? [pose.vel.x, pose.vel.y, pose.vel.z] : null,
+          rot: pose.rot ? [pose.rot.x, pose.rot.y, pose.rot.z, pose.rot.w] : null,
+          scl: pose.scl ? [pose.scl.x, pose.scl.y, pose.scl.z] : null,
+        } : null;
+        return {
+          name: e._tagName || e.decl.name,
+          base: e.decl.base || null,
+          alive: !e._despawned,
+          pos: poseObj ? poseObj.pos : null,  // backward compat: flat pos array
+          pose: poseObj,                       // v0.8.15: full pose object
+          fields,
+        };
+      }),
+      log: w.log.map(l => ({
+        type: l.type,
+        msg: l.msg !== undefined ? l.msg : (l.snd !== undefined ? l.snd : null),
+        entity: l.entity || null,
+        block: l.block || null,
+        t: l.t !== undefined ? l.t : null,
+      })),
+      diagnostics: w.runtimeDiagnostics.map(d => ({
+        code: d.error_code,
+        severity: d.severity,
+        message: d.message_for_human,
+        line: d.location?.line || null,
+        entity: d.location?.entity || null,
+        block: d.location?.block || null,
+      })),
+      compile_diagnostics: r.diagnostics.map(d => ({
+        code: d.error_code,
+        severity: d.severity,
+        message: d.message_for_human,
+        line: d.location?.line || null,
+      })),
+      frames_run: framesRun,
+      sim_time: w._simTime,
+      version: r.program.version || null,
+    };
+    process.stdout.write(JSON.stringify(state, null, 2) + '\n');
+    process.exit(0);
+  }
+  // Final state report (human-readable)
+  console.log(`\nFinal entity state:`);
+  for (const e of w.entities) {
+    const pose = e.locals.get('pose');
+    if (!pose) continue;
+    const px = pose.pos && pose.pos.x !== undefined ? pose.pos.x.toFixed(2) : '?';
+    const py = pose.pos && pose.pos.y !== undefined ? pose.pos.y.toFixed(2) : '?';
+    const pz = pose.pos && pose.pos.z !== undefined ? pose.pos.z.toFixed(2) : '?';
+    console.log(`  ${e._tagName}: pos=(${px},${py},${pz})`);
+    for (const [k, v] of e.fields) {
+      if (typeof v === 'number') console.log(`    ~${k}: ${v}`);
+      else if (v && v.__timer) console.log(`    ~${k}: timer(remaining=${v.remaining.toFixed(2)})`);
+      else if (v && v.name) console.log(`    ~${k}: atom(${v.name})`);
+    }
+  }
+  console.log(`\nRuntime diagnostics: ${w.runtimeDiagnostics.length}`);
+  console.log(`Log events: ${w.log.length} (!play=${w.log.filter(l => l.type === 'play').length}, !music=${w.log.filter(l => l.type === 'music').length}, !dbg_line=${w.log.filter(l => l.type === 'dbg_line').length})`);
+  console.log(`\nDone. PNGs in: ${SHOT_DIR}`);
+  process.exit(0);
+} else {
+  // SDL windowed mode using @kmamal/sdl's actual API:
+  //   window = sdl.video.createWindow({ title, width, height })
+  //   window.render(width, height, stride, format, buffer) — pushes RGBA pixels
+  //   window.on('keyDown'/'keyUp'/'close', handler) — events
+  //   window.destroy() / .destroyGently() — close
+  if (!flags.json) console.log(`\nMode: SDL window @ ${WIDTH}×${HEIGHT}. WASD/arrows move, Space jumps, F/Enter fires, Esc quits.`);
+  const window = sdlWindow;
+  let frameNum = 0;
+  let running = true;
+  const keyState = new Set();
+  // @kmamal/sdl's SCANCODE enum is at sdl.keyboard.SCANCODE; keyDown events carry `scancode`.
+  const SCAN = sdl.keyboard.SCANCODE;
+  // Key names for poll_key() / keys_down() (keyboard.js): the terminal's names for SDL's keys.
+  // A window reports releases, so keys_down() is exact here.
+  const keyboard = require('./keyboard');
+  keyboard.useExternal();
+  const SDL_KEY_NAMES = { return: 'enter', pageUp: 'pageup', pageDown: 'pagedown' };
+  const heldName = new Map();   // scancode → the name its keyDown pushed
+  const sdlKeyName = (e) => {
+    if (!e.key) return null;
+    let name = SDL_KEY_NAMES[e.key] || e.key;
+    if (name.length === 1 && e.shift) name = name.toUpperCase();
+    if (e.ctrl && /^[a-z]$/i.test(name)) name = 'ctrl+' + name.toLowerCase();
+    return name;
+  };
+  window.on('keyDown', (e) => {
+    keyState.add(e.scancode);
+    if (e.scancode === SCAN.ESCAPE) running = false;
+    const name = sdlKeyName(e);
+    if (name) { heldName.set(e.scancode, name); keyboard.pushKey(name, true); }
+  });
+  window.on('keyUp', (e) => {
+    keyState.delete(e.scancode);
+    const name = heldName.get(e.scancode);
+    if (name) { heldName.delete(e.scancode); keyboard.releaseKey(name); }
+  });
+  window.on('close',  () => { running = false; });
+  // v0.8.1: subscribe to controller connect/disconnect events if the SDL binding exposes them.
+  // We track connected controllers in a Set so we can poll them each frame. The polling itself
+  // is done by `pollGamepadToInput(sdl, prevJump)` which probes the SDL controller API surface
+  // defensively — never throws, returns a zero-state result if no controllers are connected.
+  let prevJumpPressed = false;
+  if (sdl.controller) {
+    if (typeof sdl.controller.on === 'function') {
+      try {
+        sdl.controller.on('connect', (ctrl) => {
+          console.log(`[gamepad] controller connected: ${ctrl && ctrl.name ? ctrl.name : '(unnamed)'}`);
+        });
+        sdl.controller.on('disconnect', (ctrl) => {
+          console.log(`[gamepad] controller disconnected: ${ctrl && ctrl.name ? ctrl.name : '(unnamed)'}`);
+        });
+      } catch (e) { /* event subscription is best-effort */ }
+    }
+    // Some @kmamal/sdl versions auto-open connected controllers on first poll; others need an
+    // explicit open. We try `sdl.controller.openAll()` if it exists, otherwise rely on auto-open.
+    if (typeof sdl.controller.openAll === 'function') {
+      try { sdl.controller.openAll(); } catch (e) { /* best-effort */ }
+    }
+  }
+
+  const TARGET_DT_NS = 16_666_666n; // 60 Hz
+  let lastTime = process.hrtime.bigint();
+
+  function loop() {
+    if (!running) { try { window.destroy(); } catch (e) {} process.exit(0); return; }
+    // Input: WASD → input.move (Vec2 x=right, y=forward), Space → jump
+    let x = 0, y = 0, jump = false;
+    if (keyState.has(SCAN.W) || keyState.has(SCAN.UP)) y += 1;
+    if (keyState.has(SCAN.S) || keyState.has(SCAN.DOWN)) y -= 1;
+    if (keyState.has(SCAN.A) || keyState.has(SCAN.LEFT)) x -= 1;
+    if (keyState.has(SCAN.D) || keyState.has(SCAN.RIGHT)) x += 1;
+    if (keyState.has(SCAN.SPACE)) jump = true;
+    w.input.fire = keyState.has(SCAN.F) || keyState.has(SCAN.RETURN);
+    // v0.8.1: poll gamepads. If a controller is connected and the keyboard is idle this frame,
+    // the controller's LeftStick axes drive input.move and ButtonSouth drives input.jump.
+    const gp = pollGamepadToInput(sdl, prevJumpPressed);
+    const merged = mergeKeyboardGamepad({ x, y }, jump, gp);
+    w.input.move.x = merged.x; w.input.move.y = merged.y; w.input.jump = merged.jump;
+    prevJumpPressed = merged.jump;
+    // Step the world + render. v0.8.15 fix: World.update() already calls stepRender()
+    // internally (after stepPhysics + stepCognition). The previous code called stepRender
+    // a SECOND time on the next line, which caused every &render: block, animation clip,
+    // and HUD draw to run twice per frame — and Tweens advanced at 2× speed. The standalone
+    // stepRender call is now removed. The headless branch (below) is unaffected: it calls
+    // dumpFrame() which calls w.stepRender(1/60) once per dumped frame, matching the
+    // headless convention of "render only when saving a PNG".
+    w.update(1 / 60);
+    const { pixels } = rasterizeFrame(w, WIDTH, HEIGHT);
+    // Push pixels to the SDL window. The rasterizer outputs RGBA (Uint8ClampedArray). SDL accepts
+    // a Node Buffer; we copy the pixels into a Buffer (zero-copy if the array's underlying buffer
+    // is already an ArrayBuffer, which Uint8ClampedArray is).
+    const buf = Buffer.from(pixels.buffer, pixels.byteOffset, pixels.byteLength);
+    window.render(WIDTH, HEIGHT, WIDTH * 4, 'rgba32', buf);
+    frameNum++;
+    if (flags.pngEvery && frameNum % PNG_EVERY === 0) dumpFrame(frameNum);   // only when asked for
+    // Frame pacing
+    const now = process.hrtime.bigint();
+    const dt = now - lastTime;
+    if (dt < TARGET_DT_NS) {
+      setTimeout(loop, Number(TARGET_DT_NS - dt) / 1_000_000);
+    } else {
+      setImmediate(loop);
+    }
+    lastTime = now;
+  }
+  loop();
+}

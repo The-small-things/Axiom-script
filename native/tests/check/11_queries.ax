@@ -1,0 +1,14 @@
+@P
+  ~n: 0
+@A
+  &tick(1hz):
+    a = ?nearest("P")
+    b = ?exists(p)
+    c = ?nearest(1)
+    d = ?nearest(#P)
+    e = ?nearest(a.b)
+    f = ?exists([1])
+    g = nearest(#P)
+    h = ?path(v3(0,0,0), v3(1,1,1))
+    ?true:
+      i = ?nearest("nested")

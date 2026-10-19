@@ -1,0 +1,24 @@
+// Higher-order functions, closures, composition.
+^fn double(x) = x * 2
+^fn add(a, b) = a + b
+^main:
+  print([1,2,3].map(double))
+  print([1,2,3].map(\x: x * 3))
+  print([1,2,3,4].filter(\x: x % 2 == 0))
+  print([1,2,3,4].reduce(\a, b: a + b, 0))
+  print([3,1,2].sort(\a, b: b - a))
+  print(apply(add, [3, 4]))
+  inc = partial(add, 1)
+  print(inc(41))
+  pipeline = compose(\x: x + 1, \x: x * 2)
+  print(pipeline(5))
+  memo_double = memo(double)
+  print(memo_double(21) + memo_double(21))
+  ops = {inc: \x: x + 1, dbl: \x: x * 2}
+  print(ops.dbl(ops.inc(3)))
+  fns = [\x: x + 1, \x: x * 10]
+  print(fns[1](fns[0](1)))
+  print([1,2,3].every(\v: v > 0), [1,2,3].some(\v: v > 2))
+  print([1,2,3].find(\v: v > 1), [1,2,3].find_index(\v: v > 1))
+  print(["a","bb"].flat_map(\s: s.chars()))
+  print(is_fn(double), is_fn(3), type(double))

@@ -1,0 +1,5 @@
+~X: undefined_fn(1)
+~Y: 2
+^main:
+  print(X, Y)
+  ^return 0

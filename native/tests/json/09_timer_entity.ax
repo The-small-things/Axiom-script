@@ -1,0 +1,4 @@
+@Clock
+  ~cd: 1.5s
+^main:
+  ^return {cd: #Clock.cd, who: #Clock, t: 0.5s, r: 0..3, q: quat(0, 0, 0, 1)}

@@ -1,0 +1,23 @@
+// The lockstep bridge: a host program (a window, a game engine, a test harness — anything
+// that can start a process) drives an AxiomScript program over stdin and stdout. Each step
+// the host writes one command line; the program answers with one line of JSON state. Nothing
+// waits on a clock, so a run is reproducible: the same commands give the same states.
+//
+// Run with a host:  node examples/bridge_host.js
+// Or by hand:       printf 'right\nright\njump\nquit\n' | node main.js examples/bridge.ax
+^main:
+  x = 0
+  y = 0
+  vy = 0
+  step = 0
+  cmd = input()
+  *cmd != null && cmd != "quit":
+    ?cmd == "left": x -= 1
+    ?cmd == "right": x += 1
+    ?cmd == "jump" && y == 0: vy = 3
+    y = max(0, y + vy)
+    vy -= 1
+    ?y == 0: vy = 0
+    step += 1
+    print(to_json({step: step, x: x, y: y}))
+    cmd = input()

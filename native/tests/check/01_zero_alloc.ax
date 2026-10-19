@@ -1,0 +1,25 @@
+^event Ping: n:: number
+@A
+  ~xs: []
+  $b: Grid(3) ~ Uniform infer: exact
+  &physics:
+    b ~= observe(1)
+    y = $b ~> argmax
+    xs.push(1)
+    s = "a" + str(1)
+    t = f"{s}"
+    print("x")
+    q = spawn_new(1)
+    !d("fine", s + "x")
+    !print("fine")
+    ?y > 1:
+      xs.append(2)
+    *i in 0..3:
+      u = "b" + i
+  &render:
+    z = 1 + "c"
+  &on(Ping):
+    w = [1].insert(0)
+@B &Body3D
+  &physics:
+    v = "exempt" + 1

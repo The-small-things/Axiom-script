@@ -1,0 +1,5 @@
+// A source file that is not valid UTF-8: Node reads each ill-formed sequence as U+FFFD.
+^main:
+  s = "aÃ(bí €cðŸ˜"
+  print(s, len(s), s.charCodeAt(1))
+  print("été")

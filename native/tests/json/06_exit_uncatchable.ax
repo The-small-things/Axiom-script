@@ -1,0 +1,7 @@
+^main:
+  ^try:
+    exit(2)
+  ^catch e:
+    print("caught", e.code)
+  print("after")
+  ^return 0

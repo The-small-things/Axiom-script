@@ -1,0 +1,19 @@
+axiom 0.7.5
+^event Declared: n
+@A
+  &tick(1hz):
+    ^Nobody(n: 1)
+    ^Declared(n: 1)
+    ^Collide()
+    ?true:
+      ^Deep(x: 1)
+@B
+  &on(Handled):
+    print("h")
+  @Inner
+    &on(Nested):
+      print("n")
+@C
+  &tick(1hz):
+    ^Handled()
+    ^Nested()
